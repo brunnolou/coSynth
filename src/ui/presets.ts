@@ -2,10 +2,9 @@
 // export/import.
 
 import { paramDef, valueToNorm } from '../shared/params'
+import { listPresets, savePreset, validatePresetData } from '../shared/preset-store'
 import type { SynthEngine, PresetData } from '../audio/engine'
 import { el } from './common'
-
-const STORAGE_KEY = 'soundgineer.presets.v1'
 
 /** Convenience: author factory presets in raw units, store normalized. */
 function P(raw: Record<string, number>): Record<string, number> {
@@ -548,16 +547,25 @@ const FACTORY: Partial<PresetData>[] = [
   }
 ]
 
-function loadUserPresets(): PresetData[] {
+const MAX_IMPORT_BYTES = 1024 * 1024
+
+export function savePresetFromUi(engine: SynthEngine, name: string, storage?: Storage): boolean {
   try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]') as PresetData[]
-  } catch {
-    return []
+    savePreset(engine.toPreset(name), storage)
+    return true
+  } catch (error) {
+    alert(`Could not save preset: ${error instanceof Error ? error.message : String(error)}`)
+    return false
   }
 }
 
-function saveUserPresets(list: PresetData[]): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(list))
+export async function importPresetFile(engine: SynthEngine, file: File, storage?: Storage): Promise<PresetData> {
+  if (file.size > MAX_IMPORT_BYTES) throw new Error('Preset import is limited to 1 MiB')
+  const parsed: unknown = JSON.parse(await file.text())
+  const preset = validatePresetData(parsed)
+  const saved = savePreset(preset, storage)
+  engine.loadPreset(saved)
+  return saved
 }
 
 export class PresetBrowser {
@@ -574,10 +582,7 @@ export class PresetBrowser {
     save.addEventListener('click', () => {
       const name = prompt('Preset name?', 'My Patch')
       if (!name) return
-      const list = loadUserPresets().filter(p => p.name !== name)
-      list.push(this.engine.toPreset(name))
-      saveUserPresets(list)
-      this.refresh(`user:${name}`)
+      if (savePresetFromUi(this.engine, name)) this.refresh(`user:${name.trim()}`)
     })
 
     const exportBtn = el('button', 'hdr-btn', 'EXPORT')
@@ -601,11 +606,7 @@ export class PresetBrowser {
       const f = file.files?.[0]
       if (!f) return
       try {
-        const preset = JSON.parse(await f.text()) as PresetData
-        this.engine.loadPreset(preset)
-        const list = loadUserPresets().filter(p => p.name !== preset.name)
-        list.push(preset)
-        saveUserPresets(list)
+        const preset = await importPresetFile(this.engine, f)
         this.refresh(`user:${preset.name}`)
       } catch (err) {
         alert(`Could not load preset: ${err}`)
@@ -628,7 +629,7 @@ export class PresetBrowser {
       fGroup.appendChild(o)
     }
     this.select.appendChild(fGroup)
-    const users = loadUserPresets()
+    const users = listPresets()
     if (users.length) {
       const uGroup = el('optgroup') as HTMLOptGroupElement
       uGroup.label = 'User'
@@ -648,7 +649,7 @@ export class PresetBrowser {
     const preset =
       kind === 'factory'
         ? FACTORY.find(p => p.name === name)
-        : loadUserPresets().find(p => p.name === name)
+        : listPresets().find(p => p.name === name)
     if (preset) this.engine.loadPreset(preset)
   }
 }

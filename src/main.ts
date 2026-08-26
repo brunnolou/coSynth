@@ -1,6 +1,8 @@
 import './style.css'
 import { SynthEngine } from './audio/engine'
 import { buildApp } from './ui/app'
+import { registerWebMcpTools } from './webmcp/register'
+import { bindWebMcpLifecycle } from './webmcp/lifecycle'
 
 const engine = new SynthEngine()
 const app = document.getElementById('app')!
@@ -40,3 +42,11 @@ window.addEventListener('keydown', start, { once: false })
 
 // expose for debugging / smoke tests
 ;(window as unknown as { soundgineer: SynthEngine }).soundgineer = engine
+
+// Progressive enhancement: WebMCP registration must never block synth startup.
+try {
+  const webMcp = registerWebMcpTools(engine)
+  bindWebMcpLifecycle(webMcp, window, import.meta.hot)
+} catch (error) {
+  console.warn('WebMCP is unavailable:', error)
+}

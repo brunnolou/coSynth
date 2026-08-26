@@ -77,6 +77,41 @@ position highlighted, oscilloscope, and log-frequency spectrum analyzer.
 **Presets** — JSON patches (parameters + matrix + LFO shapes + FX order).
 Factory patches included; save to localStorage, or export/import files.
 
+## WebMCP agent tools
+
+Soundgineer progressively exposes the same live `SynthEngine` used by the UI through the current WebMCP API, `document.modelContext.registerTool(tool, { signal })`. Browsers without WebMCP continue to run the normal synth with no polyfill or runtime dependency.
+
+Exactly nine semantic tools are available:
+
+- `get_synth_state` — complete stable-ID patch snapshot (raw, normalized, and formatted parameter values; modulation, LFO shapes, FX order) plus live voices, held notes, and peaks.
+- `get_parameter_schema` — searchable canonical parameter metadata, modulation sources, and safety limits.
+- `update_parameters` — atomic raw-unit/choice-label parameter batches with strict validation.
+- `set_modulation` — add/update/remove/clear operations over the 32-slot modulation matrix.
+- `play_notes` — bounded MIDI sequences with relative real-time timing and cancellation cleanup.
+- `render_audio` — records the actual AudioWorklet output while notes play and returns a temporary blob URL plus metrics.
+- `analyze_audio` — analyzes the latest render, explicitly falling back to the current scope buffers.
+- `save_preset` and `load_preset` — validated, replace-by-name browser presets in localStorage.
+
+WebMCP requires a secure context: deploy over HTTPS, or use `localhost` during development. At the time of writing it is an experimental browser feature; use a WebMCP-enabled Chrome build/flag and a compatible client such as ChatGPT's experimental browser integration. Audio still follows browser autoplay policy: a human user gesture must click **CLICK TO START AUDIO** before `play_notes` or `render_audio` can run.
+
+`render_audio` is intentionally **real-time**, not offline and not deterministic. It taps the current AudioWorklet graph through `MediaStreamAudioDestinationNode`/`MediaRecorder`, is capped at 15 seconds, revokes the previous blob URL, and always cleans up notes and recorder connections. Rendered audio metrics include peak/RMS dB, clipping count, DC offset, spectral centroid, attack time, and stereo width.
+
+The test shim follows the standards callback shape (`execute(input, { signal })`) and does not require experimental browser support:
+
+```bash
+npm test
+npm run typecheck
+npm run build
+npm run preview
+# in another terminal:
+node scripts/webmcp-smoke.mjs
+SHOT=/tmp/aisoundgineer-smoke.png node scripts/smoke.mjs
+```
+
+## Hackathon work
+
+The synthesizer base is [`noisyloop/soundgineer`](https://github.com/noisyloop/soundgineer), used under its MIT license. This hackathon extension preserves and credits that upstream DSP/UI foundation. The work added here is the WebMCP progressive-enhancement adapter and nine-tool semantic API, strict agent-facing validation and stable parameter semantics, abortable real-time output recording, reusable FFT-based audio analysis, shared validated preset persistence, and WebMCP unit/browser smoke coverage.
+
 ## Repository layout
 
 ```

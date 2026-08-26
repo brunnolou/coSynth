@@ -1,0 +1,416 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { defaultValues, paramIndex } from '../shared/params'
+import { DEFAULT_FX_ORDER, FX_IDS, MAX_MOD_SLOTS, defaultLfoShape, modSourceIndex, type ModSlotState } from '../shared/messages'
+import type { PresetData, RecordedAudio, SynthEngine } from '../audio/engine'
+import { createWebMcpTools } from './tools'
+
+class MemoryStorage implements Storage {
+  private data = new Map<string, string>()
+  get length() { return this.data.size }
+  clear() { this.data.clear() }
+  getItem(key: string) { return this.data.get(key) ?? null }
+  key(index: number) { return [...this.data.keys()][index] ?? null }
+  removeItem(key: string) { this.data.delete(key) }
+  setItem(key: string, value: string) { this.data.set(key, value) }
+}
+
+class FakeEngine {
+  values = defaultValues()
+  modSlots: (ModSlotState | null)[] = new Array(MAX_MOD_SLOTS).fill(null)
+  lfoShapes = Array.from({ length: 8 }, () => defaultLfoShape())
+  fxOrder = DEFAULT_FX_ORDER.slice()
+  running = true
+  ctx = { sampleRate: 8000 }
+  scopeL = new Float32Array([0, 0.2, -0.2, 0])
+  scopeR = new Float32Array([0, 0.1, -0.1, 0])
+  voiceCount = 2
+  peakL = 0.2
+  peakR = 0.1
+  heldNotes = new Set<number>()
+  private readonly defaultNoteOwner = Symbol('human')
+  private readonly noteOwners = new Map<number, Set<symbol>>()
+  setParam = vi.fn((index: number, value: number) => { this.values[index] = value })
+  setModSlot = vi.fn((slot: number, state: ModSlotState | null) => { this.modSlots[slot] = state })
+  noteOn = vi.fn((note: number, _velocity = 1, owner = this.defaultNoteOwner) => {
+    let owners = this.noteOwners.get(note)
+    if (!owners) {
+      owners = new Set()
+      this.noteOwners.set(note, owners)
+    }
+    owners.add(owner)
+    this.heldNotes.add(note)
+  })
+  noteOff = vi.fn((note: number, owner = this.defaultNoteOwner) => {
+    const owners = this.noteOwners.get(note)
+    if (!owners?.delete(owner) || owners.size > 0) return
+    this.noteOwners.delete(note)
+    this.heldNotes.delete(note)
+  })
+  allNotesOff = vi.fn(() => { this.noteOwners.clear(); this.heldNotes.clear() })
+  toPreset = vi.fn((name: string): PresetData => ({
+    name, version: 1,
+    params: Object.fromEntries(Array.from(this.values, (value, index) => [`p${index}`, value])),
+    mods: [], lfoShapes: this.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
+  }))
+  loadPreset = vi.fn((preset: Partial<PresetData>) => {
+    if (preset.params?.['master.volume'] !== undefined) this.values[paramIndex('master.volume')] = preset.params['master.volume']
+  })
+  recordOutput = vi.fn(async (duration: number, _signal?: AbortSignal): Promise<RecordedAudio> => {
+    const length = Math.max(32, Math.round(duration * 8000))
+    const left = Float32Array.from({ length }, (_, index) => 0.2 * Math.sin(2 * Math.PI * 440 * index / 8000))
+    return { blob: new Blob(['audio'], { type: 'audio/webm' }), mimeType: 'audio/webm', duration, sampleRate: 8000, channelData: [left, new Float32Array(left)] }
+  })
+}
+
+function setup(lifecycleSignal?: AbortSignal) {
+  const engine = new FakeEngine()
+  const tools = createWebMcpTools(engine as unknown as SynthEngine, lifecycleSignal)
+  const byName = new Map(tools.map(tool => [tool.name, tool]))
+  const execute = async (name: string, input: Record<string, unknown> = {}, signal = new AbortController().signal) =>
+    await byName.get(name)!.execute(input, { signal }) as any
+  return { engine, tools, byName, execute }
+}
+
+beforeEach(() => {
+  vi.stubGlobal('localStorage', new MemoryStorage())
+  vi.stubGlobal('URL', {
+    createObjectURL: vi.fn(() => `blob:render-${Math.random()}`),
+    revokeObjectURL: vi.fn()
+  })
+})
+afterEach(() => {
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
+})
+
+describe('WebMCP tool metadata', () => {
+  it('exposes exactly nine strict object schemas with descriptions and annotations', () => {
+    const { tools } = setup()
+    expect(tools.map(tool => tool.name)).toEqual([
+      'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
+      'play_notes', 'render_audio', 'analyze_audio', 'save_preset', 'load_preset'
+    ])
+    for (const tool of tools) {
+      expect(tool.description.length).toBeGreaterThan(10)
+      expect(tool.inputSchema).toMatchObject({ type: 'object', additionalProperties: false })
+      expect(tool.execute).toBeTypeOf('function')
+    }
+    expect(tools.filter(tool => tool.annotations?.readOnlyHint).map(tool => tool.name)).toEqual([
+      'get_synth_state', 'get_parameter_schema', 'analyze_audio'
+    ])
+  })
+})
+
+describe('state and parameter tools', () => {
+  it('returns a stable-ID patch and runtime snapshot', async () => {
+    const { engine, execute } = setup()
+    engine.modSlots[3] = { source: modSourceIndex('lfo1'), dest: paramIndex('filter1.cutoff'), depth: 0.4, enabled: true }
+    engine.heldNotes.add(60)
+    const state = await execute('get_synth_state')
+    expect(state.patch.parameters['master.volume']).toMatchObject({ raw: 0.7, normalized: expect.any(Number), formatted: '70%' })
+    expect(state.patch.modulations).toContainEqual({ slot: 3, source: 'lfo1', destination: 'filter1.cutoff', depth: 0.4, enabled: true })
+    expect(state.patch.lfoShapes).toHaveLength(8)
+    expect(state.patch.fxOrder).toEqual(['chorus', 'phaser', 'flanger', 'delay', 'reverb', 'eq', 'comp', 'fxdist'])
+    expect(state.runtime).toEqual({ running: true, heldNotes: [60], voices: 2, peaks: { left: 0.2, right: 0.1 } })
+  })
+
+  it('derives searchable schema with normalized defaults, sources, and limits', async () => {
+    const { execute } = setup()
+    const result = await execute('get_parameter_schema', { group: 'filter1', search: 'cut' })
+    expect(result.parameters).toHaveLength(1)
+    expect(result.parameters[0]).toMatchObject({
+      id: 'filter1.cutoff', min: 20, max: 20000, default: 8000,
+      curve: 'exp', moddable: true, normalizedDefault: expect.any(Number)
+    })
+    expect(result.modulationSources.some((source: any) => source.id === 'lfo1')).toBe(true)
+    expect(result.limits).toMatchObject({ modulationSlots: 32, modulationDepth: [-1, 1], midiNotes: [0, 127], maxRenderSeconds: 15 })
+    const tool = setup().byName.get('get_parameter_schema')!
+    expect((tool.inputSchema as { properties: object }).properties).toMatchObject({
+      group: { type: 'string', maxLength: 100 }, search: { type: 'string', maxLength: 100 }
+    })
+    await expect(execute('get_parameter_schema', { search: 'x'.repeat(101) })).rejects.toThrow(/100 characters/i)
+    await expect(execute('get_parameter_schema', { nope: true })).rejects.toThrow(/unexpected/i)
+  })
+
+  it('atomically applies linear, exponential, step, and choice values canonically', async () => {
+    const { engine, execute } = setup()
+    const result = await execute('update_parameters', { updates: [
+      { id: 'master.volume', value: 1.2 },
+      { id: 'filter1.cutoff', value: 200 },
+      { id: 'master.bpm', value: 121 },
+      { id: 'osc1.wavetable', value: 'PWM' }
+    ] })
+    expect(engine.setParam).toHaveBeenCalledTimes(4)
+    expect(result.applied.map((value: any) => value.raw)).toEqual([1.2, 200, 121, 2])
+    expect(result.applied[0].normalized).toBeCloseTo(0.8)
+    expect(result.applied[1].normalized).toBeCloseTo(Math.log(10) / Math.log(1000))
+    expect(result.applied[3].formatted).toBe('PWM')
+  })
+
+  it.each([
+    [{ id: 'missing', value: 1 }, /unknown/i],
+    [{ id: 'master.volume', value: Number.NaN }, /finite/i],
+    [{ id: 'master.volume', value: Infinity }, /finite/i],
+    [{ id: 'master.volume', value: 2 }, /range/i],
+    [{ id: 'master.bpm', value: 120.5 }, /step/i],
+    [{ id: 'osc1.wavetable', value: 'Nope' }, /choice/i]
+  ])('rejects invalid updates without mutation: %o', async (update, message) => {
+    const { engine, execute } = setup()
+    await expect(execute('update_parameters', { updates: [{ id: 'osc1.level', value: 0.5 }, update] })).rejects.toThrow(message)
+    expect(engine.setParam).not.toHaveBeenCalled()
+  })
+
+  it('rejects duplicate IDs and unknown nested fields atomically', async () => {
+    const { engine, execute } = setup()
+    await expect(execute('update_parameters', { updates: [
+      { id: 'master.volume', value: 1 }, { id: 'master.volume', value: 0.5 }
+    ] })).rejects.toThrow(/duplicate/i)
+    await expect(execute('update_parameters', { updates: [{ id: 'master.volume', value: 1, normalized: true }] })).rejects.toThrow(/unexpected/i)
+    expect(engine.setParam).not.toHaveBeenCalled()
+  })
+})
+
+describe('modulation tool', () => {
+  it('adds, updates an existing pair instead of duplicating, updates by slot, removes, and clears', async () => {
+    const { engine, execute } = setup()
+    const added = await execute('set_modulation', { action: 'add', source: 'lfo1', destination: 'filter1.cutoff', depth: 0.25, enabled: false })
+    expect(added.route).toMatchObject({ slot: 0, source: 'lfo1', destination: 'filter1.cutoff', depth: 0.25, enabled: false })
+    const replaced = await execute('set_modulation', { action: 'add', source: 'lfo1', destination: 'filter1.cutoff', depth: -0.5 })
+    expect(replaced.route).toMatchObject({ slot: 0, enabled: false })
+    expect(replaced.count).toBe(1)
+    const updated = await execute('set_modulation', { action: 'update', slot: 0, depth: 0.75, enabled: false })
+    expect(updated.route).toMatchObject({ depth: 0.75, enabled: false })
+    expect((await execute('set_modulation', { action: 'remove', slot: 0 })).count).toBe(0)
+    await execute('set_modulation', { action: 'add', source: 'env1', destination: 'osc1.level', depth: 0.1 })
+    expect((await execute('set_modulation', { action: 'clear' })).count).toBe(0)
+    expect(engine.setModSlot).toHaveBeenCalled()
+  })
+
+  it.each([
+    [{ action: 'add', source: 'wat', destination: 'osc1.level', depth: 0 }, /source/i],
+    [{ action: 'add', source: 'lfo1', destination: 'wat', depth: 0 }, /destination/i],
+    [{ action: 'add', source: 'lfo1', destination: 'master.bpm', depth: 0 }, /moddable/i],
+    [{ action: 'add', source: 'lfo1', destination: 'osc1.level', depth: 2 }, /depth/i],
+    [{ action: 'update', slot: 32, depth: 0 }, /slot/i],
+    [{ action: 'remove', slot: 0, extra: true }, /unexpected/i]
+  ])('rejects invalid route input %o', async (input, error) => {
+    await expect(setup().execute('set_modulation', input)).rejects.toThrow(error)
+  })
+
+  it('reports slot exhaustion', async () => {
+    const { engine, execute } = setup()
+    engine.modSlots.fill({ source: 0, dest: paramIndex('osc1.level'), depth: 0, enabled: true })
+    await expect(execute('set_modulation', { action: 'add', source: 'lfo1', destination: 'filter1.cutoff', depth: 0 })).rejects.toThrow(/full/i)
+  })
+})
+
+describe('note tools', () => {
+  it('plays relative note timings and always cleans up', async () => {
+    vi.useFakeTimers()
+    const { engine, execute } = setup()
+    const promise = execute('play_notes', { notes: [
+      { midi: 60, velocity: 0.8, start: 0, duration: 0.1 },
+      { midi: 64, velocity: 0.7, start: 0.05, duration: 0.1 }
+    ] })
+    await vi.advanceTimersByTimeAsync(200)
+    await expect(promise).resolves.toMatchObject({ noteCount: 2, duration: 0.15 })
+    expect(engine.noteOn).toHaveBeenCalledTimes(2)
+    expect(engine.noteOff).toHaveBeenCalledTimes(2)
+    expect(engine.allNotesOff).not.toHaveBeenCalled()
+    expect(engine.heldNotes.size).toBe(0)
+  })
+
+  it('honors cancellation and only releases notes owned by the operation', async () => {
+    vi.useFakeTimers()
+    const { engine, execute } = setup()
+    const controller = new AbortController()
+    const promise = execute('play_notes', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 10 }] }, controller.signal)
+    await vi.advanceTimersByTimeAsync(10)
+    controller.abort()
+    await expect(promise).rejects.toThrow(/abort/i)
+    expect(engine.noteOff).toHaveBeenCalledWith(60, expect.any(Symbol))
+    expect(engine.allNotesOff).not.toHaveBeenCalled()
+    expect(engine.heldNotes.size).toBe(0)
+  })
+
+  it('does not release a human owner that acquires the note after the WebMCP operation starts', async () => {
+    vi.useFakeTimers()
+    const { engine, execute } = setup()
+    const controller = new AbortController()
+    const promise = execute('play_notes', {
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 10 }]
+    }, controller.signal)
+    await vi.advanceTimersByTimeAsync(1)
+
+    engine.noteOn(60)
+    controller.abort()
+    await expect(promise).rejects.toThrow(/abort/i)
+
+    expect(engine.noteOff).toHaveBeenCalledWith(60, expect.any(Symbol))
+    expect(engine.heldNotes.has(60)).toBe(true)
+    engine.noteOff(60)
+    expect(engine.heldNotes.has(60)).toBe(false)
+  })
+
+  it('rejects overlapping intervals for one MIDI note and notes already held by another owner', async () => {
+    const first = setup()
+    await expect(first.execute('play_notes', { notes: [
+      { midi: 60, velocity: 1, start: 0, duration: 1 },
+      { midi: 60, velocity: 1, start: 0.5, duration: 1 }
+    ] })).rejects.toThrow(/overlap/i)
+    expect(first.engine.noteOn).not.toHaveBeenCalled()
+
+    const second = setup()
+    second.engine.heldNotes.add(60)
+    await expect(second.execute('play_notes', { notes: [
+      { midi: 60, velocity: 1, start: 0, duration: 0.1 }
+    ] })).rejects.toThrow(/already held/i)
+    expect(second.engine.heldNotes.has(60)).toBe(true)
+    expect(second.engine.noteOff).not.toHaveBeenCalled()
+  })
+
+  it('uses one single-flight lock shared by play and render and releases it after abort', async () => {
+    vi.useFakeTimers()
+    const { execute } = setup()
+    const controller = new AbortController()
+    const playing = execute('play_notes', {
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 10 }]
+    }, controller.signal)
+    await vi.advanceTimersByTimeAsync(1)
+    await expect(execute('render_audio', {
+      notes: [{ midi: 64, velocity: 1, start: 0, duration: 0.1 }], duration: 0.2
+    })).rejects.toThrow(/performance.*progress/i)
+    controller.abort()
+    await expect(playing).rejects.toThrow(/abort/i)
+
+    const afterAbort = execute('play_notes', {
+      notes: [{ midi: 64, velocity: 1, start: 0, duration: 0.01 }]
+    })
+    await vi.advanceTimersByTimeAsync(20)
+    await expect(afterAbort).resolves.toMatchObject({ completed: true })
+  })
+
+  it.each([
+    [{ midi: 60.5, velocity: 1, start: 0, duration: 1 }, /midi/i],
+    [{ midi: 128, velocity: 1, start: 0, duration: 1 }, /midi/i],
+    [{ midi: 60, velocity: 1.1, start: 0, duration: 1 }, /velocity/i],
+    [{ midi: 60, velocity: 1, start: -1, duration: 1 }, /start/i],
+    [{ midi: 60, velocity: 1, start: 0, duration: 0 }, /duration/i]
+  ])('validates note %o', async (note, error) => {
+    await expect(setup().execute('play_notes', { notes: [note] })).rejects.toThrow(error)
+  })
+
+  it('requires started audio and bounds the sequence', async () => {
+    const first = setup(); first.engine.running = false
+    await expect(first.execute('play_notes', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }] })).rejects.toThrow(/start audio/i)
+    await expect(setup().execute('play_notes', { notes: [{ midi: 60, velocity: 1, start: 30, duration: 1 }] })).rejects.toThrow(/30 seconds/i)
+    await expect(setup().execute('play_notes', { notes: Array.from({ length: 129 }, () => ({ midi: 60, velocity: 1, start: 0, duration: 1 })) })).rejects.toThrow(/128/i)
+  })
+})
+
+describe('render and analysis tools', () => {
+  it('records real-time output, analyzes it, returns a blob URL, and revokes the prior URL', async () => {
+    vi.useFakeTimers()
+    const { engine, execute } = setup()
+    const input = { notes: [{ midi: 60, velocity: 0.8, start: 0, duration: 0.05 }], duration: 0.1 }
+    const firstPromise = execute('render_audio', input)
+    await vi.advanceTimersByTimeAsync(200)
+    const first = await firstPromise
+    expect(first).toMatchObject({ renderMode: 'realtime', mimeType: 'audio/webm', duration: 0.1, sampleRate: 8000, channels: 2, url: expect.stringMatching(/^blob:/) })
+    expect(first.metrics.peakDb).toBeGreaterThan(-20)
+    expect(engine.recordOutput).toHaveBeenCalledWith(0.1, expect.any(AbortSignal))
+    const analysis = await execute('analyze_audio')
+    expect(analysis.source).toBe('last-render')
+    expect(analysis.metrics).toEqual(first.metrics)
+
+    const secondPromise = execute('render_audio', input)
+    await vi.advanceTimersByTimeAsync(200)
+    await secondPromise
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith(first.url)
+    expect(engine.allNotesOff).not.toHaveBeenCalled()
+  })
+
+  it('revokes the latest blob URL and aborts an active performance on lifecycle disposal', async () => {
+    vi.useFakeTimers()
+    const lifecycle = new AbortController()
+    const { engine, execute } = setup(lifecycle.signal)
+    const rendered = execute('render_audio', {
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02
+    })
+    await vi.advanceTimersByTimeAsync(30)
+    const result = await rendered
+    const active = execute('play_notes', {
+      notes: [{ midi: 64, velocity: 1, start: 0, duration: 10 }]
+    })
+    await vi.advanceTimersByTimeAsync(1)
+    lifecycle.abort()
+    await expect(active).rejects.toThrow(/abort/i)
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith(result.url)
+    expect(engine.noteOff).toHaveBeenCalledWith(64, expect.any(Symbol))
+  })
+
+  it('falls back explicitly to current scope analysis, even before audio starts', async () => {
+    const running = setup()
+    const result = await running.execute('analyze_audio')
+    expect(result).toMatchObject({ source: 'scope', sampleRate: 8000, channels: 2, metrics: { peakDb: expect.any(Number) } })
+
+    const stopped = setup()
+    stopped.engine.running = false
+    ;(stopped.engine as unknown as { ctx: null }).ctx = null
+    await expect(stopped.execute('analyze_audio')).resolves.toMatchObject({ source: 'scope', sampleRate: 48000 })
+  })
+
+  it('aborts the note sequence and cleans up if recording fails', async () => {
+    vi.useFakeTimers()
+    const { engine, execute } = setup()
+    engine.recordOutput.mockRejectedValueOnce(new Error('recorder failed'))
+    await expect(execute('render_audio', {
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 10 }], duration: 10
+    })).rejects.toThrow(/recorder failed/i)
+    expect(engine.noteOff).toHaveBeenCalledWith(60, expect.any(Symbol))
+    expect(engine.allNotesOff).not.toHaveBeenCalled()
+    expect(engine.heldNotes.size).toBe(0)
+    const afterError = execute('play_notes', {
+      notes: [{ midi: 64, velocity: 1, start: 0, duration: 0.01 }]
+    })
+    await vi.advanceTimersByTimeAsync(20)
+    await expect(afterError).resolves.toMatchObject({ completed: true })
+  })
+
+  it('requires audio and enforces the 15-second real-time bound', async () => {
+    const stopped = setup(); stopped.engine.running = false
+    await expect(stopped.execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }] })).rejects.toThrow(/start audio/i)
+    await expect(setup().execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }], duration: 15.1 })).rejects.toThrow(/15 seconds/i)
+  })
+})
+
+describe('preset tools', () => {
+  it('saves/replaces a named patch and loads it with verifiable state', async () => {
+    const { engine, execute } = setup()
+    engine.toPreset.mockImplementation((name: string): PresetData => ({
+      name, version: 1, params: { 'master.volume': engine.values[paramIndex('master.volume')] }, mods: [],
+      lfoShapes: engine.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
+    }))
+    await execute('save_preset', { name: 'Agent Patch' })
+    engine.values[paramIndex('master.volume')] = 0.25
+    await execute('save_preset', { name: 'Agent Patch' })
+    engine.values[paramIndex('master.volume')] = 0.9
+    const loaded = await execute('load_preset', { name: 'Agent Patch' })
+    expect(engine.loadPreset).toHaveBeenCalledTimes(1)
+    expect(loaded.name).toBe('Agent Patch')
+    expect(loaded.state.patch.parameters['master.volume'].normalized).toBeCloseTo(0.25)
+    await expect(execute('load_preset', { name: 'Missing' })).rejects.toThrow(/not found/i)
+    await expect(execute('save_preset', { name: ' ' })).rejects.toThrow(/preset name/i)
+  })
+
+  it('returns useful save/load errors when browser storage is unavailable', async () => {
+    const { engine, execute } = setup()
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      get() { throw new DOMException('blocked', 'SecurityError') }
+    })
+    await expect(execute('save_preset', { name: 'Blocked' })).rejects.toThrow(/storage.*unavailable/i)
+    await expect(execute('load_preset', { name: 'Blocked' })).rejects.toThrow(/storage.*unavailable/i)
+    expect(engine.loadPreset).not.toHaveBeenCalled()
+  })
+})

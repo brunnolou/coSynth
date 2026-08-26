@@ -21,8 +21,24 @@ export interface PresetData {
   fxOrder: string[]
 }
 
+export interface RecordedAudio {
+  blob: Blob
+  mimeType: string
+  duration: number
+  sampleRate: number
+  channelData: Float32Array[]
+}
+
+export type NoteOwner = symbol
+
 const OSC_WT_IDX = [1, 2, 3].map(o => paramIndex(`osc${o}.wavetable`))
 const CUSTOM_WT = WAVETABLE_NAMES.indexOf('Custom')
+
+function abortRecordingError(): Error {
+  const error = new Error('Recording aborted')
+  error.name = 'AbortError'
+  return error
+}
 
 type ParamListener = (value: number) => void
 
@@ -51,6 +67,8 @@ export class SynthEngine {
   readonly currentTables: (Wavetable | null)[] = [null, null, null]
 
   readonly heldNotes = new Set<number>()
+  private readonly defaultNoteOwner: NoteOwner = Symbol('default-note-owner')
+  private readonly noteOwners = new Map<number, Set<NoteOwner>>()
   private noteListeners = new Set<(note: number, on: boolean) => void>()
 
   get running(): boolean {
@@ -232,13 +250,23 @@ export class SynthEngine {
 
   // ------------------------------------------------------------ performance
 
-  noteOn(note: number, velocity = 1): void {
+  noteOn(note: number, velocity = 1, owner: NoteOwner = this.defaultNoteOwner): void {
+    let owners = this.noteOwners.get(note)
+    if (owners) {
+      owners.add(owner)
+      return
+    }
+    owners = new Set([owner])
+    this.noteOwners.set(note, owners)
     this.heldNotes.add(note)
     this.post({ type: 'noteOn', note, velocity })
     this.noteListeners.forEach(fn => fn(note, true))
   }
 
-  noteOff(note: number): void {
+  noteOff(note: number, owner: NoteOwner = this.defaultNoteOwner): void {
+    const owners = this.noteOwners.get(note)
+    if (!owners?.delete(owner) || owners.size > 0) return
+    this.noteOwners.delete(note)
     this.heldNotes.delete(note)
     this.post({ type: 'noteOff', note })
     this.noteListeners.forEach(fn => fn(note, false))
@@ -262,8 +290,107 @@ export class SynthEngine {
     this.post({ type: 'aftertouch', value: v })
   }
   allNotesOff(): void {
+    this.noteOwners.clear()
     this.heldNotes.clear()
     this.post({ type: 'allNotesOff' })
+  }
+
+  /**
+   * Tap and record the live worklet output. This intentionally runs in real
+   * time: MediaRecorder captures the same graph that reaches the speakers.
+   */
+  async recordOutput(duration: number, signal?: AbortSignal): Promise<RecordedAudio> {
+    if (!Number.isFinite(duration) || duration <= 0) throw new Error('Recording duration must be a positive finite number')
+    const ctx = this.ctx
+    const node = this.node
+    if (!ctx || !node) throw new Error('Start audio before recording output')
+    if (signal?.aborted) throw abortRecordingError()
+
+    const destination = ctx.createMediaStreamDestination()
+    let connected = false
+    let recorder: MediaRecorder | undefined
+    let started = false
+    let stopRequested = false
+    let stopped: Promise<Blob> | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let rejectWait: ((error: Error) => void) | undefined
+    const aborted = () => rejectWait?.(abortRecordingError())
+
+    try {
+      node.connect(destination)
+      connected = true
+
+      const preferredTypes = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
+      const mimeType = preferredTypes.find(type => MediaRecorder.isTypeSupported(type))
+      const activeRecorder = new MediaRecorder(destination.stream, mimeType ? { mimeType } : undefined)
+      recorder = activeRecorder
+      const chunks: Blob[] = []
+      let settleStop!: (blob: Blob) => void
+      let rejectStop!: (error: Error) => void
+      const activeStopped = new Promise<Blob>((resolve, reject) => {
+        settleStop = resolve
+        rejectStop = reject
+      })
+      stopped = activeStopped
+      // The stop/error promise can lose a race to cancellation or elapsed time,
+      // so install a rejection consumer before starting the recorder.
+      void activeStopped.catch(() => undefined)
+      activeRecorder.ondataavailable = event => { if (event.data.size > 0) chunks.push(event.data) }
+      activeRecorder.onerror = () => rejectStop(new Error('MediaRecorder failed while capturing output'))
+      activeRecorder.onstop = () => settleStop(new Blob(chunks, { type: activeRecorder.mimeType || mimeType || 'audio/webm' }))
+
+      activeRecorder.start()
+      started = true
+      const elapsed = new Promise<void>((resolve, reject) => {
+        rejectWait = reject
+        timer = setTimeout(resolve, duration * 1000)
+        signal?.addEventListener('abort', aborted, { once: true })
+      })
+      await Promise.race([elapsed, activeStopped.then(() => undefined)])
+      if (activeRecorder.state !== 'inactive') {
+        activeRecorder.stop()
+        stopRequested = true
+      }
+      const blob = await activeStopped
+      const encoded = await blob.arrayBuffer()
+      if (signal?.aborted) throw abortRecordingError()
+      const decoded = await ctx.decodeAudioData(encoded)
+      if (signal?.aborted) throw abortRecordingError()
+      const channelData = Array.from({ length: decoded.numberOfChannels }, (_, channel) =>
+        new Float32Array(decoded.getChannelData(channel)))
+      return {
+        blob,
+        mimeType: blob.type || activeRecorder.mimeType || mimeType || 'audio/webm',
+        duration: decoded.duration,
+        sampleRate: decoded.sampleRate,
+        channelData
+      }
+    } catch (error) {
+      if (started && recorder?.state !== 'inactive' && !stopRequested) {
+        try {
+          recorder?.stop()
+          stopRequested = true
+        } catch {
+          // A synchronous stop failure cannot produce a reliable stop event.
+        }
+      }
+      if (started && stopRequested && stopped) await stopped.catch(() => undefined)
+      throw error
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      signal?.removeEventListener('abort', aborted)
+      if (recorder) {
+        recorder.ondataavailable = null
+        recorder.onerror = null
+        recorder.onstop = null
+      }
+      for (const track of destination.stream.getTracks()) {
+        try { track.stop() } catch { /* best-effort teardown */ }
+      }
+      if (connected) {
+        try { node.disconnect(destination) } catch { /* best-effort teardown */ }
+      }
+    }
   }
 
   // ------------------------------------------------------------ presets
