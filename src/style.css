@@ -207,6 +207,7 @@ main {
   gap: 2px 6px;
   align-items: center;
 }
+.osc-knob-row { gap: 2px 0; }
 
 body.mod-dragging .knob.moddable canvas {
   outline: 1px dashed var(--accent);
