@@ -23,7 +23,7 @@ export interface ParamDef {
 export const FILTER_TYPES = ['LP 12', 'LP 24', 'HP 12', 'HP 24', 'BP 12', 'BP 24', 'Notch', 'Comb', 'Formant']
 export const SUB_SHAPES = ['Sine', 'Triangle', 'Saw', 'Square']
 export const NOISE_TYPES = ['White', 'Pink', 'Sample']
-export const DIST_TYPES = ['Off', 'Soft Clip', 'Hard Clip', 'Wavefold', 'Bitcrush']
+export const DIST_TYPES = ['Soft Clip', 'Hard Clip', 'Wavefold', 'Bitcrush']
 export const FILTER_ROUTINGS = ['Series', 'Parallel']
 export const LFO_MODES = ['Trigger', 'Free', 'Sync']
 export const SYNC_DIVISIONS = ['1/1', '1/2', '1/2T', '1/4.', '1/4', '1/4T', '1/8.', '1/8', '1/8T', '1/16.', '1/16', '1/16T', '1/32']
@@ -103,6 +103,7 @@ for (let f = 1; f <= 2; f++) {
 p({ id: 'filter.routing', name: 'Routing', group: 'filterRouting', min: 0, max: 1, def: 0, choices: FILTER_ROUTINGS })
 
 // ---------------------------------------------------------------- distortion section (per-voice)
+p({ id: 'dist.enabled', name: 'On', group: 'dist', min: 0, max: 1, def: 0, step: 1 })
 p({ id: 'dist.type', name: 'Type', group: 'dist', min: 0, max: DIST_TYPES.length - 1, def: 0, choices: DIST_TYPES })
 p({ id: 'dist.drive', name: 'Drive', group: 'dist', min: 0, max: 1, def: 0.3, moddable: true, fmt: pct })
 p({ id: 'dist.mix', name: 'Mix', group: 'dist', min: 0, max: 1, def: 1, moddable: true, fmt: pct })

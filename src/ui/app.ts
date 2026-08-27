@@ -126,6 +126,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   }
   const distPanel = el('section', 'panel filter-panel')
   const distHead = el('div', 'panel-head')
+  distHead.appendChild(paramToggle(engine, 'dist.enabled', '●'))
   distHead.appendChild(el('span', 'panel-title', 'SHAPE'))
   distHead.appendChild(paramSelect(engine, 'dist.type'))
   distPanel.appendChild(distHead)
@@ -134,6 +135,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   routingWrap.appendChild(el('span', 'routing-label', 'ROUTING'))
   routingWrap.appendChild(paramSelect(engine, 'filter.routing'))
   distPanel.appendChild(routingWrap)
+  bindEnabledState(engine, 'dist.enabled', distPanel)
   filterRow.appendChild(distPanel)
   centerCol.appendChild(filterRow)
 

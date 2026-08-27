@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { SynthEngine } from './engine'
+import { paramIndex } from '../shared/params'
 
 function engineWithPostedMessages() {
   const engine = new SynthEngine()
@@ -54,5 +55,25 @@ describe('SynthEngine note ownership', () => {
     expect(postMessage).toHaveBeenCalledTimes(2)
     expect(listener).toHaveBeenCalledTimes(2)
     expect(engine.heldNotes.has(64)).toBe(false)
+  })
+})
+
+describe('SynthEngine legacy preset migration', () => {
+  it('splits the legacy distortion Off choice into an enabled parameter', () => {
+    const engine = new SynthEngine()
+
+    engine.loadPreset({ params: { 'dist.type': 0.5 } })
+
+    expect(engine.getParam(paramIndex('dist.enabled'))).toBe(1)
+    expect(engine.getParam(paramIndex('dist.type'))).toBeCloseTo(1 / 3)
+  })
+
+  it('keeps legacy Off presets disabled', () => {
+    const engine = new SynthEngine()
+
+    engine.loadPreset({ params: { 'dist.type': 0 } })
+
+    expect(engine.getParam(paramIndex('dist.enabled'))).toBe(0)
+    expect(engine.getParam(paramIndex('dist.type'))).toBe(0)
   })
 })

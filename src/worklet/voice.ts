@@ -57,6 +57,7 @@ export const FILT_IDX = [1, 2].map(f => ({
 export const FILTER_ROUTING_IDX = idx('filter.routing')
 
 export const DIST_IDX = {
+  enabled: idx('dist.enabled'),
   type: idx('dist.type'),
   drive: idx('dist.drive'),
   mix: idx('dist.mix'),
@@ -450,13 +451,13 @@ export class Voice {
     }
 
     // ---- distortion section
-    const distType = Math.round(normToValue(PARAMS[DIST_IDX.type], ctx.base[DIST_IDX.type]))
-    if (distType > 0) {
+    if (ctx.base[DIST_IDX.enabled] >= 0.5) {
+      const distType = Math.round(normToValue(PARAMS[DIST_IDX.type], ctx.base[DIST_IDX.type]))
       const drive = this.pv(DIST_IDX.drive, ctx)
       const mix = this.pv(DIST_IDX.mix, ctx)
       const gain = 1 + drive * 15
       const comp = 1 / Math.pow(gain, 0.5)
-      if (distType === 4) {
+      if (distType === 3) {
         // bitcrush + downsample
         const bits = this.pv(DIST_IDX.bits, ctx)
         const levels = Math.pow(2, bits)
@@ -475,10 +476,10 @@ export class Voice {
         for (let i = 0; i < n; i++) {
           let sl: number
           let sr2: number
-          if (distType === 1) {
+          if (distType === 0) {
             sl = Math.tanh(bufL[i] * gain) * comp
             sr2 = Math.tanh(bufR[i] * gain) * comp
-          } else if (distType === 2) {
+          } else if (distType === 1) {
             sl = Math.max(-0.8, Math.min(0.8, bufL[i] * gain)) * comp
             sr2 = Math.max(-0.8, Math.min(0.8, bufR[i] * gain)) * comp
           } else {
