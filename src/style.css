@@ -426,7 +426,7 @@ body.mod-dragging .knob.moddable canvas {
 .matrix { display: flex; flex-direction: column; gap: 4px; }
 .matrix-head, .matrix-row {
   display: grid;
-  grid-template-columns: 130px 1fr 220px 60px;
+  grid-template-columns: 1fr 1fr 1fr 50px;
   gap: 8px;
   align-items: center;
 }
