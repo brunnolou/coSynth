@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { defaultValues, paramIndex } from '../shared/params'
 import { DEFAULT_FX_ORDER, FX_IDS, MAX_MOD_SLOTS, defaultLfoShape, modSourceIndex, type ModSlotState } from '../shared/messages'
 import type { PresetData, RecordedAudio, SynthEngine } from '../audio/engine'
-import { createWebMcpTools } from './tools'
+import { createWebMcpTools, type WebMcpToolDependencies } from './tools'
+import type { DecodeBase64AudioOptions, DecodedBase64Audio } from './audio-input'
 
 class MemoryStorage implements Storage {
   private data = new Map<string, string>()
@@ -62,13 +63,28 @@ class FakeEngine {
   })
 }
 
-function setup(lifecycleSignal?: AbortSignal) {
+function decodedReference(overrides: Partial<DecodedBase64Audio> = {}): DecodedBase64Audio {
+  const channel = Float32Array.from([0, 0.5, -0.5, 0])
+  return {
+    decodedBytes: 4,
+    duration: channel.length / 8000,
+    sampleRate: 8000,
+    channels: 1,
+    channelData: [channel],
+    ...overrides
+  }
+}
+
+function setup(
+  lifecycleSignal?: AbortSignal,
+  decodeAudio: NonNullable<WebMcpToolDependencies['decodeAudio']> = vi.fn(async () => decodedReference())
+) {
   const engine = new FakeEngine()
-  const tools = createWebMcpTools(engine as unknown as SynthEngine, lifecycleSignal)
+  const tools = createWebMcpTools(engine as unknown as SynthEngine, lifecycleSignal, { decodeAudio })
   const byName = new Map(tools.map(tool => [tool.name, tool]))
   const execute = async (name: string, input: Record<string, unknown> = {}, signal = new AbortController().signal) =>
     await byName.get(name)!.execute(input, { signal }) as any
-  return { engine, tools, byName, execute }
+  return { engine, tools, byName, execute, decodeAudio }
 }
 
 beforeEach(() => {
@@ -84,11 +100,12 @@ afterEach(() => {
 })
 
 describe('WebMCP tool metadata', () => {
-  it('exposes exactly nine strict object schemas with descriptions and annotations', () => {
+  it('exposes exactly eleven strict object schemas in composable workflow order', () => {
     const { tools } = setup()
     expect(tools.map(tool => tool.name)).toEqual([
       'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
-      'play_notes', 'render_audio', 'analyze_audio', 'save_preset', 'load_preset'
+      'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
+      'compare_audio', 'save_preset', 'load_preset'
     ])
     for (const tool of tools) {
       expect(tool.description.length).toBeGreaterThan(10)
@@ -96,8 +113,18 @@ describe('WebMCP tool metadata', () => {
       expect(tool.execute).toBeTypeOf('function')
     }
     expect(tools.filter(tool => tool.annotations?.readOnlyHint).map(tool => tool.name)).toEqual([
-      'get_synth_state', 'get_parameter_schema', 'analyze_audio'
+      'get_synth_state', 'get_parameter_schema', 'analyze_audio',
+      'compare_audio'
     ])
+    expect(tools[7].inputSchema).toMatchObject({
+      required: ['audioBase64'],
+      properties: {
+        audioBase64: { type: 'string', maxLength: 16 * 1024 * 1024 },
+        name: { type: 'string' },
+        mimeType: { type: 'string' }
+      }
+    })
+    expect((tools[7].inputSchema as any).properties.mimeType.pattern).toBe('^[aA][uU][dD][iI][oO]/')
   })
 })
 
@@ -358,6 +385,232 @@ describe('render and analysis tools', () => {
     stopped.engine.running = false
     ;(stopped.engine as unknown as { ctx: null }).ctx = null
     await expect(stopped.execute('analyze_audio')).resolves.toMatchObject({ source: 'scope', sampleRate: 48000 })
+  })
+
+  it('analyzes Base64 reference PCM with the same metrics without returning Base64 or PCM', async () => {
+    const decodeAudio = vi.fn(async () => decodedReference({ mimeType: 'audio/wav' }))
+    const { engine, execute } = setup(undefined, decodeAudio)
+    const audioBase64 = 'data:audio/wav;base64,UklGRg=='
+    const result = await execute('analyze_reference_audio', {
+      audioBase64,
+      name: 'reference.wav'
+    })
+
+    expect(result).toEqual({
+      source: 'base64-reference',
+      name: 'reference.wav',
+      mimeType: 'audio/wav',
+      decodedBytes: 4,
+      duration: 4 / 8000,
+      sampleRate: 8000,
+      channels: 1,
+      metrics: {
+        peakDb: expect.any(Number), rmsDb: expect.any(Number), clippingCount: expect.any(Number),
+        dcOffset: expect.any(Number), spectralCentroidHz: expect.any(Number), attackMs: expect.any(Number),
+        stereoWidth: expect.any(Number)
+      }
+    })
+    expect(decodeAudio).toHaveBeenCalledWith(audioBase64, {
+      context: engine.ctx,
+      signal: expect.any(AbortSignal)
+    })
+    expect(JSON.stringify(result)).not.toContain(audioBase64)
+    expect(result).not.toHaveProperty('audioBase64')
+    expect(result).not.toHaveProperty('channelData')
+  })
+
+  it('strictly validates reference properties, name, MIME type, and non-empty Base64', async () => {
+    const { execute, decodeAudio } = setup()
+    const invalid: Array<[Record<string, unknown>, RegExp]> = [
+      [{ audioBase64: 'UklGRg==', extra: true }, /unexpected/i],
+      [{}, /audioBase64.*required/i],
+      [{ audioBase64: 4 }, /audioBase64.*string/i],
+      [{ audioBase64: '' }, /audioBase64.*empty/i],
+      [{ audioBase64: 'UklGRg==', name: '' }, /name/i],
+      [{ audioBase64: 'UklGRg==', name: '   ' }, /name/i],
+      [{ audioBase64: 'UklGRg==', name: 'x'.repeat(256) }, /255/i],
+      [{ audioBase64: 'UklGRg==', name: 'bad\nname' }, /name/i],
+      [{ audioBase64: 'UklGRg==', mimeType: 'text/plain' }, /audio MIME/i],
+      [{ audioBase64: 'UklGRg==', mimeType: '' }, /audio MIME/i]
+    ]
+    for (const [input, error] of invalid) await expect(execute('analyze_reference_audio', input)).rejects.toThrow(error)
+    expect(decodeAudio).not.toHaveBeenCalled()
+  })
+
+  it('normalizes explicit MIME case and rejects conflicts with data-URI-derived MIME', async () => {
+    const decodeAudio = vi.fn(async () => decodedReference({ mimeType: 'AuDiO/WaV' }))
+    const { execute } = setup(undefined, decodeAudio)
+    await expect(execute('analyze_reference_audio', {
+      audioBase64: 'DATA:AuDiO/WaV;BaSe64,UklGRg==',
+      mimeType: 'AUDIO/WAV'
+    })).resolves.toMatchObject({ mimeType: 'audio/wav' })
+    await expect(execute('analyze_reference_audio', {
+      audioBase64: 'data:audio/wav;base64,UklGRg==',
+      mimeType: 'audio/mpeg'
+    })).rejects.toThrow(/mimeType.*conflict/i)
+  })
+
+  it('requires a reference then compares against exactly the analyze_audio scope candidate', async () => {
+    const { execute } = setup()
+    await expect(execute('compare_audio')).rejects.toThrow(/analyze_reference_audio.*first/i)
+    await expect(execute('compare_audio', { extra: true })).rejects.toThrow(/unexpected/i)
+
+    const reference = await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', mimeType: 'audio/wav' })
+    const analysis = await execute('analyze_audio')
+    const result = await execute('compare_audio')
+    expect(result.reference).toEqual(reference)
+    expect(result.candidate).toEqual(analysis)
+    expect(result.comparison.similarity).toBeGreaterThanOrEqual(0)
+    expect(result.comparison.similarity).toBeLessThanOrEqual(1)
+    expect(Object.keys(result.comparison.details)).toEqual([
+      'peakDb', 'rmsDb', 'clippingCount', 'dcOffset',
+      'spectralCentroidHz', 'attackMs', 'stereoWidth'
+    ])
+  })
+
+  it('compares against the latest real render and retains only the latest reference analysis', async () => {
+    vi.useFakeTimers()
+    const first = decodedReference()
+    const second = decodedReference({
+      decodedBytes: 8,
+      channelData: [new Float32Array([0, 0.25, -0.25, 0])]
+    })
+    const decodeAudio = vi.fn()
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second)
+    const { execute } = setup(undefined, decodeAudio)
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'first.wav' })
+    const latest = await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'latest.wav' })
+
+    const rendering = execute('render_audio', {
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02
+    })
+    await vi.advanceTimersByTimeAsync(30)
+    const render = await rendering
+    const result = await execute('compare_audio')
+    expect(result.reference).toEqual(latest)
+    expect(result.reference.name).toBe('latest.wav')
+    expect(result.candidate).toMatchObject({ source: 'last-render', metrics: render.metrics, url: render.url })
+    expect(result.reference).not.toHaveProperty('channelData')
+  })
+
+  it('rejects stale out-of-order reference completion and compare_audio retains the newer reference', async () => {
+    const resolvers: Array<(decoded: DecodedBase64Audio) => void> = []
+    const decodeAudio = vi.fn(() => new Promise<DecodedBase64Audio>(resolve => resolvers.push(resolve)))
+    const { execute } = setup(undefined, decodeAudio)
+    const older = execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'older.wav' })
+    const newer = execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'newer.wav' })
+    await vi.waitFor(() => expect(resolvers).toHaveLength(2))
+
+    resolvers[1](decodedReference({ decodedBytes: 8 }))
+    await expect(newer).resolves.toMatchObject({ name: 'newer.wav', decodedBytes: 8 })
+    resolvers[0](decodedReference({ decodedBytes: 4 }))
+    await expect(older).rejects.toThrow(/superseded/i)
+
+    await expect(execute('compare_audio')).resolves.toMatchObject({
+      reference: { name: 'newer.wav', decodedBytes: 8 }
+    })
+  })
+
+  it('promptly aborts a superseded decoder before starting the replacement and retains only B', async () => {
+    let activeDecodes = 0
+    let maxConcurrentDecodes = 0
+    let firstSignal: AbortSignal | undefined
+    const firstExecution = new AbortController()
+    const decodeAudio = vi.fn((audioBase64: string, options: DecodeBase64AudioOptions = {}) => {
+      activeDecodes++
+      maxConcurrentDecodes = Math.max(maxConcurrentDecodes, activeDecodes)
+      if (audioBase64 === 'Qg==') {
+        activeDecodes--
+        return Promise.resolve(decodedReference({
+          decodedBytes: 8,
+          channelData: [new Float32Array([0, 0.25, -0.25, 0])]
+        }))
+      }
+
+      firstSignal = options.signal
+      return new Promise<DecodedBase64Audio>((_resolve, reject) => {
+        const abort = () => {
+          activeDecodes--
+          const error = new Error('Reference audio analysis superseded')
+          error.name = 'AbortError'
+          reject(error)
+        }
+        options.signal?.addEventListener('abort', abort, { once: true })
+        if (options.signal?.aborted) abort()
+      })
+    })
+    const { execute } = setup(undefined, decodeAudio)
+    const first = execute('analyze_reference_audio', { audioBase64: 'QQ==', name: 'A.wav' }, firstExecution.signal)
+
+    try {
+      await vi.waitFor(() => expect(decodeAudio).toHaveBeenCalledOnce())
+      const second = execute('analyze_reference_audio', { audioBase64: 'Qg==', name: 'B.wav' })
+
+      await expect(second).resolves.toMatchObject({ name: 'B.wav', decodedBytes: 8 })
+      await vi.waitFor(() => expect(firstSignal?.aborted).toBe(true), { timeout: 100 })
+      await expect(first).rejects.toMatchObject({ name: 'AbortError' })
+      expect(maxConcurrentDecodes).toBe(1)
+      expect(activeDecodes).toBe(0)
+      await expect(execute('compare_audio')).resolves.toMatchObject({
+        reference: { name: 'B.wav', decodedBytes: 8 }
+      })
+    } finally {
+      firstExecution.abort()
+      await first.catch(() => undefined)
+    }
+  })
+
+  it('promptly aborts the active reference decoder on lifecycle disposal', async () => {
+    let activeDecodes = 0
+    let decoderSignal: AbortSignal | undefined
+    const lifecycle = new AbortController()
+    const decodeAudio = vi.fn((_audioBase64: string, options: DecodeBase64AudioOptions = {}) => {
+      activeDecodes++
+      decoderSignal = options.signal
+      return new Promise<DecodedBase64Audio>((_resolve, reject) => {
+        const abort = () => {
+          activeDecodes--
+          const error = new Error('Reference audio analysis aborted')
+          error.name = 'AbortError'
+          reject(error)
+        }
+        options.signal?.addEventListener('abort', abort, { once: true })
+        if (options.signal?.aborted) abort()
+      })
+    })
+    const { execute } = setup(lifecycle.signal, decodeAudio)
+    const pending = execute('analyze_reference_audio', { audioBase64: 'QQ==' })
+
+    await vi.waitFor(() => expect(decodeAudio).toHaveBeenCalledOnce())
+    lifecycle.abort()
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(decoderSignal?.aborted).toBe(true)
+    expect(activeDecodes).toBe(0)
+  })
+
+  it('honors execute and lifecycle aborts around reference decoding and analysis', async () => {
+    let finish!: () => void
+    const decodeAudio = vi.fn((_value: string, _options: unknown) => new Promise<DecodedBase64Audio>(resolve => {
+      finish = () => resolve(decodedReference())
+    }))
+    const execution = new AbortController()
+    const first = setup(undefined, decodeAudio)
+    const pending = first.execute('analyze_reference_audio', { audioBase64: 'UklGRg==' }, execution.signal)
+    await vi.waitFor(() => expect(decodeAudio).toHaveBeenCalledOnce())
+    execution.abort()
+    finish()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+
+    const lifecycle = new AbortController()
+    const second = setup(lifecycle.signal, decodeAudio)
+    const disposed = second.execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    await vi.waitFor(() => expect(decodeAudio).toHaveBeenCalledTimes(2))
+    lifecycle.abort()
+    finish()
+    await expect(disposed).rejects.toMatchObject({ name: 'AbortError' })
+    await expect(second.execute('compare_audio')).rejects.toMatchObject({ name: 'AbortError' })
   })
 
   it('aborts the note sequence and cleans up if recording fails', async () => {

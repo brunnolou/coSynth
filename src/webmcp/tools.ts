@@ -4,8 +4,9 @@ import {
   type ParamDef
 } from '../shared/params'
 import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type ModSlotState } from '../shared/messages'
-import { analyzeAudio, type AudioMetrics } from '../shared/audio-analysis'
+import { analyzeAudio, compareAudioMetrics, type AudioMetrics } from '../shared/audio-analysis'
 import { loadPreset, savePreset, validatePresetData, validatePresetName } from '../shared/preset-store'
+import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
 
 export const WEBMCP_TOOL_NAMES = [
   'get_synth_state',
@@ -15,6 +16,8 @@ export const WEBMCP_TOOL_NAMES = [
   'play_notes',
   'render_audio',
   'analyze_audio',
+  'analyze_reference_audio',
+  'compare_audio',
   'save_preset',
   'load_preset'
 ] as const
@@ -23,9 +26,27 @@ const MAX_NOTES = 128
 const MAX_PLAY_SECONDS = 30
 const MAX_RENDER_SECONDS = 15
 const MAX_QUERY_LENGTH = 100
+const MAX_REFERENCE_NAME_LENGTH = 255
+const MAX_MIME_TYPE_LENGTH = 127
 
 type Input = Record<string, unknown>
 interface ValidNote { midi: number; velocity: number; start: number; duration: number }
+type DecodeAudio = typeof decodeBase64Audio
+
+export interface WebMcpToolDependencies {
+  decodeAudio?: DecodeAudio
+}
+
+interface ReferenceAnalysis {
+  source: 'base64-reference'
+  name?: string
+  mimeType?: string
+  decodedBytes: number
+  duration: number
+  sampleRate: number
+  channels: number
+  metrics: AudioMetrics
+}
 
 function assertObject(value: unknown, label: string, allowed: readonly string[], required: readonly string[] = []): Input {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`${label} must be an object`)
@@ -124,6 +145,20 @@ function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw abortError()
 }
 
+function validateReferenceName(value: unknown): string | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || value.trim().length === 0 || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error('name must be a non-empty string without control characters')
+  }
+  if (value.length > MAX_REFERENCE_NAME_LENGTH) throw new Error(`name is limited to ${MAX_REFERENCE_NAME_LENGTH} characters`)
+  return value
+}
+
+function validateAudioMimeType(value: unknown): string | undefined {
+  if (value === undefined) return undefined
+  return normalizeAudioMimeType(value)
+}
+
 function wait(seconds: number, signal: AbortSignal): Promise<void> {
   throwIfAborted(signal)
   if (seconds <= 0) return Promise.resolve()
@@ -201,19 +236,29 @@ const noteSchema = {
 } as const
 
 /** Build WebMCP descriptors over the exact live engine used by the UI. */
-export function createWebMcpTools(engine: SynthEngine, lifecycleSignal?: AbortSignal): WebMCP.ModelContextTool[] {
+export function createWebMcpTools(
+  engine: SynthEngine,
+  lifecycleSignal?: AbortSignal,
+  dependencies: WebMcpToolDependencies = {}
+): WebMCP.ModelContextTool[] {
   let lastRender: { metrics: AudioMetrics; sampleRate: number; channels: number; url: string } | null = null
+  let lastReference: ReferenceAnalysis | null = null
+  let referenceGeneration = 0
+  let activeReferenceController: AbortController | null = null
   let performanceInProgress = false
+  const decodeAudio = dependencies.decodeAudio ?? decodeBase64Audio
 
-  const cleanupRender = () => {
+  const cleanup = () => {
+    referenceGeneration++
+    activeReferenceController?.abort()
+    activeReferenceController = null
     if (lastRender) URL.revokeObjectURL(lastRender.url)
     lastRender = null
+    lastReference = null
   }
-  lifecycleSignal?.addEventListener('abort', cleanupRender, { once: true })
+  lifecycleSignal?.addEventListener('abort', cleanup, { once: true })
 
-  async function runPerformance<T>(signal: AbortSignal, task: (signal: AbortSignal) => Promise<T>): Promise<T> {
-    if (performanceInProgress) throw new Error('A WebMCP performance is already in progress')
-    performanceInProgress = true
+  async function runAbortable<T>(signal: AbortSignal, task: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const controller = new AbortController()
     const abort = () => controller.abort()
     signal.addEventListener('abort', abort, { once: true })
@@ -225,7 +270,69 @@ export function createWebMcpTools(engine: SynthEngine, lifecycleSignal?: AbortSi
     } finally {
       signal.removeEventListener('abort', abort)
       lifecycleSignal?.removeEventListener('abort', abort)
+    }
+  }
+
+  async function runReferenceAnalysis<T>(
+    signal: AbortSignal,
+    invocationGeneration: number,
+    task: (signal: AbortSignal, assertCurrent: () => void) => Promise<T>
+  ): Promise<T> {
+    const superseded = new Error('Reference audio analysis was superseded by a newer invocation')
+    activeReferenceController?.abort(superseded)
+
+    const controller = new AbortController()
+    activeReferenceController = controller
+    const abort = () => controller.abort()
+    signal.addEventListener('abort', abort, { once: true })
+    lifecycleSignal?.addEventListener('abort', abort, { once: true })
+    if (signal.aborted || lifecycleSignal?.aborted) controller.abort()
+
+    const assertCurrent = () => {
+      if (controller.signal.aborted) {
+        const reason = controller.signal.reason
+        if (reason instanceof Error && /superseded/i.test(reason.message)) throw reason
+        throw abortError()
+      }
+      if (invocationGeneration !== referenceGeneration) {
+        throw new Error('Reference audio analysis was superseded by a newer invocation')
+      }
+    }
+
+    try {
+      assertCurrent()
+      return await task(controller.signal, assertCurrent)
+    } finally {
+      signal.removeEventListener('abort', abort)
+      lifecycleSignal?.removeEventListener('abort', abort)
+      if (activeReferenceController === controller) activeReferenceController = null
+    }
+  }
+
+  async function runPerformance<T>(signal: AbortSignal, task: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    if (performanceInProgress) throw new Error('A WebMCP performance is already in progress')
+    performanceInProgress = true
+    try {
+      return await runAbortable(signal, task)
+    } finally {
       performanceInProgress = false
+    }
+  }
+
+  function currentCandidate() {
+    if (lastRender) return {
+      source: 'last-render' as const,
+      sampleRate: lastRender.sampleRate,
+      channels: lastRender.channels,
+      url: lastRender.url,
+      metrics: lastRender.metrics
+    }
+    const sampleRate = engine.ctx?.sampleRate ?? 48000
+    return {
+      source: 'scope' as const,
+      sampleRate,
+      channels: 2,
+      metrics: analyzeAudio([engine.scopeL, engine.scopeR], sampleRate)
     }
   }
 
@@ -483,14 +590,76 @@ export function createWebMcpTools(engine: SynthEngine, lifecycleSignal?: AbortSi
       annotations: { readOnlyHint: true },
       execute(input) {
         assertObject(input, 'input', [])
-        if (lastRender) return {
-          source: 'last-render', sampleRate: lastRender.sampleRate, channels: lastRender.channels,
-          url: lastRender.url, metrics: lastRender.metrics
-        }
-        const sampleRate = engine.ctx?.sampleRate ?? 48000
+        return currentCandidate()
+      }
+    },
+    {
+      name: 'analyze_reference_audio',
+      description: 'Decode a short Base64 audio reference in memory and analyze it with the same metrics as synth output.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          audioBase64: { type: 'string', minLength: 1, maxLength: MAX_AUDIO_BASE64_CHARACTERS },
+          name: { type: 'string', minLength: 1, maxLength: MAX_REFERENCE_NAME_LENGTH },
+          mimeType: { type: 'string', minLength: 1, maxLength: MAX_MIME_TYPE_LENGTH, pattern: '^[aA][uU][dD][iI][oO]/' }
+        },
+        required: ['audioBase64'],
+        additionalProperties: false
+      },
+      async execute(input, { signal }) {
+        const invocationGeneration = ++referenceGeneration
+        return runReferenceAnalysis(signal, invocationGeneration, async (operationSignal, assertCurrent) => {
+          const value = assertObject(input, 'input', ['audioBase64', 'name', 'mimeType'], ['audioBase64'])
+          if (typeof value.audioBase64 !== 'string') throw new Error('audioBase64 must be a string')
+          if (value.audioBase64.length === 0 || value.audioBase64.trim().length === 0) {
+            throw new Error('audioBase64 must not be empty')
+          }
+          if (value.audioBase64.length > MAX_AUDIO_BASE64_CHARACTERS) {
+            throw new Error('audioBase64 is limited to 16 MiB characters')
+          }
+          const name = validateReferenceName(value.name)
+          const requestedMimeType = validateAudioMimeType(value.mimeType)
+          assertCurrent()
+          const decoded = await decodeAudio(value.audioBase64, { context: engine.ctx, signal: operationSignal })
+          assertCurrent()
+          const metrics = analyzeAudio(decoded.channelData, decoded.sampleRate)
+          assertCurrent()
+          const decodedMimeType = decoded.mimeType === undefined ? undefined : normalizeAudioMimeType(decoded.mimeType)
+          if (requestedMimeType && decodedMimeType && requestedMimeType !== decodedMimeType) {
+            throw new Error(`mimeType conflicts with data URI MIME type ${decodedMimeType}`)
+          }
+          const mimeType = requestedMimeType ?? decodedMimeType
+          const analysis: ReferenceAnalysis = {
+            source: 'base64-reference',
+            ...(name ? { name } : {}),
+            ...(mimeType ? { mimeType } : {}),
+            decodedBytes: decoded.decodedBytes,
+            duration: decoded.duration,
+            sampleRate: decoded.sampleRate,
+            channels: decoded.channels,
+            metrics
+          }
+          assertCurrent()
+          lastReference = analysis
+          return analysis
+        })
+      }
+    },
+    {
+      name: 'compare_audio',
+      description: 'Compare the latest Base64 reference analysis with the same synth candidate selected by analyze_audio.',
+      inputSchema: emptySchema,
+      annotations: { readOnlyHint: true },
+      execute(input, { signal }) {
+        if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
+        assertObject(input, 'input', [])
+        if (!lastReference) throw new Error('Call analyze_reference_audio first before compare_audio')
+        const candidate = currentCandidate()
+        if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
         return {
-          source: 'scope', sampleRate, channels: 2,
-          metrics: analyzeAudio([engine.scopeL, engine.scopeR], sampleRate)
+          reference: lastReference,
+          candidate,
+          comparison: compareAudioMetrics(lastReference.metrics, candidate.metrics)
         }
       }
     },

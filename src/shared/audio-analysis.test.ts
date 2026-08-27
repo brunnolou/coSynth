@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { analyzeAudio } from './audio-analysis'
+import { analyzeAudio, compareAudioMetrics, type AudioMetrics } from './audio-analysis'
 
 function sine(frequency: number, sampleRate: number, seconds: number, amplitude = 1, phase = 0): Float32Array {
   return Float32Array.from({ length: Math.round(sampleRate * seconds) }, (_, i) =>
@@ -79,5 +79,128 @@ describe('analyzeAudio', () => {
     })
     expect(() => analyzeAudio([], 48000)).toThrow(/channel/i)
     expect(() => analyzeAudio([new Float32Array(2)], 0)).toThrow(/sample rate/i)
+  })
+
+  it.each([Number.NaN, Infinity, -Infinity])('rejects nonfinite PCM sample %s before analysis', sample => {
+    expect(() => analyzeAudio([new Float32Array([0, sample, 0])], 48000)).toThrow(/finite.*sample/i)
+  })
+
+  it('rejects finite Float32 PCM when derived analysis metrics overflow', () => {
+    const huge = Float32Array.from([3e38, -3e38, 3e38, -3e38])
+    expect(Array.from(huge).every(Number.isFinite)).toBe(true)
+    expect(() => analyzeAudio([huge], 48000)).toThrow(/analysis.*nonfinite/i)
+  })
+
+  it('returns accepted metrics whose JSON serialization contains no null numeric values', () => {
+    const metrics = analyzeAudio([sine(440, 48000, 0.01, 0.25)], 48000)
+    expect(Object.values(metrics).every(Number.isFinite)).toBe(true)
+    expect(JSON.stringify(metrics)).not.toContain('null')
+  })
+})
+
+const metricKeys: (keyof AudioMetrics)[] = [
+  'peakDb', 'rmsDb', 'clippingCount', 'dcOffset',
+  'spectralCentroidHz', 'attackMs', 'stereoWidth'
+]
+
+const referenceMetrics: AudioMetrics = {
+  peakDb: -6,
+  rmsDb: -12,
+  clippingCount: 0,
+  dcOffset: 0.001,
+  spectralCentroidHz: 1200,
+  attackMs: 25,
+  stereoWidth: 0.2
+}
+
+describe('compareAudioMetrics', () => {
+  it('returns exact overall and per-metric similarity of 1 for identical metrics', () => {
+    const result = compareAudioMetrics(referenceMetrics, { ...referenceMetrics })
+    expect(result.similarity).toBe(1)
+    expect(Object.keys(result.details)).toEqual(metricKeys)
+    for (const key of metricKeys) {
+      expect(result.details[key]).toEqual({
+        reference: referenceMetrics[key],
+        candidate: referenceMetrics[key],
+        delta: 0,
+        similarity: 1
+      })
+    }
+  })
+
+  it('returns every signed delta and lowers bounded scores for meaningful differences', () => {
+    const candidate: AudioMetrics = {
+      peakDb: -18,
+      rmsDb: -30,
+      clippingCount: 20,
+      dcOffset: -0.05,
+      spectralCentroidHz: 4800,
+      attackMs: 200,
+      stereoWidth: 0.9
+    }
+    const result = compareAudioMetrics(referenceMetrics, candidate)
+    expect(result.similarity).toBeGreaterThanOrEqual(0)
+    expect(result.similarity).toBeLessThan(1)
+    for (const key of metricKeys) {
+      expect(result.details[key].reference).toBe(referenceMetrics[key])
+      expect(result.details[key].candidate).toBe(candidate[key])
+      expect(result.details[key].delta).toBe(candidate[key] - referenceMetrics[key])
+      expect(result.details[key].similarity).toBeGreaterThanOrEqual(0)
+      expect(result.details[key].similarity).toBeLessThanOrEqual(1)
+    }
+    expect(result.details.spectralCentroidHz.similarity).toBeLessThan(0.7)
+    expect(result.details.attackMs.similarity).toBeLessThan(0.7)
+  })
+
+  it('uses finite robust math for silence, zero, and nonnegative edge values', () => {
+    const silence: AudioMetrics = {
+      peakDb: -160, rmsDb: -160, clippingCount: 0, dcOffset: 0,
+      spectralCentroidHz: 0, attackMs: 0, stereoWidth: 0
+    }
+    const changed: AudioMetrics = {
+      peakDb: -159, rmsDb: -140, clippingCount: 1, dcOffset: 0,
+      spectralCentroidHz: 20, attackMs: 1, stereoWidth: 0
+    }
+    for (const result of [compareAudioMetrics(silence, silence), compareAudioMetrics(silence, changed)]) {
+      expect(Number.isFinite(result.similarity)).toBe(true)
+      for (const key of metricKeys) {
+        expect(Number.isFinite(result.details[key].similarity)).toBe(true)
+        expect(Number.isFinite(result.details[key].delta)).toBe(true)
+      }
+    }
+  })
+
+  it('reports clipping similarity but excludes clippingCount entirely from the overall score', () => {
+    const clipped = { ...referenceMetrics, clippingCount: 1_000_000 }
+    const result = compareAudioMetrics(referenceMetrics, clipped)
+    expect(result.details.clippingCount.similarity).toBeLessThan(1)
+    expect(result.similarity).toBe(1)
+  })
+
+  it.each(metricKeys)('rejects nonfinite reference and candidate %s values', key => {
+    expect(() => compareAudioMetrics({ ...referenceMetrics, [key]: Number.NaN }, referenceMetrics)).toThrow(/finite/i)
+    expect(() => compareAudioMetrics(referenceMetrics, { ...referenceMetrics, [key]: Infinity })).toThrow(/finite/i)
+  })
+
+  it('requires clippingCount to be a nonnegative integer', () => {
+    expect(() => compareAudioMetrics({ ...referenceMetrics, clippingCount: -1 }, referenceMetrics)).toThrow(/clippingCount.*nonnegative integer/i)
+    expect(() => compareAudioMetrics(referenceMetrics, { ...referenceMetrics, clippingCount: 1.5 })).toThrow(/clippingCount.*nonnegative integer/i)
+  })
+
+  it('returns only finite JSON numeric details, deltas, similarities, and overall score', () => {
+    const result = compareAudioMetrics(referenceMetrics, {
+      ...referenceMetrics,
+      peakDb: -160,
+      spectralCentroidHz: 0,
+      attackMs: 0,
+      clippingCount: 100
+    })
+    expect(Number.isFinite(result.similarity)).toBe(true)
+    for (const detail of Object.values(result.details)) {
+      expect(Object.values(detail).every(Number.isFinite)).toBe(true)
+    }
+    expect(JSON.stringify(result)).not.toContain('null')
+    const parsed = JSON.parse(JSON.stringify(result))
+    expect(typeof parsed.similarity).toBe('number')
   })
 })

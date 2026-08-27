@@ -15,7 +15,7 @@ describe('registerWebMcpTools', () => {
     expect(() => registration.dispose()).not.toThrow()
   })
 
-  it('registers each of the nine tools exactly once with a shared lifecycle signal', async () => {
+  it('registers each of the eleven tools exactly once with a shared lifecycle signal', async () => {
     const calls: Array<{ tool: WebMCP.ModelContextTool; signal?: AbortSignal }> = []
     const modelContext = context((tool, options) => {
       calls.push({ tool, signal: options?.signal })
@@ -28,7 +28,7 @@ describe('registerWebMcpTools', () => {
     expect(calls.map(({ tool }) => tool.name)).toEqual([
       'get_synth_state', 'get_parameter_schema', 'update_parameters',
       'set_modulation', 'play_notes', 'render_audio', 'analyze_audio',
-      'save_preset', 'load_preset'
+      'analyze_reference_audio', 'compare_audio', 'save_preset', 'load_preset'
     ])
     expect(new Set(calls.map(call => call.signal)).size).toBe(1)
     expect(calls[0].signal?.aborted).toBe(false)
@@ -47,7 +47,7 @@ describe('registerWebMcpTools', () => {
     })
 
     await expect(registerWebMcpTools(engine, modelContext).ready).resolves.toBeUndefined()
-    expect(attempted).toHaveLength(9)
+    expect(attempted).toHaveLength(11)
     expect(warn).toHaveBeenCalledTimes(2)
     warn.mockRestore()
   })

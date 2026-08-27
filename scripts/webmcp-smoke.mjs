@@ -51,7 +51,7 @@ try {
     Object.defineProperty(window, '__webMcpTools', { value: tools })
   })
   await shimmed.page.goto(url, { waitUntil: 'networkidle' })
-  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 9)
+  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 11)
   await shimmed.page.click('#start-btn')
   await shimmed.page.waitForFunction(() => !document.getElementById('start-overlay'), { timeout: 10000 })
 
@@ -65,6 +65,41 @@ try {
       return await tool.execute(input, { signal: controller.signal })
     }
     const names = [...tools.keys()]
+    const makeReferenceWavBase64 = () => {
+      const sampleRate = 8000
+      const frames = 800
+      const channels = 2
+      const bytesPerSample = 2
+      const blockAlign = channels * bytesPerSample
+      const buffer = new ArrayBuffer(44 + frames * blockAlign)
+      const view = new DataView(buffer)
+      const text = (offset, value) => {
+        for (let index = 0; index < value.length; index++) view.setUint8(offset + index, value.charCodeAt(index))
+      }
+      text(0, 'RIFF')
+      view.setUint32(4, buffer.byteLength - 8, true)
+      text(8, 'WAVE')
+      text(12, 'fmt ')
+      view.setUint32(16, 16, true)
+      view.setUint16(20, 1, true)
+      view.setUint16(22, channels, true)
+      view.setUint32(24, sampleRate, true)
+      view.setUint32(28, sampleRate * blockAlign, true)
+      view.setUint16(32, blockAlign, true)
+      view.setUint16(34, bytesPerSample * 8, true)
+      text(36, 'data')
+      view.setUint32(40, frames * blockAlign, true)
+      for (let frame = 0; frame < frames; frame++) {
+        const left = Math.sin(2 * Math.PI * 440 * frame / sampleRate) * 0.4
+        const right = Math.sin(2 * Math.PI * 660 * frame / sampleRate) * 0.25
+        view.setInt16(44 + frame * blockAlign, Math.round(left * 32767), true)
+        view.setInt16(46 + frame * blockAlign, Math.round(right * 32767), true)
+      }
+      const data = new Uint8Array(buffer)
+      let binary = ''
+      for (let index = 0; index < data.length; index++) binary += String.fromCharCode(data[index])
+      return btoa(binary)
+    }
     const state = await call('get_synth_state')
     const schema = await call('get_parameter_schema', { group: 'global' })
     const update = await call('update_parameters', { updates: [{ id: 'master.volume', value: 0.8 }] })
@@ -74,11 +109,17 @@ try {
     const played = await call('play_notes', {
       notes: [{ midi: 60, velocity: 0.9, start: 0, duration: 0.15 }]
     })
+    const referenceBase64 = makeReferenceWavBase64()
+    const reference = await call('analyze_reference_audio', {
+      audioBase64: `data:audio/wav;base64,${referenceBase64}`,
+      name: 'browser-reference.wav'
+    })
     const render = await call('render_audio', {
       notes: [{ midi: 60, velocity: 0.9, start: 0, duration: 0.25 }], duration: 0.6
     })
     const renderedBlob = await (await fetch(render.url)).blob()
     const analysis = await call('analyze_audio')
+    const comparison = await call('compare_audio')
     await call('save_preset', { name: 'WebMCP Smoke' })
     await call('update_parameters', { updates: [{ id: 'master.volume', value: 0.3 }] })
     const loaded = await call('load_preset', { name: 'WebMCP Smoke' })
@@ -97,6 +138,19 @@ try {
         channels: render.channels
       },
       analysisSource: analysis.source,
+      reference: {
+        source: reference.source,
+        name: reference.name,
+        mimeType: reference.mimeType,
+        decodedBytes: reference.decodedBytes,
+        duration: reference.duration,
+        sampleRate: reference.sampleRate,
+        channels: reference.channels,
+        metrics: reference.metrics,
+        echoedBase64: JSON.stringify(reference).includes(referenceBase64)
+      },
+      comparison: comparison.comparison,
+      comparisonCandidateSource: comparison.candidate.source,
       loadedRaw: loaded.state.patch.parameters['master.volume'].raw,
       heldNotes: window.soundgineer.heldNotes.size
     }
@@ -104,7 +158,8 @@ try {
 
   const expectedNames = [
     'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
-    'play_notes', 'render_audio', 'analyze_audio', 'save_preset', 'load_preset'
+    'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
+    'compare_audio', 'save_preset', 'load_preset'
   ]
   if (JSON.stringify(result.names) !== JSON.stringify(expectedNames)) throw new Error(`Unexpected tools: ${result.names}`)
   if (!result.running || !result.schemaCount || result.appliedRaw !== 0.8) throw new Error('State/schema/update check failed')
@@ -114,6 +169,23 @@ try {
     throw new Error(`Rendered audio is silent: ${JSON.stringify(result.render)}`)
   }
   if (result.analysisSource !== 'last-render' || Math.abs(result.loadedRaw - 0.8) > 1e-6) throw new Error('Analysis/preset check failed')
+  const metricKeys = ['peakDb', 'rmsDb', 'clippingCount', 'dcOffset', 'spectralCentroidHz', 'attackMs', 'stereoWidth']
+  if (result.reference.source !== 'base64-reference' || result.reference.mimeType !== 'audio/wav' ||
+      result.reference.decodedBytes <= 0 || result.reference.duration <= 0 || result.reference.duration > 30 ||
+      result.reference.channels < 1 || result.reference.echoedBase64) {
+    throw new Error(`Reference analysis check failed: ${JSON.stringify(result.reference)}`)
+  }
+  if (!metricKeys.every(key => Number.isFinite(result.reference.metrics[key]))) throw new Error('Reference metrics are not finite')
+  if (result.comparisonCandidateSource !== 'last-render' || !Number.isFinite(result.comparison.similarity) ||
+      result.comparison.similarity < 0 || result.comparison.similarity > 1 ||
+      !metricKeys.every(key => {
+        const detail = result.comparison.details[key]
+        return detail && Number.isFinite(detail.reference) && Number.isFinite(detail.candidate) &&
+          Number.isFinite(detail.delta) && Number.isFinite(detail.similarity) &&
+          detail.similarity >= 0 && detail.similarity <= 1
+      })) {
+    throw new Error(`Comparison check failed: ${JSON.stringify(result.comparison)}`)
+  }
   if (shimmed.errors.length) throw new Error(`Shimmed page errors:\n${shimmed.errors.join('\n')}`)
   console.log(JSON.stringify(result, null, 2))
   console.log('WEBMCP SMOKE OK')

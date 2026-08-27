@@ -11,6 +11,76 @@ export interface AudioMetrics {
   stereoWidth: number
 }
 
+export interface AudioMetricComparisonDetail {
+  reference: number
+  candidate: number
+  delta: number
+  similarity: number
+}
+
+export interface AudioMetricsComparison {
+  similarity: number
+  details: { [Key in keyof AudioMetrics]: AudioMetricComparisonDetail }
+}
+
+const clampSimilarity = (value: number): number => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
+const exponentialSimilarity = (error: number, scale: number): number =>
+  clampSimilarity(Math.exp(-Math.abs(error) / scale))
+const metricKeys: (keyof AudioMetrics)[] = [
+  'peakDb', 'rmsDb', 'clippingCount', 'dcOffset',
+  'spectralCentroidHz', 'attackMs', 'stereoWidth'
+]
+
+/**
+ * Compare summary audio features on bounded, metric-specific scales.
+ * This is feature similarity for iterative sound design, not proof that two
+ * sounds are perceptually identical.
+ */
+export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMetrics): AudioMetricsComparison {
+  for (const [label, metrics] of [['reference', reference], ['candidate', candidate]] as const) {
+    for (const key of metricKeys) {
+      if (!Number.isFinite(metrics[key])) throw new Error(`${label}.${key} must be finite`)
+    }
+    if (!Number.isInteger(metrics.clippingCount) || metrics.clippingCount < 0) {
+      throw new Error(`${label}.clippingCount must be a nonnegative integer`)
+    }
+  }
+  for (const key of metricKeys) {
+    if (!Number.isFinite(candidate[key] - reference[key])) {
+      throw new Error(`${key} delta must be finite`)
+    }
+  }
+
+  const detail = (key: keyof AudioMetrics, similarity: number): AudioMetricComparisonDetail => ({
+    reference: reference[key],
+    candidate: candidate[key],
+    delta: candidate[key] - reference[key],
+    similarity: clampSimilarity(similarity)
+  })
+  const logRatio = (left: number, right: number, floor: number): number =>
+    Math.log((Math.max(0, right) + floor) / (Math.max(0, left) + floor))
+
+  const details: AudioMetricsComparison['details'] = {
+    peakDb: detail('peakDb', exponentialSimilarity(candidate.peakDb - reference.peakDb, 12)),
+    rmsDb: detail('rmsDb', exponentialSimilarity(candidate.rmsDb - reference.rmsDb, 12)),
+    clippingCount: detail('clippingCount', exponentialSimilarity(
+      Math.log1p(Math.max(0, candidate.clippingCount)) - Math.log1p(Math.max(0, reference.clippingCount)), 4
+    )),
+    dcOffset: detail('dcOffset', exponentialSimilarity(candidate.dcOffset - reference.dcOffset, 0.05)),
+    spectralCentroidHz: detail('spectralCentroidHz', exponentialSimilarity(
+      logRatio(reference.spectralCentroidHz, candidate.spectralCentroidHz, 20), Math.log(4)
+    )),
+    attackMs: detail('attackMs', exponentialSimilarity(
+      logRatio(reference.attackMs, candidate.attackMs, 1), Math.log(4)
+    )),
+    stereoWidth: detail('stereoWidth', exponentialSimilarity(candidate.stereoWidth - reference.stereoWidth, 0.35))
+  }
+
+  const overallKeys = metricKeys.filter(key => key !== 'clippingCount')
+  const similarity = overallKeys.reduce((sum, key) => sum + details[key].similarity, 0) / overallKeys.length
+  return { similarity: clampSimilarity(similarity), details }
+}
+
 const toDb = (amplitude: number): number => amplitude > 0 ? 20 * Math.log10(amplitude) : -160
 
 export function analyzeAudio(channels: readonly Float32Array[], sampleRate: number): AudioMetrics {
@@ -28,6 +98,7 @@ export function analyzeAudio(channels: readonly Float32Array[], sampleRate: numb
   let count = 0
   for (const channel of channels) {
     for (const sample of channel) {
+      if (!Number.isFinite(sample)) throw new Error('Audio PCM must contain finite samples')
       const abs = Math.abs(sample)
       if (abs > peak) peak = abs
       if (abs >= 1) clippingCount++
@@ -103,7 +174,7 @@ export function analyzeAudio(channels: readonly Float32Array[], sampleRate: numb
     stereoWidth = total > 0 ? sideRms / total : 0
   }
 
-  return {
+  const metrics: AudioMetrics = {
     peakDb: toDb(peak),
     rmsDb: toDb(Math.sqrt(sumSquares / count)),
     clippingCount,
@@ -112,4 +183,13 @@ export function analyzeAudio(channels: readonly Float32Array[], sampleRate: numb
     attackMs,
     stereoWidth
   }
+  for (const key of metricKeys) {
+    if (!Number.isFinite(metrics[key])) {
+      throw new Error(`Audio analysis produced nonfinite metric: ${key}`)
+    }
+  }
+  if (!Number.isInteger(metrics.clippingCount) || metrics.clippingCount < 0) {
+    throw new Error('Audio analysis produced invalid clippingCount; expected a nonnegative integer')
+  }
+  return metrics
 }
