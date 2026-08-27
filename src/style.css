@@ -74,6 +74,13 @@ header {
   font-size: 11px;
   white-space: nowrap;
 }
+.hdr-stats {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 72px;
+}
 .hdr-voices {
   min-width: 52px;
   font-variant-numeric: tabular-nums;
@@ -125,7 +132,7 @@ main {
 }
 .osc-col {
   grid-column: 1;
-  grid-row: 1 / 3;
+  grid-row: 1;
   width: 100%;
   max-width: 360px;
 }
@@ -138,13 +145,11 @@ main {
   grid-row: 1;
 }
 .matrix-panel {
-  grid-column: 2 / 4;
-  grid-row: 2;
   min-width: 0;
 }
 .performance-panel {
   grid-column: 1 / 4;
-  grid-row: 3;
+  grid-row: 2;
   min-width: 0;
 }
 
@@ -231,10 +236,7 @@ body.mod-dragging .knob.moddable canvas {
 .toggle.on { color: var(--lfo); border-color: var(--lfo); }
 
 /* ------------------------------------------------ visualizers */
-.viz-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
+.osc-preview {
   height: 190px;
   flex: 0 0 auto;
 }
@@ -247,7 +249,7 @@ body.mod-dragging .knob.moddable canvas {
   overflow: hidden;
 }
 
-.wt3d-tabs, .scope-tabs {
+.wt3d-tabs {
   display: flex;
   gap: 4px;
   padding: 3px 6px;
@@ -266,6 +268,28 @@ body.mod-dragging .knob.moddable canvas {
   border-radius: 3px;
 }
 .scope-tab.on { color: var(--accent); background: var(--panel-2); }
+
+.header-scope {
+  width: 120px;
+  height: 40px;
+  flex: 0 0 auto;
+  cursor: pointer;
+  border-radius: 5px;
+}
+.header-scope:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+.header-scope canvas { display: block; }
+.scope-mode {
+  position: absolute;
+  top: 2px;
+  left: 4px;
+  color: var(--accent);
+  font-size: 8px;
+  letter-spacing: 0.8px;
+  pointer-events: none;
+}
 
 .filter-panel { min-width: 0; }
 .routing-wrap {

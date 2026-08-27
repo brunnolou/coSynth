@@ -27,15 +27,21 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   hdrRight.appendChild(new Knob(engine, paramIndex('master.bpm'), 40).root)
   const voiceLabel = el('span', 'hdr-stat hdr-voices', 'voices 0')
   const midiLabel = el('span', 'hdr-stat', 'MIDI: …')
+  const hdrStats = el('div', 'hdr-stats')
+  hdrStats.append(voiceLabel, midiLabel)
   const meter = el('div', 'meter')
   const meterL = el('div', 'meter-bar')
   const meterR = el('div', 'meter-bar')
   meter.append(meterL, meterR)
-  hdrRight.append(voiceLabel, midiLabel, meter)
+  const scope = new Scope(engine)
+  hdrRight.append(hdrStats, meter, scope.root)
   header.appendChild(hdrRight)
 
   // ------------------------------------------------------------ oscillators
   const oscCol = el('div', 'col osc-col')
+  const wt3d = new WavetableView(engine)
+  wt3d.root.classList.add('osc-preview')
+  oscCol.appendChild(wt3d.root)
   for (let o = 1; o <= 3; o++) {
     const panel = el('section', 'panel')
     const head = el('div', 'panel-head')
@@ -103,12 +109,6 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ center column
   const centerCol = el('div', 'col center-col')
-
-  const vizRow = el('div', 'viz-row')
-  const wt3d = new WavetableView(engine)
-  const scope = new Scope(engine)
-  vizRow.append(wt3d.root, scope.root)
-  centerCol.appendChild(vizRow)
 
   for (let f = 1; f <= 2; f++) {
     const panel = el('section', 'panel filter-panel')
@@ -218,10 +218,11 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   centerCol.appendChild(lfoPanel)
 
   // ------------------------------------------------------------ matrix
-  const matrixPanel = el('section', 'panel matrix-panel')
+  const matrixPanel = el('section', 'panel module-panel matrix-panel')
   const matrixHead = el('div', 'panel-head')
   matrixHead.appendChild(el('span', 'panel-title', 'MATRIX'))
   matrixPanel.append(matrixHead, new ModMatrix(engine).root)
+  centerCol.appendChild(matrixPanel)
 
   // ------------------------------------------------------------ performance sources
   const performancePanel = el('section', 'panel performance-panel')
@@ -252,7 +253,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ layout
   const main = el('main')
-  main.append(oscCol, centerCol, sideCol, matrixPanel, performancePanel)
+  main.append(oscCol, centerCol, sideCol, performancePanel)
   const keyboard = new Keyboard(engine)
   container.append(header, main, keyboard.root)
 
