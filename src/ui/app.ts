@@ -48,6 +48,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   oscCol.appendChild(wt3d.root)
   for (let o = 1; o <= 3; o++) {
     const panel = el('section', 'panel')
+    panel.addEventListener('click', () => wt3d.setOsc(o - 1))
     const head = el('div', 'panel-head')
     head.appendChild(paramToggle(engine, `osc${o}.enabled`, '●'))
     head.appendChild(el('span', 'panel-title', `OSC ${o}`))

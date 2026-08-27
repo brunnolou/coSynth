@@ -55,11 +55,7 @@ export class WavetableView {
     const tabs = el('div', 'wt3d-tabs')
     for (let o = 0; o < 3; o++) {
       const b = el('button', o === 0 ? 'scope-tab on' : 'scope-tab', `OSC ${o + 1}`) as HTMLButtonElement
-      b.addEventListener('click', () => {
-        this.osc = o
-        this.oscTabs.forEach((t, i) => t.classList.toggle('on', i === o))
-        this.rebuild()
-      })
+      b.addEventListener('click', () => this.setOsc(o))
       this.oscTabs.push(b)
       tabs.appendChild(b)
     }
@@ -72,6 +68,14 @@ export class WavetableView {
     })
     this.initGl()
     this.rebuild()
+  }
+
+  setOsc(osc: number): void {
+    if (!Number.isInteger(osc) || osc < 0 || osc >= this.oscTabs.length) return
+    const changed = this.osc !== osc
+    this.osc = osc
+    this.oscTabs.forEach((tab, index) => tab.classList.toggle('on', index === osc))
+    if (changed) this.rebuild()
   }
 
   private initGl(): void {
