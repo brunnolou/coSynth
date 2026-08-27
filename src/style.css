@@ -189,7 +189,12 @@ main {
   align-items: center;
   width: 52px;
 }
-.knob canvas { cursor: ns-resize; touch-action: none; }
+.knob > canvas {
+  cursor: ns-resize;
+  touch-action: none;
+  opacity: 0.7;
+}
+.knob:hover > canvas { opacity: 1; }
 .knob-label {
   font-size: 9px;
   color: var(--text-dim);
