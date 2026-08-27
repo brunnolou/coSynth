@@ -101,7 +101,7 @@ export class Knob {
   draw(): void {
     const c = this.cx
     const s = this.size
-    const r = s / 2 - 5
+    const r = s / 2 - 7
     const cx = s / 2
     const cy = s / 2
     const a0 = 0.75 * Math.PI
@@ -135,7 +135,8 @@ export class Knob {
     // modulation arcs
     const routes = this.engine.routesForDest(this.paramIndex)
     if (routes.length) {
-      let ring = r + 3.5
+      const maxRing = s / 2 - 2
+      let ring = Math.min(r + 3, maxRing)
       for (const { state } of routes) {
         if (!state.enabled) continue
         const col = sourceColor(state.source)
@@ -152,10 +153,10 @@ export class Knob {
         const cur = clamp01(v + state.depth * src)
         const ca = a0 + sweep * cur
         c.beginPath()
-        c.arc(cx + Math.cos(ca) * ring, cy + Math.sin(ca) * ring, 1.8, 0, 2 * Math.PI)
+        c.arc(cx + Math.cos(ca) * ring, cy + Math.sin(ca) * ring, 1.5, 0, 2 * Math.PI)
         c.fillStyle = col
         c.fill()
-        ring += 3
+        ring = Math.min(ring + 2.5, maxRing)
       }
     }
 
