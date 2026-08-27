@@ -64,6 +64,16 @@ try {
       // Match the standards API callback shape exactly.
       return await tool.execute(input, { signal: controller.signal })
     }
+    const callWithoutOptions = async (name, input = {}) => {
+      const tool = tools.get(name)
+      if (!tool) throw new Error(`Missing tool: ${name}`)
+      return await tool.execute(input)
+    }
+    const callWithoutSignal = async (name, input = {}) => {
+      const tool = tools.get(name)
+      if (!tool) throw new Error(`Missing tool: ${name}`)
+      return await tool.execute(input, {})
+    }
     const names = [...tools.keys()]
     const makeReferenceWavBase64 = () => {
       const sampleRate = 8000
@@ -106,7 +116,7 @@ try {
     const modulation = await call('set_modulation', {
       action: 'add', source: 'lfo1', destination: 'osc1.morph', depth: 0.2
     })
-    const played = await call('play_notes', {
+    const played = await callWithoutOptions('play_notes', {
       notes: [{ midi: 60, velocity: 0.9, start: 0, duration: 0.15 }]
     })
     const referenceBase64 = makeReferenceWavBase64()
@@ -114,7 +124,7 @@ try {
       audioBase64: `data:audio/wav;base64,${referenceBase64}`,
       name: 'browser-reference.wav'
     })
-    const render = await call('render_audio', {
+    const render = await callWithoutSignal('render_audio', {
       notes: [{ midi: 60, velocity: 0.9, start: 0, duration: 0.25 }], duration: 0.6
     })
     const renderedBlob = await (await fetch(render.url)).blob()

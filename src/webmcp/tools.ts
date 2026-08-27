@@ -141,6 +141,15 @@ function abortError(): Error {
   return error
 }
 
+/**
+ * Some experimental WebMCP clients omit the per-invocation AbortSignal even
+ * though the current type definition requires it. Treat that as an
+ * uncancellable invocation while retaining lifecycle cancellation.
+ */
+function invocationSignal(options?: WebMCP.ToolExecuteCallbackOptions): AbortSignal {
+  return options?.signal ?? new AbortController().signal
+}
+
 function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw abortError()
 }
@@ -411,6 +420,7 @@ export function createWebMcpTools(
         },
         required: ['updates'], additionalProperties: false
       },
+      annotations: { readOnlyHint: false },
       execute(input) {
         const value = assertObject(input, 'input', ['updates'], ['updates'])
         if (!Array.isArray(value.updates) || value.updates.length === 0) throw new Error('updates must be a non-empty array')
@@ -450,6 +460,7 @@ export function createWebMcpTools(
         },
         required: ['action'], additionalProperties: false
       },
+      annotations: { readOnlyHint: false },
       execute(input) {
         const value = assertObject(input, 'input', ['action', 'source', 'destination', 'depth', 'enabled', 'slot'], ['action'])
         if (!['add', 'update', 'remove', 'clear'].includes(value.action as string)) throw new Error('Unknown modulation action')
@@ -511,13 +522,14 @@ export function createWebMcpTools(
     },
     {
       name: 'play_notes',
-      description: 'Play a bounded sequence of MIDI notes with relative real-time start and duration values.',
+      description: 'Play a bounded sequence of MIDI notes with relative real-time start and duration values. Requires runtime.running=true; otherwise click CLICK TO START AUDIO first.',
       inputSchema: {
         type: 'object', properties: { notes: { type: 'array', minItems: 1, maxItems: MAX_NOTES, items: noteSchema } },
         required: ['notes'], additionalProperties: false
       },
-      async execute(input, { signal }) {
-        return runPerformance(signal, async operationSignal => {
+      annotations: { readOnlyHint: false },
+      async execute(input, options) {
+        return runPerformance(invocationSignal(options), async operationSignal => {
           const value = assertObject(input, 'input', ['notes'], ['notes'])
           const sequence = validateNotes(value.notes, MAX_PLAY_SECONDS)
           if (!engine.running) throw new Error('Start audio with a user gesture before playing notes')
@@ -530,7 +542,7 @@ export function createWebMcpTools(
     },
     {
       name: 'render_audio',
-      description: 'Record the live AudioWorklet output in real time while playing a bounded note sequence; this is not offline or deterministic.',
+      description: 'Record the live AudioWorklet output in real time while playing a bounded note sequence; this is not offline or deterministic. Requires runtime.running=true; otherwise click CLICK TO START AUDIO first.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -539,8 +551,9 @@ export function createWebMcpTools(
         },
         required: ['notes'], additionalProperties: false
       },
-      async execute(input, { signal }) {
-        return runPerformance(signal, async operationSignal => {
+      annotations: { readOnlyHint: false },
+      async execute(input, options) {
+        return runPerformance(invocationSignal(options), async operationSignal => {
           const value = assertObject(input, 'input', ['notes', 'duration'], ['notes'])
           const sequence = validateNotes(value.notes, MAX_RENDER_SECONDS)
           if (!engine.running) throw new Error('Start audio with a user gesture before rendering audio')
@@ -606,7 +619,9 @@ export function createWebMcpTools(
         required: ['audioBase64'],
         additionalProperties: false
       },
-      async execute(input, { signal }) {
+      annotations: { readOnlyHint: false, untrustedContentHint: true },
+      async execute(input, options) {
+        const signal = invocationSignal(options)
         const invocationGeneration = ++referenceGeneration
         return runReferenceAnalysis(signal, invocationGeneration, async (operationSignal, assertCurrent) => {
           const value = assertObject(input, 'input', ['audioBase64', 'name', 'mimeType'], ['audioBase64'])
@@ -650,7 +665,8 @@ export function createWebMcpTools(
       description: 'Compare the latest Base64 reference analysis with the same synth candidate selected by analyze_audio.',
       inputSchema: emptySchema,
       annotations: { readOnlyHint: true },
-      execute(input, { signal }) {
+      execute(input, options) {
+        const signal = invocationSignal(options)
         if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
         assertObject(input, 'input', [])
         if (!lastReference) throw new Error('Call analyze_reference_audio first before compare_audio')
@@ -670,6 +686,7 @@ export function createWebMcpTools(
         type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 80 } },
         required: ['name'], additionalProperties: false
       },
+      annotations: { readOnlyHint: false },
       execute(input) {
         const value = assertObject(input, 'input', ['name'], ['name'])
         const name = validatePresetName(value.name)
@@ -679,11 +696,12 @@ export function createWebMcpTools(
     },
     {
       name: 'load_preset',
-      description: 'Load a named localStorage preset through the live engine and return its verifiable resulting state.',
+      description: 'Load a named user preset previously saved to localStorage and return its verifiable resulting state. Factory presets from the UI dropdown are not included.',
       inputSchema: {
         type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 80 } },
         required: ['name'], additionalProperties: false
       },
+      annotations: { readOnlyHint: false },
       execute(input) {
         const value = assertObject(input, 'input', ['name'], ['name'])
         const name = validatePresetName(value.name)
