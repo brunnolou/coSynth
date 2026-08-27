@@ -110,7 +110,6 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   vizRow.append(wt3d.root, scope.root)
   centerCol.appendChild(vizRow)
 
-  const filterRow = el('div', 'filter-row')
   for (let f = 1; f <= 2; f++) {
     const panel = el('section', 'panel filter-panel')
     const head = el('div', 'panel-head')
@@ -122,8 +121,11 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
       `filter${f}.cutoff`, `filter${f}.resonance`, `filter${f}.drive`, `filter${f}.keytrack`, `filter${f}.mix`
     ], 42))
     bindEnabledState(engine, `filter${f}.enabled`, panel)
-    filterRow.appendChild(panel)
+    centerCol.appendChild(panel)
   }
+
+  // ------------------------------------------------------------ right column
+  const sideCol = el('div', 'col side-col')
   const distPanel = el('section', 'panel filter-panel')
   const distHead = el('div', 'panel-head')
   distHead.appendChild(paramToggle(engine, 'dist.enabled', '●'))
@@ -136,29 +138,13 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   routingWrap.appendChild(paramSelect(engine, 'filter.routing'))
   distPanel.appendChild(routingWrap)
   bindEnabledState(engine, 'dist.enabled', distPanel)
-  filterRow.appendChild(distPanel)
-  centerCol.appendChild(filterRow)
+  sideCol.appendChild(distPanel)
 
-  // ------------------------------------------------------------ modulator tabs
-  const tabsPanel = el('section', 'panel tabs-panel')
-  const tabBar = el('div', 'tab-bar')
-  const tabBodies = new Map<string, HTMLElement>()
-  const tabButtons = new Map<string, HTMLButtonElement>()
-  const addTab = (name: string, body: HTMLElement) => {
-    const btn = el('button', 'tab-btn', name) as HTMLButtonElement
-    btn.addEventListener('click', () => selectTab(name))
-    tabBar.appendChild(btn)
-    tabButtons.set(name, btn)
-    tabBodies.set(name, body)
-  }
-  const tabContent = el('div', 'tab-content')
-  const selectTab = (name: string) => {
-    tabContent.textContent = ''
-    tabContent.appendChild(tabBodies.get(name)!)
-    tabButtons.forEach((b, n) => b.classList.toggle('on', n === name))
-  }
-
-  // ENV tab
+  // ------------------------------------------------------------ envelopes
+  const envPanel = el('section', 'panel module-panel env-panel')
+  const envHead = el('div', 'panel-head')
+  envHead.appendChild(el('span', 'panel-title', 'ENV'))
+  envPanel.appendChild(envHead)
   const envBody = el('div', 'mod-tab')
   const envSelector = el('div', 'sub-tabs')
   const envDisplay = new EnvDisplay(engine, 1)
@@ -188,9 +174,14 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   }
   renderEnvKnobs()
   envBody.append(envSelector, envDisplay.root, envKnobArea)
-  addTab('ENV', envBody)
+  envPanel.appendChild(envBody)
+  centerCol.appendChild(envPanel)
 
-  // LFO tab
+  // ------------------------------------------------------------ LFOs
+  const lfoPanel = el('section', 'panel module-panel lfo-panel')
+  const lfoHead = el('div', 'panel-head')
+  lfoHead.appendChild(el('span', 'panel-title', 'LFO'))
+  lfoPanel.appendChild(lfoHead)
   const lfoBody = el('div', 'mod-tab')
   const lfoSelector = el('div', 'sub-tabs')
   const lfoEditor = new LfoEditor(engine, 0)
@@ -223,10 +214,19 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   }
   renderLfoKnobs()
   lfoBody.append(lfoSelector, lfoEditor.root, lfoKnobArea)
-  addTab('LFO', lfoBody)
+  lfoPanel.appendChild(lfoBody)
+  centerCol.appendChild(lfoPanel)
 
-  // MATRIX tab (also hosts macros + performance sources)
-  const matrixBody = el('div', 'mod-tab')
+  // ------------------------------------------------------------ matrix
+  const matrixPanel = el('section', 'panel matrix-panel')
+  const matrixHead = el('div', 'panel-head')
+  matrixHead.appendChild(el('span', 'panel-title', 'MATRIX'))
+  matrixPanel.append(matrixHead, new ModMatrix(engine).root)
+
+  // ------------------------------------------------------------ performance sources
+  const performancePanel = el('section', 'panel performance-panel')
+  const performanceHead = el('div', 'panel-head')
+  performanceHead.appendChild(el('span', 'panel-title', 'PERFORMANCE'))
   const srcRow = el('div', 'source-row')
   const macroKnobs = el('div', 'knob-row')
   for (let m = 1; m <= 4; m++) {
@@ -241,21 +241,18 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     perfBadges.appendChild(sourceBadge(engine, id))
   }
   srcRow.appendChild(perfBadges)
-  matrixBody.append(srcRow, new ModMatrix(engine).root)
-  addTab('MATRIX', matrixBody)
+  performancePanel.append(performanceHead, srcRow)
 
-  // FX tab
-  const fxBody = el('div', 'mod-tab')
-  fxBody.appendChild(new FxRack(engine).root)
-  addTab('FX', fxBody)
-
-  tabsPanel.append(tabBar, tabContent)
-  selectTab('ENV')
-  centerCol.appendChild(tabsPanel)
+  // ------------------------------------------------------------ effects
+  const fxPanel = el('section', 'panel fx-panel')
+  const fxHead = el('div', 'panel-head')
+  fxHead.appendChild(el('span', 'panel-title', 'FX'))
+  fxPanel.append(fxHead, new FxRack(engine).root)
+  sideCol.appendChild(fxPanel)
 
   // ------------------------------------------------------------ layout
   const main = el('main')
-  main.append(oscCol, centerCol)
+  main.append(oscCol, centerCol, sideCol, matrixPanel, performancePanel)
   const keyboard = new Keyboard(engine)
   container.append(header, main, keyboard.root)
 
