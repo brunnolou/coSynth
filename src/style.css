@@ -121,8 +121,8 @@ header {
 main {
   display: grid;
   grid-template-columns: minmax(300px, 360px) minmax(420px, 1fr) minmax(280px, 340px);
-  gap: 8px;
-  padding: 8px;
+  gap: 4px;
+  padding: 4px;
   flex: 1 1 auto;
   overflow: auto;
   min-height: 0;
@@ -132,7 +132,7 @@ main {
 .col {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 4px;
   min-width: 0;
 }
 .osc-col {
