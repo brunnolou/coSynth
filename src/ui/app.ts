@@ -25,7 +25,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   const hdrRight = el('div', 'hdr-right')
   hdrRight.appendChild(new Knob(engine, paramIndex('master.volume'), 40).root)
   hdrRight.appendChild(new Knob(engine, paramIndex('master.bpm'), 40).root)
-  const voiceLabel = el('span', 'hdr-stat', 'voices 0')
+  const voiceLabel = el('span', 'hdr-stat hdr-voices', 'voices 0')
   const midiLabel = el('span', 'hdr-stat', 'MIDI: …')
   const meter = el('div', 'meter')
   const meterL = el('div', 'meter-bar')
@@ -36,6 +36,13 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ oscillators
   const oscCol = el('div', 'col osc-col')
+  const bindPanelEnabled = (panel: HTMLElement, id: string) => {
+    const index = paramIndex(id)
+    const sync = () => panel.classList.toggle('panel-disabled', engine.getParam(index) < 0.5)
+    sync()
+    engine.onParam(index, sync)
+  }
+
   for (let o = 1; o <= 3; o++) {
     const panel = el('section', 'panel')
     const head = el('div', 'panel-head')
@@ -62,10 +69,11 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     panel.appendChild(knobRow(engine, [
       `osc${o}.unison`, `osc${o}.detune`, `osc${o}.blend`, `osc${o}.spread`, `osc${o}.phase`, `osc${o}.phase_rand`
     ], 42))
+    bindPanelEnabled(panel, `osc${o}.enabled`)
     oscCol.appendChild(panel)
   }
 
-  // sub + noise
+  // sub
   const subPanel = el('section', 'panel')
   const subHead = el('div', 'panel-head')
   subHead.appendChild(paramToggle(engine, 'sub.enabled', '●'))
@@ -73,6 +81,11 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   subHead.appendChild(paramSelect(engine, 'sub.shape'))
   subPanel.appendChild(subHead)
   subPanel.appendChild(knobRow(engine, ['sub.level', 'sub.pan', 'sub.octave'], 42))
+  bindPanelEnabled(subPanel, 'sub.enabled')
+  oscCol.appendChild(subPanel)
+
+  // noise
+  const noisePanel = el('section', 'panel')
   const noiseHead = el('div', 'panel-head')
   noiseHead.appendChild(paramToggle(engine, 'noise.enabled', '●'))
   noiseHead.appendChild(el('span', 'panel-title', 'NOISE'))
@@ -90,9 +103,10 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   })
   sampleBtn.addEventListener('click', () => sampleFile.click())
   noiseHead.append(sampleBtn, sampleFile)
-  subPanel.appendChild(noiseHead)
-  subPanel.appendChild(knobRow(engine, ['noise.level', 'noise.pan', 'noise.pitch'], 42))
-  oscCol.appendChild(subPanel)
+  noisePanel.appendChild(noiseHead)
+  noisePanel.appendChild(knobRow(engine, ['noise.level', 'noise.pan', 'noise.pitch'], 42))
+  bindPanelEnabled(noisePanel, 'noise.enabled')
+  oscCol.appendChild(noisePanel)
 
   // ------------------------------------------------------------ center column
   const centerCol = el('div', 'col center-col')

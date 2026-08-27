@@ -74,6 +74,10 @@ header {
   font-size: 11px;
   white-space: nowrap;
 }
+.hdr-voices {
+  min-width: 52px;
+  font-variant-numeric: tabular-nums;
+}
 
 .hdr-btn {
   background: var(--panel-2);
@@ -104,7 +108,7 @@ header {
 /* ------------------------------------------------ layout */
 main {
   display: grid;
-  grid-template-columns: minmax(300px, 340px) 1fr;
+  grid-template-columns: minmax(300px, 360px) 1fr;
   gap: 8px;
   padding: 8px;
   flex: 1 1 auto;
@@ -118,12 +122,19 @@ main {
   gap: 8px;
   min-width: 0;
 }
+.osc-col {
+  width: 100%;
+  max-width: 360px;
+}
 
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 8px;
+}
+.panel-disabled {
+  opacity: 0.48;
 }
 
 .panel-head {
