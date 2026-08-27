@@ -4,7 +4,7 @@
 import { FX_IDS } from '../shared/messages'
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
-import { paramToggle, paramSelect, knobRow } from './controls'
+import { bindEnabledState, paramToggle, paramSelect, knobRow } from './controls'
 
 const FX_LABELS: Record<string, string> = {
   chorus: 'CHORUS',
@@ -63,6 +63,7 @@ export class FxRack {
     }
     body.appendChild(knobRow(this.engine, FX_KNOBS[id], 40))
     unit.appendChild(body)
+    bindEnabledState(this.engine, `${id}.enabled`, unit)
     return unit
   }
 

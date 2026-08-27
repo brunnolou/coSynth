@@ -38,6 +38,15 @@ export function paramToggle(engine: SynthEngine, id: string, label = 'ON'): HTML
   return b
 }
 
+export function bindEnabledState(engine: SynthEngine, id: string, target: HTMLElement): () => void {
+  const index = paramIndex(id)
+  const sync = (value = engine.getParam(index)) => {
+    target.classList.toggle('is-disabled', value < 0.5)
+  }
+  sync()
+  return engine.onParam(index, sync)
+}
+
 export function knobRow(engine: SynthEngine, ids: string[], size = 46): HTMLElement {
   const row = el('div', 'knob-row')
   for (const id of ids) row.appendChild(new Knob(engine, paramIndex(id), size).root)
