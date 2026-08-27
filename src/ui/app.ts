@@ -128,6 +128,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     panel.appendChild(knobRow(engine, [
       `filter${f}.cutoff`, `filter${f}.resonance`, `filter${f}.drive`, `filter${f}.keytrack`, `filter${f}.mix`
     ], 42))
+    bindPanelEnabled(panel, `filter${f}.enabled`)
     filterRow.appendChild(panel)
   }
   const distPanel = el('section', 'panel filter-panel')
