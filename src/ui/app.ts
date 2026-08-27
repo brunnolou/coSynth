@@ -4,7 +4,7 @@ import { paramIndex } from '../shared/params'
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
 import { Knob, sourceBadge, animatedKnobs } from './knob'
-import { paramSelect, paramToggle, knobRow } from './controls'
+import { bindEnabledState, paramSelect, paramToggle, knobRow } from './controls'
 import { EnvDisplay } from './enveditor'
 import { LfoEditor } from './lfoeditor'
 import { ModMatrix } from './matrix'
@@ -36,13 +36,6 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ oscillators
   const oscCol = el('div', 'col osc-col')
-  const bindPanelEnabled = (panel: HTMLElement, id: string) => {
-    const index = paramIndex(id)
-    const sync = () => panel.classList.toggle('panel-disabled', engine.getParam(index) < 0.5)
-    sync()
-    engine.onParam(index, sync)
-  }
-
   for (let o = 1; o <= 3; o++) {
     const panel = el('section', 'panel')
     const head = el('div', 'panel-head')
@@ -69,7 +62,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     panel.appendChild(knobRow(engine, [
       `osc${o}.unison`, `osc${o}.detune`, `osc${o}.blend`, `osc${o}.spread`, `osc${o}.phase`, `osc${o}.phase_rand`
     ], 42))
-    bindPanelEnabled(panel, `osc${o}.enabled`)
+    bindEnabledState(engine, `osc${o}.enabled`, panel)
     oscCol.appendChild(panel)
   }
 
@@ -81,7 +74,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   subHead.appendChild(paramSelect(engine, 'sub.shape'))
   subPanel.appendChild(subHead)
   subPanel.appendChild(knobRow(engine, ['sub.level', 'sub.pan', 'sub.octave'], 42))
-  bindPanelEnabled(subPanel, 'sub.enabled')
+  bindEnabledState(engine, 'sub.enabled', subPanel)
   oscCol.appendChild(subPanel)
 
   // noise
@@ -105,7 +98,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   noiseHead.append(sampleBtn, sampleFile)
   noisePanel.appendChild(noiseHead)
   noisePanel.appendChild(knobRow(engine, ['noise.level', 'noise.pan', 'noise.pitch'], 42))
-  bindPanelEnabled(noisePanel, 'noise.enabled')
+  bindEnabledState(engine, 'noise.enabled', noisePanel)
   oscCol.appendChild(noisePanel)
 
   // ------------------------------------------------------------ center column
@@ -128,7 +121,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     panel.appendChild(knobRow(engine, [
       `filter${f}.cutoff`, `filter${f}.resonance`, `filter${f}.drive`, `filter${f}.keytrack`, `filter${f}.mix`
     ], 42))
-    bindPanelEnabled(panel, `filter${f}.enabled`)
+    bindEnabledState(engine, `filter${f}.enabled`, panel)
     filterRow.appendChild(panel)
   }
   const distPanel = el('section', 'panel filter-panel')

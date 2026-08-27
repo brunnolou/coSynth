@@ -133,7 +133,7 @@ main {
   border-radius: 8px;
   padding: 8px;
 }
-.panel-disabled {
+.is-disabled {
   opacity: 0.48;
 }
 
