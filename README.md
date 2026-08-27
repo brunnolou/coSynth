@@ -94,7 +94,17 @@ Exactly eleven semantic tools are available:
 - `compare_audio` — compares that latest reference analysis against the same latest-render/current-scope candidate selected by `analyze_audio`.
 - `save_preset` and `load_preset` — validated, replace-by-name browser presets in localStorage.
 
+Every tool explicitly declares whether it is read-only. State-changing tools
+set `readOnlyHint: false` so clients can classify them as write tools instead
+of leaving them unclassified. Reference-audio analysis also declares that its
+result may contain user-supplied metadata.
+
 WebMCP requires a secure context: deploy over HTTPS, or use `localhost` during development. At the time of writing it is an experimental browser feature; use a WebMCP-enabled Chrome build/flag and a compatible client such as ChatGPT's experimental browser integration. Audio still follows browser autoplay policy: a human user gesture must click **CLICK TO START AUDIO** before `play_notes` or `render_audio` can run.
+
+Soundgineer accepts both the current standards callback shape,
+`execute(input, { signal })`, and experimental clients that omit the execution
+options or its `AbortSignal`. Invocations without a signal remain cancellable
+through page lifecycle disposal.
 
 `render_audio` is intentionally **real-time**, not offline and not deterministic. It taps the current AudioWorklet graph through `MediaStreamAudioDestinationNode`/`MediaRecorder`, is capped at 15 seconds, revokes the previous blob URL, and always cleans up notes and recorder connections. Rendered audio metrics include peak/RMS dB, clipping count, DC offset, spectral centroid, attack time, and stereo width.
 

@@ -116,6 +116,11 @@ describe('WebMCP tool metadata', () => {
       'get_synth_state', 'get_parameter_schema', 'analyze_audio',
       'compare_audio'
     ])
+    expect(tools.filter(tool => tool.annotations?.readOnlyHint === false).map(tool => tool.name)).toEqual([
+      'update_parameters', 'set_modulation', 'play_notes', 'render_audio',
+      'analyze_reference_audio', 'save_preset', 'load_preset'
+    ])
+    expect(tools.find(tool => tool.name === 'analyze_reference_audio')?.annotations?.untrustedContentHint).toBe(true)
     expect(tools[7].inputSchema).toMatchObject({
       required: ['audioBase64'],
       properties: {
@@ -125,6 +130,28 @@ describe('WebMCP tool metadata', () => {
       }
     })
     expect((tools[7].inputSchema as any).properties.mimeType.pattern).toBe('^[aA][uU][dD][iI][oO]/')
+  })
+})
+
+describe('experimental client compatibility', () => {
+  it('plays, renders, and compares when invocation options omit the AbortSignal', async () => {
+    vi.useFakeTimers()
+    const { byName, engine } = setup()
+    const noteInput = { notes: [{ midi: 60, velocity: 0.8, start: 0, duration: 0.01 }] }
+
+    const played = (byName.get('play_notes')!.execute as any)(noteInput)
+    await vi.advanceTimersByTimeAsync(20)
+    await expect(played).resolves.toMatchObject({ completed: true })
+
+    const rendered = (byName.get('render_audio')!.execute as any)({ ...noteInput, duration: 0.02 }, {})
+    await vi.advanceTimersByTimeAsync(30)
+    await expect(rendered).resolves.toMatchObject({ renderMode: 'realtime', channels: 2 })
+    expect(engine.heldNotes.size).toBe(0)
+
+    await expect((byName.get('analyze_reference_audio')!.execute as any)({ audioBase64: 'UklGRg==' }))
+      .resolves.toMatchObject({ source: 'base64-reference' })
+    expect((byName.get('compare_audio')!.execute as any)({}, {}))
+      .toMatchObject({ candidate: { source: 'last-render' } })
   })
 })
 
