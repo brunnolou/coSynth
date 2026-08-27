@@ -108,12 +108,13 @@ header {
 /* ------------------------------------------------ layout */
 main {
   display: grid;
-  grid-template-columns: minmax(300px, 360px) 1fr;
+  grid-template-columns: minmax(300px, 360px) minmax(420px, 1fr) minmax(280px, 340px);
   gap: 8px;
   padding: 8px;
   flex: 1 1 auto;
   overflow: auto;
   min-height: 0;
+  align-items: start;
 }
 
 .col {
@@ -123,8 +124,28 @@ main {
   min-width: 0;
 }
 .osc-col {
+  grid-column: 1;
+  grid-row: 1 / 3;
   width: 100%;
   max-width: 360px;
+}
+.center-col {
+  grid-column: 2;
+  grid-row: 1;
+}
+.side-col {
+  grid-column: 3;
+  grid-row: 1;
+}
+.matrix-panel {
+  grid-column: 2 / 4;
+  grid-row: 2;
+  min-width: 0;
+}
+.performance-panel {
+  grid-column: 1 / 4;
+  grid-row: 3;
+  min-width: 0;
 }
 
 .panel {
@@ -246,11 +267,6 @@ body.mod-dragging .knob.moddable canvas {
 }
 .scope-tab.on { color: var(--accent); background: var(--panel-2); }
 
-.filter-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 8px;
-}
 .filter-panel { min-width: 0; }
 .routing-wrap {
   display: flex;
@@ -260,27 +276,13 @@ body.mod-dragging .knob.moddable canvas {
 }
 .routing-label { font-size: 9px; color: var(--text-dim); letter-spacing: 1px; }
 
-/* ------------------------------------------------ tabs */
-.tabs-panel {
-  flex: 1 1 auto;
+/* ------------------------------------------------ modulators */
+.module-panel {
   display: flex;
   flex-direction: column;
-  min-height: 240px;
+  min-width: 0;
 }
-.tab-bar { display: flex; gap: 4px; margin-bottom: 6px; }
-.tab-btn {
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  color: var(--text-dim);
-  border-radius: 5px;
-  padding: 4px 14px;
-  font-size: 11px;
-  letter-spacing: 1px;
-  cursor: pointer;
-}
-.tab-btn.on { color: var(--text); border-color: var(--accent); }
-.tab-content { flex: 1 1 auto; min-height: 0; overflow: auto; }
-.mod-tab { display: flex; flex-direction: column; gap: 6px; height: 100%; }
+.mod-tab { display: flex; flex-direction: column; gap: 6px; }
 
 .sub-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
 .sub-tab-wrap { display: flex; flex-direction: column; gap: 2px; align-items: center; }
@@ -296,8 +298,8 @@ body.mod-dragging .knob.moddable canvas {
 .sub-tab.on { color: var(--text); border-color: var(--accent); }
 
 .env-display, .lfo-editor {
-  height: 110px;
-  flex: 1 1 auto;
+  height: 130px;
+  flex: 0 0 auto;
   min-height: 90px;
   background: #101218;
   border: 1px solid var(--line);
@@ -307,6 +309,10 @@ body.mod-dragging .knob.moddable canvas {
 .lfo-editor canvas { touch-action: none; }
 
 .lfo-controls { align-items: center; }
+
+.performance-panel .source-row {
+  justify-content: space-between;
+}
 
 /* ------------------------------------------------ mod sources / badges */
 .source-badge {
