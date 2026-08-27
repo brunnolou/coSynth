@@ -7,6 +7,7 @@ import { el } from './common'
 export class Scope {
   readonly root: HTMLElement
   private readonly canvas: HTMLCanvasElement
+  private readonly modeLabel: HTMLElement
   private readonly cx: CanvasRenderingContext2D
   private w = 0
   private h = 0
@@ -16,31 +17,33 @@ export class Scope {
   private readonly smooth = new Float32Array(512)
 
   constructor(private readonly engine: SynthEngine) {
-    this.root = el('div', 'scope')
-    const tabs = el('div', 'scope-tabs')
-    const waveBtn = el('button', 'scope-tab on', 'WAVE')
-    const specBtn = el('button', 'scope-tab', 'SPECTRUM')
-    waveBtn.addEventListener('click', () => {
-      this.mode = 'wave'
-      waveBtn.classList.add('on')
-      specBtn.classList.remove('on')
-    })
-    specBtn.addEventListener('click', () => {
-      this.mode = 'spectrum'
-      specBtn.classList.add('on')
-      waveBtn.classList.remove('on')
-    })
-    tabs.append(waveBtn, specBtn)
+    this.root = el('div', 'scope header-scope')
+    this.root.tabIndex = 0
+    this.root.setAttribute('role', 'button')
+    this.root.setAttribute('aria-label', 'Waveform visualizer. Click to show spectrum.')
+    this.modeLabel = el('span', 'scope-mode', 'WAVE')
     this.canvas = el('canvas')
-    this.root.append(tabs, this.canvas)
+    this.root.append(this.canvas, this.modeLabel)
     this.cx = this.canvas.getContext('2d')!
+    const toggleMode = () => {
+      this.mode = this.mode === 'wave' ? 'spectrum' : 'wave'
+      const label = this.mode === 'wave' ? 'WAVE' : 'SPECTRUM'
+      this.modeLabel.textContent = label
+      this.root.setAttribute('aria-label', `${label === 'WAVE' ? 'Waveform' : 'Spectrum'} visualizer. Click to toggle.`)
+    }
+    this.root.addEventListener('click', toggleMode)
+    this.root.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return
+      event.preventDefault()
+      toggleMode()
+    })
     new ResizeObserver(() => this.resize()).observe(this.root)
   }
 
   private resize(): void {
     const dpr = window.devicePixelRatio || 1
     this.w = this.root.clientWidth
-    this.h = this.root.clientHeight - 22
+    this.h = this.root.clientHeight
     this.canvas.width = this.w * dpr
     this.canvas.height = Math.max(this.h, 10) * dpr
     this.canvas.style.width = `${this.w}px`
