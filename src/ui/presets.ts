@@ -23,7 +23,7 @@ const FACTORY: Partial<PresetData>[] = [
       'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 300, 'filter1.resonance': 0.35, 'filter1.drive': 0.3,
       'env1.attack': 0.003, 'env1.decay': 0.4, 'env1.sustain': 0.9, 'env1.release': 0.12,
       'env2.attack': 0.003, 'env2.decay': 0.35, 'env2.sustain': 0.15, 'env2.release': 0.1,
-      'dist.type': 1, 'dist.drive': 0.25
+      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.25
     }),
     mods: [{ source: 'env2', dest: 'filter1.cutoff', depth: 0.45, enabled: true }]
   },
@@ -82,7 +82,7 @@ const FACTORY: Partial<PresetData>[] = [
       'osc2.enabled': 1, 'osc2.wavetable': 0, 'osc2.morph': 0.7, 'osc2.transpose': -12, 'osc2.fine': 12, 'osc2.level': 0.5,
       'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 700, 'filter1.resonance': 0.1, 'filter1.drive': 0.4,
       'env1.attack': 0.003, 'env1.decay': 0.5, 'env1.sustain': 1, 'env1.release': 0.15,
-      'dist.type': 1, 'dist.drive': 0.3, 'eq.enabled': 1, 'eq.low_gain': 2
+      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.3, 'eq.enabled': 1, 'eq.low_gain': 2
     }),
     mods: [{ source: 'modwheel', dest: 'filter1.cutoff', depth: 0.3, enabled: true }]
   },
@@ -94,7 +94,7 @@ const FACTORY: Partial<PresetData>[] = [
       'filter1.drive': 0.5, 'filter1.keytrack': 0.5,
       'env1.attack': 0.002, 'env1.decay': 0.3, 'env1.sustain': 0.6, 'env1.release': 0.08,
       'env2.attack': 0.001, 'env2.decay': 0.18, 'env2.sustain': 0, 'env2.release': 0.1,
-      'dist.type': 1, 'dist.drive': 0.35,
+      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.35,
       'delay.enabled': 1, 'delay.division': 7, 'delay.mix': 0.18, 'delay.feedback': 0.3
     }),
     mods: [
@@ -111,7 +111,7 @@ const FACTORY: Partial<PresetData>[] = [
       'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 400, 'filter1.resonance': 0.4, 'filter1.drive': 0.3,
       'env1.attack': 0.002, 'env1.decay': 0.4, 'env1.sustain': 1, 'env1.release': 0.1,
       'lfo1.sync': 1, 'lfo1.division': 4,
-      'dist.type': 1, 'dist.drive': 0.3
+      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.3
     }),
     mods: [
       { source: 'lfo1', dest: 'filter1.cutoff', depth: 0.5, enabled: true },
@@ -153,7 +153,7 @@ const FACTORY: Partial<PresetData>[] = [
       'filter2.enabled': 1, 'filter2.type': 1, 'filter2.cutoff': 900, 'filter2.resonance': 0.2,
       'env1.attack': 0.002, 'env1.decay': 0.4, 'env1.sustain': 1, 'env1.release': 0.1,
       'lfo1.sync': 1, 'lfo1.division': 1, 'lfo2.sync': 1, 'lfo2.division': 7,
-      'dist.type': 3, 'dist.drive': 0.35, 'dist.mix': 0.7
+      'dist.enabled': 1, 'dist.type': 2, 'dist.drive': 0.35, 'dist.mix': 0.7
     }),
     mods: [
       { source: 'lfo1', dest: 'filter1.cutoff', depth: 0.45, enabled: true },
@@ -167,7 +167,7 @@ const FACTORY: Partial<PresetData>[] = [
       'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0, 'osc1.transpose': -12, 'osc1.level': 0.9,
       'env1.attack': 0.001, 'env1.decay': 1.2, 'env1.sustain': 0.4, 'env1.release': 0.3,
       'env2.attack': 0.001, 'env2.decay': 0.09, 'env2.sustain': 0, 'env2.release': 0.05,
-      'dist.type': 1, 'dist.drive': 0.2
+      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.2
     }),
     mods: [
       { source: 'env2', dest: 'osc1.transpose', depth: 0.25, enabled: true },
@@ -202,7 +202,7 @@ const FACTORY: Partial<PresetData>[] = [
       'env1.attack': 0.002, 'env1.decay': 0.4, 'env1.sustain': 1, 'env1.release': 0.25,
       'env2.attack': 0.001, 'env2.decay': 0.6, 'env2.sustain': 0.3, 'env2.release': 0.3,
       'lfo1.sync': 0, 'lfo1.rate': 6,
-      'dist.type': 2, 'dist.drive': 0.25,
+      'dist.enabled': 1, 'dist.type': 1, 'dist.drive': 0.25,
       'delay.enabled': 1, 'delay.division': 7, 'delay.mix': 0.22
     }),
     mods: [
@@ -234,7 +234,7 @@ const FACTORY: Partial<PresetData>[] = [
       'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 12000,
       'env1.attack': 0.001, 'env1.decay': 0.3, 'env1.sustain': 1, 'env1.release': 0.05,
       'lfo1.sync': 0, 'lfo1.rate': 6.5,
-      'dist.type': 4, 'dist.bits': 6, 'dist.downsample': 6, 'dist.mix': 0.8,
+      'dist.enabled': 1, 'dist.type': 3, 'dist.bits': 6, 'dist.downsample': 6, 'dist.mix': 0.8,
       'delay.enabled': 1, 'delay.division': 7, 'delay.mix': 0.25, 'delay.feedback': 0.25
     }),
     mods: [{ source: 'lfo1', dest: 'osc1.fine', depth: 0.04, enabled: true }]
@@ -381,7 +381,7 @@ const FACTORY: Partial<PresetData>[] = [
       'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 5000, 'filter1.keytrack': 0.4,
       'env1.attack': 0.002, 'env1.decay': 1.5, 'env1.sustain': 0.35, 'env1.release': 0.4,
       'lfo1.sync': 0, 'lfo1.rate': 4.5, 'lfo1.mode': 1,
-      'dist.type': 4, 'dist.bits': 10, 'dist.downsample': 2, 'dist.mix': 0.5,
+      'dist.enabled': 1, 'dist.type': 3, 'dist.bits': 10, 'dist.downsample': 2, 'dist.mix': 0.5,
       'chorus.enabled': 1, 'chorus.mix': 0.35, 'reverb.enabled': 1, 'reverb.mix': 0.18
     }),
     mods: [
@@ -426,7 +426,7 @@ const FACTORY: Partial<PresetData>[] = [
       'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 4500, 'filter1.resonance': 0.15,
       'env1.attack': 0.002, 'env1.decay': 0.4, 'env1.sustain': 0, 'env1.release': 0.25,
       'env2.attack': 0.001, 'env2.decay': 0.2, 'env2.sustain': 0, 'env2.release': 0.1,
-      'dist.type': 1, 'dist.drive': 0.2, 'reverb.enabled': 1, 'reverb.mix': 0.2
+      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.2, 'reverb.enabled': 1, 'reverb.mix': 0.2
     }),
     mods: [
       { source: 'velocity', dest: 'filter1.cutoff', depth: 0.3, enabled: true },
@@ -473,7 +473,7 @@ const FACTORY: Partial<PresetData>[] = [
       'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 900, 'filter1.resonance': 0.35,
       'env1.attack': 0.001, 'env1.decay': 0.4, 'env1.sustain': 0, 'env1.release': 0.3,
       'env2.attack': 0.001, 'env2.decay': 0.1, 'env2.sustain': 0, 'env2.release': 0.05,
-      'dist.type': 3, 'dist.drive': 0.45, 'dist.mix': 0.8
+      'dist.enabled': 1, 'dist.type': 2, 'dist.drive': 0.45, 'dist.mix': 0.8
     }),
     mods: [
       { source: 'env2', dest: 'filter1.cutoff', depth: 0.35, enabled: true },

@@ -4,7 +4,7 @@
 
 import processorUrl from '../worklet/processor.ts?worker&url'
 import {
-  PARAMS, NUM_PARAMS, paramIndex, defaultValues, WAVETABLE_NAMES
+  PARAMS, NUM_PARAMS, paramIndex, defaultValues, WAVETABLE_NAMES, DIST_TYPES
 } from '../shared/params'
 import {
   MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, DEFAULT_FX_ORDER, FX_IDS,
@@ -38,6 +38,17 @@ function abortRecordingError(): Error {
   const error = new Error('Recording aborted')
   error.name = 'AbortError'
   return error
+}
+
+function migrateLegacyDistortionParams(params: Record<string, number>): Record<string, number> {
+  const legacyType = params['dist.type']
+  if (params['dist.enabled'] !== undefined || legacyType === undefined) return params
+  const legacyTypeIndex = Math.round(legacyType * DIST_TYPES.length)
+  return {
+    ...params,
+    'dist.enabled': legacyTypeIndex > 0 ? 1 : 0,
+    'dist.type': legacyTypeIndex > 0 ? (legacyTypeIndex - 1) / (DIST_TYPES.length - 1) : 0
+  }
 }
 
 type ParamListener = (value: number) => void
@@ -421,7 +432,8 @@ export class SynthEngine {
     const defs = defaultValues()
     this.values.set(defs)
     if (preset.params) {
-      for (const [id, v] of Object.entries(preset.params)) {
+      const params = migrateLegacyDistortionParams(preset.params)
+      for (const [id, v] of Object.entries(params)) {
         try {
           this.values[paramIndex(id)] = Math.max(0, Math.min(1, v))
         } catch {
