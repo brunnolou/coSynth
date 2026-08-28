@@ -20,11 +20,13 @@ overlay.innerHTML = `
 document.body.appendChild(overlay)
 
 let starting = false
+let audioWebMcp: ReturnType<typeof registerWebMcpTools> | null = null
 const start = async () => {
   if (starting) return
   starting = true
   try {
     await engine.start()
+    if (!audioWebMcp) audioWebMcp = registerWebMcpTools(engine, undefined, { audioTools: 'only' })
     overlay.remove()
   } catch (err) {
     starting = false
@@ -45,8 +47,14 @@ window.addEventListener('keydown', start, { once: false })
 
 // Progressive enhancement: WebMCP registration must never block synth startup.
 try {
-  const webMcp = registerWebMcpTools(engine)
-  bindWebMcpLifecycle(webMcp, window, import.meta.hot)
+  const webMcp = registerWebMcpTools(engine, undefined, { audioTools: 'exclude' })
+  bindWebMcpLifecycle({
+    ready: webMcp.ready,
+    dispose() {
+      webMcp.dispose()
+      audioWebMcp?.dispose()
+    }
+  }, window, import.meta.hot)
 } catch (error) {
   console.warn('WebMCP is unavailable:', error)
 }

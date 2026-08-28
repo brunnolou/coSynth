@@ -160,23 +160,26 @@ describe('state and parameter tools', () => {
     const { engine, execute } = setup()
     engine.modSlots[3] = { source: modSourceIndex('lfo1'), dest: paramIndex('filter1.cutoff'), depth: 0.4, enabled: true }
     engine.heldNotes.add(60)
-    const state = await execute('get_synth_state')
-    expect(state.patch.parameters['master.volume']).toMatchObject({ raw: 0.7, normalized: expect.any(Number), formatted: '70%' })
-    expect(state.patch.modulations).toContainEqual({ slot: 3, source: 'lfo1', destination: 'filter1.cutoff', depth: 0.4, enabled: true })
-    expect(state.patch.lfoShapes).toHaveLength(8)
+    const state = await execute('get_synth_state', { group: 'global', search: 'volume' })
+    expect(state.patch.parameters.items['master.volume']).toMatchObject({ raw: 0.7, normalized: expect.any(Number), formatted: '70%' })
+    expect(state.patch.modulationCount).toBe(1)
+    const routes = await execute('get_synth_state', { modulationOffset: 0 })
+    expect(routes.patch.modulations.items).toContainEqual({ slot: 3, source: 'lfo1', destination: 'filter1.cutoff', depth: 0.4, enabled: true })
+    const lfo = await execute('get_synth_state', { lfo: 1 })
+    expect(lfo.patch.lfoShape).toMatchObject({ id: 'lfo1', points: { items: expect.any(Array) } })
     expect(state.patch.fxOrder).toEqual(['chorus', 'phaser', 'flanger', 'delay', 'reverb', 'eq', 'comp', 'fxdist'])
     expect(state.runtime).toEqual({ running: true, heldNotes: [60], voices: 2, peaks: { left: 0.2, right: 0.1 } })
   })
 
   it('derives searchable schema with normalized defaults, sources, and limits', async () => {
     const { execute } = setup()
-    const result = await execute('get_parameter_schema', { group: 'filter1', search: 'cut' })
-    expect(result.parameters).toHaveLength(1)
-    expect(result.parameters[0]).toMatchObject({
+    const result = await execute('get_parameter_schema', { group: 'filter1', search: 'cut', sourceOffset: 6 })
+    expect(result.parameters.items).toHaveLength(1)
+    expect(result.parameters.items[0]).toMatchObject({
       id: 'filter1.cutoff', min: 20, max: 20000, default: 8000,
       curve: 'exp', moddable: true, normalizedDefault: expect.any(Number)
     })
-    expect(result.modulationSources.some((source: any) => source.id === 'lfo1')).toBe(true)
+    expect(result.modulationSources.items.some((source: any) => source.id === 'lfo1')).toBe(true)
     expect(result.limits).toMatchObject({ modulationSlots: 32, modulationDepth: [-1, 1], midiNotes: [0, 127], maxRenderSeconds: 15 })
     const tool = setup().byName.get('get_parameter_schema')!
     expect((tool.inputSchema as { properties: object }).properties).toMatchObject({
@@ -184,6 +187,12 @@ describe('state and parameter tools', () => {
     })
     await expect(execute('get_parameter_schema', { search: 'x'.repeat(101) })).rejects.toThrow(/100 characters/i)
     await expect(execute('get_parameter_schema', { nope: true })).rejects.toThrow(/unexpected/i)
+  })
+
+  it('keeps default discovery responses within the recommended WebMCP output budget', async () => {
+    const { execute } = setup()
+    expect(JSON.stringify(await execute('get_synth_state')).length).toBeLessThanOrEqual(1500)
+    expect(JSON.stringify(await execute('get_parameter_schema')).length).toBeLessThanOrEqual(1500)
   })
 
   it('atomically applies linear, exponential, step, and choice values canonically', async () => {
@@ -342,6 +351,36 @@ describe('note tools', () => {
     })
     await vi.advanceTimersByTimeAsync(20)
     await expect(afterAbort).resolves.toMatchObject({ completed: true })
+  })
+
+  it('blocks patch mutation for the complete performance window', async () => {
+    vi.useFakeTimers()
+    const { engine, execute } = setup()
+    engine.toPreset.mockReturnValue({
+      name: 'Before Performance', version: 1, params: { 'master.volume': 0.5 }, mods: [],
+      lfoShapes: engine.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
+    })
+    await execute('save_preset', { name: 'Before Performance' })
+    const controller = new AbortController()
+    const playing = execute('play_notes', {
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 10 }]
+    }, controller.signal)
+    await vi.advanceTimersByTimeAsync(1)
+
+    await expect(execute('update_parameters', { updates: [{ id: 'master.volume', value: 0.5 }] }))
+      .rejects.toThrow(/performance.*progress/i)
+    await expect(execute('set_modulation', { action: 'clear' }))
+      .rejects.toThrow(/performance.*progress/i)
+    await expect(execute('load_preset', { name: 'Before Performance' }))
+      .rejects.toThrow(/performance.*progress/i)
+    expect(engine.setParam).not.toHaveBeenCalled()
+    expect(engine.setModSlot).not.toHaveBeenCalled()
+    expect(engine.loadPreset).not.toHaveBeenCalled()
+
+    controller.abort()
+    await expect(playing).rejects.toThrow(/abort/i)
+    await expect(execute('update_parameters', { updates: [{ id: 'master.volume', value: 0.5 }] }))
+      .resolves.toMatchObject({ applied: [{ id: 'master.volume' }] })
   })
 
   it.each([
@@ -665,7 +704,7 @@ describe('render and analysis tools', () => {
 })
 
 describe('preset tools', () => {
-  it('saves/replaces a named patch and loads it with verifiable state', async () => {
+  it('saves/replaces a named patch and loads it with compact confirmation', async () => {
     const { engine, execute } = setup()
     engine.toPreset.mockImplementation((name: string): PresetData => ({
       name, version: 1, params: { 'master.volume': engine.values[paramIndex('master.volume')] }, mods: [],
@@ -677,8 +716,9 @@ describe('preset tools', () => {
     engine.values[paramIndex('master.volume')] = 0.9
     const loaded = await execute('load_preset', { name: 'Agent Patch' })
     expect(engine.loadPreset).toHaveBeenCalledTimes(1)
-    expect(loaded.name).toBe('Agent Patch')
-    expect(loaded.state.patch.parameters['master.volume'].normalized).toBeCloseTo(0.25)
+    expect(loaded).toEqual({ name: 'Agent Patch', loaded: true })
+    const state = await execute('get_synth_state', { search: 'master.volume' })
+    expect(state.patch.parameters.items['master.volume'].normalized).toBeCloseTo(0.25)
     await expect(execute('load_preset', { name: 'Missing' })).rejects.toThrow(/not found/i)
     await expect(execute('save_preset', { name: ' ' })).rejects.toThrow(/preset name/i)
   })

@@ -7,6 +7,7 @@ import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type ModSlotState }
 import { analyzeAudio, compareAudioMetrics, type AudioMetrics } from '../shared/audio-analysis'
 import { loadPreset, savePreset, validatePresetData, validatePresetName } from '../shared/preset-store'
 import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
+import { analyzeAudioAbortably } from './audio-analysis-task'
 
 export const WEBMCP_TOOL_NAMES = [
   'get_synth_state',
@@ -28,6 +29,7 @@ const MAX_RENDER_SECONDS = 15
 const MAX_QUERY_LENGTH = 100
 const MAX_REFERENCE_NAME_LENGTH = 255
 const MAX_MIME_TYPE_LENGTH = 127
+const MAX_PAGE_SIZE = 5
 
 type Input = Record<string, unknown>
 interface ValidNote { midi: number; velocity: number; start: number; duration: number }
@@ -35,6 +37,7 @@ type DecodeAudio = typeof decodeBase64Audio
 
 export interface WebMcpToolDependencies {
   decodeAudio?: DecodeAudio
+  analyzeAudioAsync?: typeof analyzeAudioAbortably
 }
 
 interface ReferenceAnalysis {
@@ -46,6 +49,31 @@ interface ReferenceAnalysis {
   sampleRate: number
   channels: number
   metrics: AudioMetrics
+}
+
+interface WebMcpSessionState {
+  lastRender: { metrics: AudioMetrics; sampleRate: number; channels: number; url: string } | null
+  lastReference: ReferenceAnalysis | null
+  referenceGeneration: number
+  activeReferenceController: AbortController | null
+  performanceInProgress: boolean
+}
+
+const sessions = new WeakMap<SynthEngine, WebMcpSessionState>()
+
+function sessionFor(engine: SynthEngine): WebMcpSessionState {
+  let session = sessions.get(engine)
+  if (!session) {
+    session = {
+      lastRender: null,
+      lastReference: null,
+      referenceGeneration: 0,
+      activeReferenceController: null,
+      performanceInProgress: false
+    }
+    sessions.set(engine, session)
+  }
+  return session
 }
 
 function assertObject(value: unknown, label: string, allowed: readonly string[], required: readonly string[] = []): Input {
@@ -83,28 +111,37 @@ function routeValue(slot: number, route: ModSlotState) {
   }
 }
 
-function snapshot(engine: SynthEngine) {
-  const parameters: Record<string, ReturnType<typeof parameterValue>> = {}
-  PARAMS.forEach((def, index) => { parameters[def.id] = parameterValue(def, engine.values[index]) })
-  const modulations = engine.modSlots.flatMap((route, slot) => route ? [routeValue(slot, route)] : [])
-  const lfoShapes = engine.lfoShapes.map((points, index) => ({
-    id: `lfo${index + 1}`,
-    points: points.map(point => ({ ...point }))
-  }))
+function runtimeSnapshot(engine: SynthEngine) {
   return {
-    patch: {
-      parameters,
-      modulations,
-      lfoShapes,
-      fxOrder: engine.fxOrder.map(index => FX_IDS[index]).filter((id): id is (typeof FX_IDS)[number] => id !== undefined)
-    },
-    runtime: {
-      running: engine.running,
-      heldNotes: [...engine.heldNotes].sort((a, b) => a - b),
-      voices: engine.voiceCount,
-      peaks: { left: engine.peakL, right: engine.peakR }
-    }
+    running: engine.running,
+    heldNotes: [...engine.heldNotes].sort((a, b) => a - b),
+    voices: engine.voiceCount,
+    peaks: { left: engine.peakL, right: engine.peakR }
   }
+}
+
+function fxOrder(engine: SynthEngine) {
+  return {
+    fxOrder: engine.fxOrder.map(index => FX_IDS[index]).filter((id): id is (typeof FX_IDS)[number] => id !== undefined)
+  }
+}
+
+function boundedInteger(value: unknown, label: string, fallback: number, min: number, max: number): number {
+  if (value === undefined) return fallback
+  const number = finite(value, label)
+  if (!Number.isInteger(number) || number < min || number > max) {
+    throw new Error(`${label} must be an integer in range ${min}..${max}`)
+  }
+  return number
+}
+
+function filteredParameters(group?: string, search?: string): ParamDef[] {
+  const normalizedGroup = group?.toLowerCase()
+  const normalizedSearch = search?.toLowerCase()
+  return PARAMS.filter(def =>
+    (!normalizedGroup || def.group.toLowerCase() === normalizedGroup) &&
+    (!normalizedSearch || `${def.id} ${def.name} ${def.group}`.toLowerCase().includes(normalizedSearch))
+  )
 }
 
 function validateNotes(value: unknown, maxSeconds: number): { notes: ValidNote[]; duration: number } {
@@ -250,20 +287,17 @@ export function createWebMcpTools(
   lifecycleSignal?: AbortSignal,
   dependencies: WebMcpToolDependencies = {}
 ): WebMCP.ModelContextTool[] {
-  let lastRender: { metrics: AudioMetrics; sampleRate: number; channels: number; url: string } | null = null
-  let lastReference: ReferenceAnalysis | null = null
-  let referenceGeneration = 0
-  let activeReferenceController: AbortController | null = null
-  let performanceInProgress = false
+  const session = sessionFor(engine)
   const decodeAudio = dependencies.decodeAudio ?? decodeBase64Audio
+  const analyzeAudioAsync = dependencies.analyzeAudioAsync ?? analyzeAudioAbortably
 
   const cleanup = () => {
-    referenceGeneration++
-    activeReferenceController?.abort()
-    activeReferenceController = null
-    if (lastRender) URL.revokeObjectURL(lastRender.url)
-    lastRender = null
-    lastReference = null
+    session.referenceGeneration++
+    session.activeReferenceController?.abort()
+    session.activeReferenceController = null
+    if (session.lastRender) URL.revokeObjectURL(session.lastRender.url)
+    session.lastRender = null
+    session.lastReference = null
   }
   lifecycleSignal?.addEventListener('abort', cleanup, { once: true })
 
@@ -288,10 +322,10 @@ export function createWebMcpTools(
     task: (signal: AbortSignal, assertCurrent: () => void) => Promise<T>
   ): Promise<T> {
     const superseded = new Error('Reference audio analysis was superseded by a newer invocation')
-    activeReferenceController?.abort(superseded)
+    session.activeReferenceController?.abort(superseded)
 
     const controller = new AbortController()
-    activeReferenceController = controller
+    session.activeReferenceController = controller
     const abort = () => controller.abort()
     signal.addEventListener('abort', abort, { once: true })
     lifecycleSignal?.addEventListener('abort', abort, { once: true })
@@ -303,7 +337,7 @@ export function createWebMcpTools(
         if (reason instanceof Error && /superseded/i.test(reason.message)) throw reason
         throw abortError()
       }
-      if (invocationGeneration !== referenceGeneration) {
+      if (invocationGeneration !== session.referenceGeneration) {
         throw new Error('Reference audio analysis was superseded by a newer invocation')
       }
     }
@@ -314,27 +348,31 @@ export function createWebMcpTools(
     } finally {
       signal.removeEventListener('abort', abort)
       lifecycleSignal?.removeEventListener('abort', abort)
-      if (activeReferenceController === controller) activeReferenceController = null
+      if (session.activeReferenceController === controller) session.activeReferenceController = null
     }
   }
 
   async function runPerformance<T>(signal: AbortSignal, task: (signal: AbortSignal) => Promise<T>): Promise<T> {
-    if (performanceInProgress) throw new Error('A WebMCP performance is already in progress')
-    performanceInProgress = true
+    if (session.performanceInProgress) throw new Error('A WebMCP performance is already in progress')
+    session.performanceInProgress = true
     try {
       return await runAbortable(signal, task)
     } finally {
-      performanceInProgress = false
+      session.performanceInProgress = false
     }
   }
 
+  function assertPerformanceIdle(action: string): void {
+    if (session.performanceInProgress) throw new Error(`${action} is unavailable while a WebMCP performance is in progress`)
+  }
+
   function currentCandidate() {
-    if (lastRender) return {
+    if (session.lastRender) return {
       source: 'last-render' as const,
-      sampleRate: lastRender.sampleRate,
-      channels: lastRender.channels,
-      url: lastRender.url,
-      metrics: lastRender.metrics
+      sampleRate: session.lastRender.sampleRate,
+      channels: session.lastRender.channels,
+      url: session.lastRender.url,
+      metrics: session.lastRender.metrics
     }
     const sampleRate = engine.ctx?.sampleRate ?? 48000
     return {
@@ -348,12 +386,79 @@ export function createWebMcpTools(
   return [
     {
       name: 'get_synth_state',
-      description: 'Get the complete live Soundgineer patch and runtime state using stable semantic IDs.',
-      inputSchema: emptySchema,
+      description: 'Get compact live synth state. Runtime, modulation routes, and FX order are returned by default; request a filtered parameter page or one LFO shape when needed.',
+      inputSchema: {
+        type: 'object', properties: {
+          group: { type: 'string', maxLength: MAX_QUERY_LENGTH },
+          search: { type: 'string', maxLength: MAX_QUERY_LENGTH },
+          parameterOffset: { type: 'integer', minimum: 0 },
+          parameterLimit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE },
+          modulationOffset: { type: 'integer', minimum: 0 },
+          modulationLimit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE },
+          lfo: { type: 'integer', minimum: 1, maximum: 8 },
+          lfoPointOffset: { type: 'integer', minimum: 0 },
+          lfoPointLimit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE }
+        }, additionalProperties: false
+      },
       annotations: { readOnlyHint: true },
       execute(input) {
-        assertObject(input, 'input', [])
-        return snapshot(engine)
+        const value = assertObject(input, 'input', [
+          'group', 'search', 'parameterOffset', 'parameterLimit', 'modulationOffset', 'modulationLimit',
+          'lfo', 'lfoPointOffset', 'lfoPointLimit'
+        ])
+        if (value.group !== undefined && typeof value.group !== 'string') throw new Error('group must be a string')
+        if (value.search !== undefined && typeof value.search !== 'string') throw new Error('search must be a string')
+        const group = value.group as string | undefined
+        const search = value.search as string | undefined
+        if (group && group.length > MAX_QUERY_LENGTH) throw new Error(`group is limited to ${MAX_QUERY_LENGTH} characters`)
+        if (search && search.length > MAX_QUERY_LENGTH) throw new Error(`search is limited to ${MAX_QUERY_LENGTH} characters`)
+        const offset = boundedInteger(value.parameterOffset, 'parameterOffset', 0, 0, PARAMS.length)
+        const limit = boundedInteger(value.parameterLimit, 'parameterLimit', 5, 1, MAX_PAGE_SIZE)
+        const matches = filteredParameters(group, search)
+        const includeParameters = group !== undefined || search !== undefined || value.parameterOffset !== undefined || value.parameterLimit !== undefined
+        const includeModulations = value.modulationOffset !== undefined || value.modulationLimit !== undefined
+        const includeLfo = value.lfo !== undefined || value.lfoPointOffset !== undefined || value.lfoPointLimit !== undefined
+        if (Number(includeParameters) + Number(includeModulations) + Number(includeLfo) > 1) {
+          throw new Error('Request parameters, modulations, or one LFO shape in separate calls')
+        }
+        if (includeLfo && value.lfo === undefined) throw new Error('lfo is required when paging LFO points')
+        const modulations = engine.modSlots.flatMap((route, slot) => route ? [routeValue(slot, route)] : [])
+        const modulationOffset = boundedInteger(value.modulationOffset, 'modulationOffset', 0, 0, MAX_MOD_SLOTS)
+        const modulationLimit = boundedInteger(value.modulationLimit, 'modulationLimit', 5, 1, MAX_PAGE_SIZE)
+        const modulationPage = modulations.slice(modulationOffset, modulationOffset + modulationLimit)
+        const lfo = value.lfo === undefined ? undefined : boundedInteger(value.lfo, 'lfo', 1, 1, 8)
+        const lfoPoints = lfo === undefined ? [] : engine.lfoShapes[lfo - 1]
+        const lfoPointOffset = boundedInteger(value.lfoPointOffset, 'lfoPointOffset', 0, 0, lfoPoints.length)
+        const lfoPointLimit = boundedInteger(value.lfoPointLimit, 'lfoPointLimit', 5, 1, MAX_PAGE_SIZE)
+        const lfoPointPage = lfoPoints.slice(lfoPointOffset, lfoPointOffset + lfoPointLimit)
+        const page = matches.slice(offset, offset + limit)
+        return {
+          runtime: runtimeSnapshot(engine),
+          patch: {
+            ...fxOrder(engine),
+            modulationCount: modulations.length,
+            ...(includeModulations ? { modulations: {
+              items: modulationPage, offset: modulationOffset, limit: modulationLimit, total: modulations.length,
+              ...(modulationOffset + modulationPage.length < modulations.length ? { nextOffset: modulationOffset + modulationPage.length } : {})
+            } } : {}),
+            ...(includeParameters ? {
+              parameters: {
+                items: Object.fromEntries(page.map(def => [def.id, parameterValue(def, engine.values[paramIndex(def.id)])])),
+                offset, limit, total: matches.length,
+                ...(offset + page.length < matches.length ? { nextOffset: offset + page.length } : {})
+              }
+            } : {}),
+            ...(!includeLfo || lfo === undefined ? {} : {
+              lfoShape: {
+                id: `lfo${lfo}`,
+                points: {
+                  items: lfoPointPage.map(point => ({ ...point })), offset: lfoPointOffset, limit: lfoPointLimit, total: lfoPoints.length,
+                  ...(lfoPointOffset + lfoPointPage.length < lfoPoints.length ? { nextOffset: lfoPointOffset + lfoPointPage.length } : {})
+                }
+              }
+            })
+          }
+        }
       }
     },
     {
@@ -362,22 +467,25 @@ export function createWebMcpTools(
       inputSchema: {
         type: 'object', properties: {
           group: { type: 'string', maxLength: MAX_QUERY_LENGTH },
-          search: { type: 'string', maxLength: MAX_QUERY_LENGTH }
+          search: { type: 'string', maxLength: MAX_QUERY_LENGTH },
+          offset: { type: 'integer', minimum: 0 },
+          limit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE },
+          sourceOffset: { type: 'integer', minimum: 0 },
+          sourceLimit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE }
         }, additionalProperties: false
       },
       annotations: { readOnlyHint: true },
       execute(input) {
-        const value = assertObject(input, 'input', ['group', 'search'])
+        const value = assertObject(input, 'input', ['group', 'search', 'offset', 'limit', 'sourceOffset', 'sourceLimit'])
         if (value.group !== undefined && typeof value.group !== 'string') throw new Error('group must be a string')
         if (value.search !== undefined && typeof value.search !== 'string') throw new Error('search must be a string')
         if ((value.group as string | undefined)?.length && (value.group as string).length > MAX_QUERY_LENGTH) throw new Error(`group is limited to ${MAX_QUERY_LENGTH} characters`)
         if ((value.search as string | undefined)?.length && (value.search as string).length > MAX_QUERY_LENGTH) throw new Error(`search is limited to ${MAX_QUERY_LENGTH} characters`)
-        const group = (value.group as string | undefined)?.toLowerCase()
-        const search = (value.search as string | undefined)?.toLowerCase()
-        const parameters = PARAMS.filter(def =>
-          (!group || def.group.toLowerCase() === group) &&
-          (!search || `${def.id} ${def.name} ${def.group}`.toLowerCase().includes(search))
-        ).map(def => ({
+        const matches = filteredParameters(value.group as string | undefined, value.search as string | undefined)
+        const offset = boundedInteger(value.offset, 'offset', 0, 0, PARAMS.length)
+        const limit = boundedInteger(value.limit, 'limit', 5, 1, MAX_PAGE_SIZE)
+        const page = matches.slice(offset, offset + limit)
+        const parameters = page.map(def => ({
           id: def.id, name: def.name, group: def.group,
           min: def.choices ? 0 : def.min,
           max: def.choices ? def.choices.length - 1 : def.max,
@@ -389,9 +497,15 @@ export function createWebMcpTools(
           curve: def.curve ?? 'lin',
           moddable: def.moddable === true
         }))
+        const sourceOffset = value.sourceOffset === undefined ? undefined : boundedInteger(value.sourceOffset, 'sourceOffset', 0, 0, MOD_SOURCES.length)
+        const sourceLimit = boundedInteger(value.sourceLimit, 'sourceLimit', 5, 1, MAX_PAGE_SIZE)
+        const sources = sourceOffset === undefined ? [] : MOD_SOURCES.slice(sourceOffset, sourceOffset + sourceLimit)
         return {
-          parameters,
-          modulationSources: MOD_SOURCES.map(source => ({ ...source })),
+          groups: [...new Set(PARAMS.map(def => def.group))],
+          parameters: { items: parameters, offset, limit, total: matches.length, ...(offset + page.length < matches.length ? { nextOffset: offset + page.length } : {}) },
+          ...(sourceOffset === undefined ? {} : {
+            modulationSources: { items: sources.map(source => ({ ...source })), offset: sourceOffset, limit: sourceLimit, total: MOD_SOURCES.length, ...(sourceOffset + sources.length < MOD_SOURCES.length ? { nextOffset: sourceOffset + sources.length } : {}) }
+          }),
           limits: {
             modulationSlots: MAX_MOD_SLOTS,
             modulationDepth: [-1, 1],
@@ -422,6 +536,7 @@ export function createWebMcpTools(
       },
       annotations: { readOnlyHint: false },
       execute(input) {
+        assertPerformanceIdle('Parameter updates')
         const value = assertObject(input, 'input', ['updates'], ['updates'])
         if (!Array.isArray(value.updates) || value.updates.length === 0) throw new Error('updates must be a non-empty array')
         const seen = new Set<string>()
@@ -462,6 +577,7 @@ export function createWebMcpTools(
       },
       annotations: { readOnlyHint: false },
       execute(input) {
+        assertPerformanceIdle('Modulation changes')
         const value = assertObject(input, 'input', ['action', 'source', 'destination', 'depth', 'enabled', 'slot'], ['action'])
         if (!['add', 'update', 'remove', 'clear'].includes(value.action as string)) throw new Error('Unknown modulation action')
         const action = value.action as string
@@ -572,10 +688,10 @@ export function createWebMcpTools(
           try {
             const [recording] = await Promise.all([recordingTask, notesTask])
             throwIfAborted(operationSignal)
-            const metrics = analyzeAudio(recording.channelData, recording.sampleRate)
-            if (lastRender) URL.revokeObjectURL(lastRender.url)
+            const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal)
+            if (session.lastRender) URL.revokeObjectURL(session.lastRender.url)
             const url = URL.createObjectURL(recording.blob)
-            lastRender = { metrics, sampleRate: recording.sampleRate, channels: recording.channelData.length, url }
+            session.lastRender = { metrics, sampleRate: recording.sampleRate, channels: recording.channelData.length, url }
             return {
               renderMode: 'realtime',
               mimeType: recording.mimeType,
@@ -622,7 +738,7 @@ export function createWebMcpTools(
       annotations: { readOnlyHint: false, untrustedContentHint: true },
       async execute(input, options) {
         const signal = invocationSignal(options)
-        const invocationGeneration = ++referenceGeneration
+        const invocationGeneration = ++session.referenceGeneration
         return runReferenceAnalysis(signal, invocationGeneration, async (operationSignal, assertCurrent) => {
           const value = assertObject(input, 'input', ['audioBase64', 'name', 'mimeType'], ['audioBase64'])
           if (typeof value.audioBase64 !== 'string') throw new Error('audioBase64 must be a string')
@@ -637,7 +753,7 @@ export function createWebMcpTools(
           assertCurrent()
           const decoded = await decodeAudio(value.audioBase64, { context: engine.ctx, signal: operationSignal })
           assertCurrent()
-          const metrics = analyzeAudio(decoded.channelData, decoded.sampleRate)
+          const metrics = await analyzeAudioAsync(decoded.channelData, decoded.sampleRate, operationSignal)
           assertCurrent()
           const decodedMimeType = decoded.mimeType === undefined ? undefined : normalizeAudioMimeType(decoded.mimeType)
           if (requestedMimeType && decodedMimeType && requestedMimeType !== decodedMimeType) {
@@ -655,7 +771,7 @@ export function createWebMcpTools(
             metrics
           }
           assertCurrent()
-          lastReference = analysis
+          session.lastReference = analysis
           return analysis
         })
       }
@@ -669,13 +785,13 @@ export function createWebMcpTools(
         const signal = invocationSignal(options)
         if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
         assertObject(input, 'input', [])
-        if (!lastReference) throw new Error('Call analyze_reference_audio first before compare_audio')
+        if (!session.lastReference) throw new Error('Call analyze_reference_audio first before compare_audio')
         const candidate = currentCandidate()
         if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
         return {
-          reference: lastReference,
+          reference: session.lastReference,
           candidate,
-          comparison: compareAudioMetrics(lastReference.metrics, candidate.metrics)
+          comparison: compareAudioMetrics(session.lastReference.metrics, candidate.metrics)
         }
       }
     },
@@ -691,7 +807,7 @@ export function createWebMcpTools(
         const value = assertObject(input, 'input', ['name'], ['name'])
         const name = validatePresetName(value.name)
         savePreset(engine.toPreset(name))
-        return { name, saved: true, state: snapshot(engine) }
+        return { name, saved: true }
       }
     },
     {
@@ -703,13 +819,14 @@ export function createWebMcpTools(
       },
       annotations: { readOnlyHint: false },
       execute(input) {
+        assertPerformanceIdle('Preset loading')
         const value = assertObject(input, 'input', ['name'], ['name'])
         const name = validatePresetName(value.name)
         const preset = loadPreset(name)
         if (!preset) throw new Error(`Preset not found: ${name}`)
         const validated = validatePresetData(preset)
         engine.loadPreset(validated)
-        return { name, loaded: true, state: snapshot(engine) }
+        return { name, loaded: true }
       }
     }
   ]

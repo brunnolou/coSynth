@@ -51,9 +51,14 @@ try {
     Object.defineProperty(window, '__webMcpTools', { value: tools })
   })
   await shimmed.page.goto(url, { waitUntil: 'networkidle' })
-  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 11)
+  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 9)
+  const toolsBeforeAudio = await shimmed.page.evaluate(() => [...window.__webMcpTools.keys()])
+  if (toolsBeforeAudio.includes('play_notes') || toolsBeforeAudio.includes('render_audio')) {
+    throw new Error('Audio tools were exposed before audio startup')
+  }
   await shimmed.page.click('#start-btn')
   await shimmed.page.waitForFunction(() => !document.getElementById('start-overlay'), { timeout: 10000 })
+  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 11)
 
   const result = await shimmed.page.evaluate(async () => {
     const tools = window.__webMcpTools
@@ -133,9 +138,11 @@ try {
     await call('save_preset', { name: 'WebMCP Smoke' })
     await call('update_parameters', { updates: [{ id: 'master.volume', value: 0.3 }] })
     const loaded = await call('load_preset', { name: 'WebMCP Smoke' })
+    const loadedState = await call('get_synth_state', { search: 'master.volume' })
+    const expectedError = await call('update_parameters', { updates: [{ id: 'missing', value: 1 }] })
     return {
       names, running: state.runtime.running,
-      schemaCount: schema.parameters.length,
+      schemaCount: schema.parameters.items.length,
       appliedRaw: update.applied[0].raw,
       modulationCount: modulation.count,
       played,
@@ -161,7 +168,9 @@ try {
       },
       comparison: comparison.comparison,
       comparisonCandidateSource: comparison.candidate.source,
-      loadedRaw: loaded.state.patch.parameters['master.volume'].raw,
+      loaded: loaded.loaded,
+      loadedRaw: loadedState.patch.parameters.items['master.volume'].raw,
+      expectedError,
       heldNotes: window.soundgineer.heldNotes.size
     }
   })
@@ -171,14 +180,19 @@ try {
     'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
     'compare_audio', 'save_preset', 'load_preset'
   ]
-  if (JSON.stringify(result.names) !== JSON.stringify(expectedNames)) throw new Error(`Unexpected tools: ${result.names}`)
+  if (JSON.stringify([...result.names].sort()) !== JSON.stringify([...expectedNames].sort())) throw new Error(`Unexpected tools: ${result.names}`)
   if (!result.running || !result.schemaCount || result.appliedRaw !== 0.8) throw new Error('State/schema/update check failed')
   if (result.modulationCount !== 1 || result.played.noteCount !== 1 || result.heldNotes !== 0) throw new Error('Modulation/note check failed')
   if (result.render.mode !== 'realtime' || result.render.blobSize <= 0 || result.render.channels < 1) throw new Error('Render metadata check failed')
   if (!Number.isFinite(result.render.peakDb) || result.render.peakDb <= -80 || !Number.isFinite(result.render.rmsDb)) {
     throw new Error(`Rendered audio is silent: ${JSON.stringify(result.render)}`)
   }
-  if (result.analysisSource !== 'last-render' || Math.abs(result.loadedRaw - 0.8) > 1e-6) throw new Error('Analysis/preset check failed')
+  if (result.analysisSource !== 'last-render' || !result.loaded || Math.abs(result.loadedRaw - 0.8) > 1e-6) {
+    throw new Error(`Analysis/preset check failed: ${JSON.stringify({ analysisSource: result.analysisSource, loaded: result.loaded, loadedRaw: result.loadedRaw })}`)
+  }
+  if (result.expectedError?.ok !== false || !/unknown parameter/i.test(result.expectedError?.error?.message ?? '')) {
+    throw new Error(`Structured error check failed: ${JSON.stringify(result.expectedError)}`)
+  }
   const metricKeys = ['peakDb', 'rmsDb', 'clippingCount', 'dcOffset', 'spectralCentroidHz', 'attackMs', 'stereoWidth']
   if (result.reference.source !== 'base64-reference' || result.reference.mimeType !== 'audio/wav' ||
       result.reference.decodedBytes <= 0 || result.reference.duration <= 0 || result.reference.duration > 30 ||

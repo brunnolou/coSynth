@@ -36,6 +36,34 @@ describe('registerWebMcpTools', () => {
     expect(calls[0].signal?.aborted).toBe(true)
   })
 
+  it('can expose safe tools before audio and audio tools only after startup', async () => {
+    const names: string[] = []
+    const modelContext = context(tool => { names.push(tool.name) })
+    await registerWebMcpTools(engine, modelContext, { audioTools: 'exclude' }).ready
+    expect(names).not.toContain('play_notes')
+    expect(names).not.toContain('render_audio')
+    expect(names).toHaveLength(9)
+
+    names.length = 0
+    await registerWebMcpTools(engine, modelContext, { audioTools: 'only' }).ready
+    expect(names).toEqual(['play_notes', 'render_audio'])
+  })
+
+  it('returns actionable expected errors while preserving cancellation semantics', async () => {
+    const calls: WebMCP.ModelContextTool[] = []
+    const modelContext = context(tool => { calls.push(tool) })
+    await registerWebMcpTools(engine, modelContext).ready
+
+    const update = calls.find(tool => tool.name === 'update_parameters')!
+    await expect(update.execute({ updates: [{ id: 'missing', value: 1 }] }, { signal: new AbortController().signal }))
+      .resolves.toEqual({ ok: false, error: { code: 'tool_error', message: 'Unknown parameter: missing' } })
+
+    const controller = new AbortController()
+    controller.abort()
+    const play = calls.find(tool => tool.name === 'play_notes')!
+    await expect(play.execute({ notes: [] }, { signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
   it('isolates synchronous and asynchronous registration errors', async () => {
     const attempted: string[] = []
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
