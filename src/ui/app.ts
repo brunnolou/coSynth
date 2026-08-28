@@ -15,6 +15,7 @@ import { Keyboard } from './keyboard'
 import { PresetBrowser } from './presets'
 import { initMidi } from './midi'
 import { FilterResponseView } from './filter-response'
+import { OscWavePreview } from './osc-wave-preview'
 
 export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   engine.primeTables()
@@ -45,6 +46,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   // ------------------------------------------------------------ oscillators
   const oscCol = el('div', 'col osc-col')
   const wt3d = new WavetableView(engine)
+  const oscWavePreviews: OscWavePreview[] = []
   wt3d.root.classList.add('osc-preview')
   oscCol.appendChild(wt3d.root)
   for (let o = 1; o <= 3; o++) {
@@ -66,7 +68,9 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
       file.value = ''
     })
     importBtn.addEventListener('click', () => file.click())
-    head.append(importBtn, file)
+    const wavePreview = new OscWavePreview(engine, o - 1)
+    oscWavePreviews.push(wavePreview)
+    head.append(importBtn, file, wavePreview.root)
     panel.appendChild(head)
     const oscKnobs = knobRow(engine, [
       `osc${o}.morph`, `osc${o}.level`, `osc${o}.pan`, `osc${o}.transpose`, `osc${o}.fine`, `osc${o}.sync`,
@@ -276,6 +280,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   const tick = () => {
     scope.draw()
     wt3d.draw()
+    for (const preview of oscWavePreviews) if (preview.animated) preview.draw()
     for (const k of animatedKnobs()) k.draw()
     for (const view of filterViews) if (view.animated) view.draw()
     lfoEditor.draw()

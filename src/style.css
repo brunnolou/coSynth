@@ -182,6 +182,22 @@ main {
   color: var(--text-dim);
 }
 
+.osc-wave-preview {
+  width: 76px;
+  height: 26px;
+  flex: 0 0 76px;
+  margin-left: auto;
+  background: #101218;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.osc-wave-preview canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
 /* ------------------------------------------------ knobs */
 .knob {
   display: flex;
