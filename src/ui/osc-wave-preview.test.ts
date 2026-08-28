@@ -21,9 +21,11 @@ describe('wavetableSample', () => {
 })
 
 describe('syncedPhase', () => {
-  it('wraps the slave waveform within the master oscillator cycle', () => {
+  it('centers the hard-sync reset and wraps toward both edges', () => {
+    expect(syncedPhase(0.5, 2)).toBe(0)
     expect(syncedPhase(0.25, 2)).toBe(0.5)
     expect(syncedPhase(0.75, 2)).toBe(0.5)
-    expect(syncedPhase(0.75, 1.5)).toBe(0.125)
+    expect(syncedPhase(0.25, 1.5)).toBe(0.625)
+    expect(syncedPhase(0.75, 1.5)).toBe(0.375)
   })
 })

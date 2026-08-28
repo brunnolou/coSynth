@@ -18,7 +18,8 @@ export function wavetableSample(table: Wavetable, morph: number, phase: number):
 }
 
 export function syncedPhase(phase: number, sync: number): number {
-  return (clamp01(phase) * Math.max(1, sync)) % 1
+  const centered = (clamp01(phase) - 0.5) * Math.max(1, sync)
+  return ((centered % 1) + 1) % 1
 }
 
 export class OscWavePreview {
