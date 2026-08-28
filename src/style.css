@@ -373,13 +373,13 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
 .mod-tab { display: flex; flex-direction: column; gap: 6px; }
 
 .sub-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
-.sub-tab-wrap { display: flex; flex-direction: column; gap: 2px; align-items: center; }
+.sub-tab-wrap { display: flex; flex-direction: column; gap: 4px; align-items: center; }
 .sub-tab {
   background: var(--panel-2);
   border: 1px solid var(--line);
   color: var(--text-dim);
   border-radius: 4px;
-  padding: 3px 8px;
+  padding: 8px;
   font-size: 10px;
   cursor: pointer;
 }

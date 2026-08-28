@@ -156,9 +156,6 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ envelopes
   const envPanel = el('section', 'panel module-panel env-panel')
-  const envHead = el('div', 'panel-head')
-  envHead.appendChild(el('span', 'panel-title', 'ENV'))
-  envPanel.appendChild(envHead)
   const envBody = el('div', 'mod-tab')
   const envSelector = el('div', 'sub-tabs')
   const envDisplay = new EnvDisplay(engine, 1)
@@ -193,9 +190,6 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ LFOs
   const lfoPanel = el('section', 'panel module-panel lfo-panel')
-  const lfoHead = el('div', 'panel-head')
-  lfoHead.appendChild(el('span', 'panel-title', 'LFO'))
-  lfoPanel.appendChild(lfoHead)
   const lfoBody = el('div', 'mod-tab')
   const lfoSelector = el('div', 'sub-tabs')
   const lfoEditor = new LfoEditor(engine, 0)
