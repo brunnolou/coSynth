@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Wavetable } from '../shared/wavetable-gen'
-import { wavetableSample } from './osc-wave-preview'
+import { syncedPhase, wavetableSample } from './osc-wave-preview'
 
 describe('wavetableSample', () => {
   const table: Wavetable = {
@@ -17,5 +17,13 @@ describe('wavetableSample', () => {
 
   it('interpolates between wavetable frames', () => {
     expect(wavetableSample(table, 0.5, 0)).toBeCloseTo(0.5)
+  })
+})
+
+describe('syncedPhase', () => {
+  it('wraps the slave waveform within the master oscillator cycle', () => {
+    expect(syncedPhase(0.25, 2)).toBe(0.5)
+    expect(syncedPhase(0.75, 2)).toBe(0.5)
+    expect(syncedPhase(0.75, 1.5)).toBe(0.125)
   })
 })

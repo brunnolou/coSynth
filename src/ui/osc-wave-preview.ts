@@ -1,5 +1,5 @@
 import type { SynthEngine } from '../audio/engine'
-import { paramIndex } from '../shared/params'
+import { PARAMS, normToValue, paramIndex } from '../shared/params'
 import type { Wavetable } from '../shared/wavetable-gen'
 import { el } from './common'
 
@@ -17,11 +17,16 @@ export function wavetableSample(table: Wavetable, morph: number, phase: number):
   return a + (b - a) * frameMix
 }
 
+export function syncedPhase(phase: number, sync: number): number {
+  return (clamp01(phase) * Math.max(1, sync)) % 1
+}
+
 export class OscWavePreview {
   readonly root: HTMLElement
   private readonly canvas: HTMLCanvasElement
   private readonly context: CanvasRenderingContext2D
   private readonly morphIndex: number
+  private readonly syncIndex: number
   private width = 0
   private height = 0
 
@@ -32,9 +37,11 @@ export class OscWavePreview {
     this.root.appendChild(this.canvas)
     this.context = this.canvas.getContext('2d')!
     this.morphIndex = paramIndex(`osc${osc + 1}.morph`)
+    this.syncIndex = paramIndex(`osc${osc + 1}.sync`)
 
     new ResizeObserver(() => this.resize()).observe(this.root)
     engine.onParam(this.morphIndex, () => this.draw())
+    engine.onParam(this.syncIndex, () => this.draw())
     engine.onTableChange(changedOsc => {
       if (changedOsc === osc) this.draw()
     })
@@ -42,12 +49,14 @@ export class OscWavePreview {
   }
 
   get animated(): boolean {
-    return this.engine.routesForDest(this.morphIndex).some(({ state }) => state.enabled)
+    return [this.morphIndex, this.syncIndex].some(index =>
+      this.engine.routesForDest(index).some(({ state }) => state.enabled)
+    )
   }
 
-  private morph(): number {
-    let value = this.engine.getParam(this.morphIndex)
-    for (const { state } of this.engine.routesForDest(this.morphIndex)) {
+  private normalizedValue(index: number): number {
+    let value = this.engine.getParam(index)
+    for (const { state } of this.engine.routesForDest(index)) {
       if (state.enabled) value += state.depth * (this.engine.sourceValues[state.source] ?? 0)
     }
     return clamp01(value)
@@ -82,12 +91,14 @@ export class OscWavePreview {
     c.stroke()
     if (!table) return
 
-    const morph = this.morph()
+    const morph = this.normalizedValue(this.morphIndex)
+    const sync = normToValue(PARAMS[this.syncIndex], this.normalizedValue(this.syncIndex))
     const points = Math.max(32, Math.round(w))
     c.beginPath()
     for (let i = 0; i < points; i++) {
       const x = i / (points - 1) * w
-      const sample = wavetableSample(table, morph, i / (points - 1))
+      const phase = syncedPhase(i / (points - 1), sync)
+      const sample = wavetableSample(table, morph, phase)
       const y = middle - sample * (h * 0.38)
       if (i === 0) c.moveTo(x, y)
       else c.lineTo(x, y)
