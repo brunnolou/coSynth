@@ -36,7 +36,7 @@ void main() {
   p = vec3(p.x, p.y * cx - p.z * sx, p.y * sx + p.z * cx);
   float zc = p.z + 2.6;
   float zoom = 1.55;
-  gl_Position = vec4(p.x * 2.0 * zoom / zc / uAspect, p.y * 2.0 * zoom / zc + 0.05, p.z * 0.1, 1.0);
+  gl_Position = vec4(p.x * 2.0 * zoom / zc / uAspect, p.y * 2.0 * zoom / zc + 0.14, p.z * 0.1, 1.0);
 }`
 
 const FRAG = `#version 300 es
