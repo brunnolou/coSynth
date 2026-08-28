@@ -7,6 +7,7 @@ const MIN_FREQ = 20
 const MAX_FREQ = 20000
 const MIN_DB = -36
 const MAX_DB = 12
+const FILTER_COLOR = '#e85cff'
 const KEY_TRACK_SOURCE = modSourceIndex('keytrack')
 const FORMANTS = [
   [800, 1150, 2900],
@@ -189,12 +190,12 @@ export class FilterResponseView {
       const high = clamp(params.cutoff * 2 ** (3 * params.keytrack), MIN_FREQ, MAX_FREQ)
       const x1 = frequencyToX(low, w)
       const x2 = frequencyToX(high, w)
-      c.fillStyle = '#53a8ff0c'
+      c.fillStyle = `${FILTER_COLOR}0c`
       c.fillRect(x1, 0, Math.max(1, x2 - x1), h)
     }
 
     const cutoffX = frequencyToX(params.cutoff, w)
-    c.strokeStyle = '#53a8ff45'
+    c.strokeStyle = `${FILTER_COLOR}45`
     c.setLineDash([2, 3])
     c.beginPath()
     c.moveTo(cutoffX, 0)
@@ -219,15 +220,15 @@ export class FilterResponseView {
     c.lineTo(0, h)
     c.closePath()
     const gradient = c.createLinearGradient(0, 0, 0, h)
-    gradient.addColorStop(0, '#53a8ff38')
-    gradient.addColorStop(1, '#53a8ff05')
+    gradient.addColorStop(0, `${FILTER_COLOR}38`)
+    gradient.addColorStop(1, `${FILTER_COLOR}05`)
     c.fillStyle = gradient
     c.fill()
 
     c.beginPath()
     c.moveTo(points[0][0], points[0][1])
     for (let i = 1; i < points.length; i++) c.lineTo(points[i][0], points[i][1])
-    c.strokeStyle = '#53a8ff'
+    c.strokeStyle = FILTER_COLOR
     c.lineWidth = 1.5
     c.lineJoin = 'round'
     c.stroke()

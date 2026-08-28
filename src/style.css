@@ -337,6 +337,16 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   width: 100%;
   height: 100%;
 }
+.filter-visual-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.filter-visual-panel {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.filter-visual-panel .filter-response { margin-bottom: 0; }
 .routing-wrap {
   display: flex;
   align-items: center;
