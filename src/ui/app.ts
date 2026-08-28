@@ -126,13 +126,13 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     panel.appendChild(head)
     const filterView = new FilterResponseView(engine, f as 1 | 2)
     filterViews.push(filterView)
+    panel.appendChild(filterView.root)
     panel.appendChild(knobRow(engine, [
       `filter${f}.cutoff`, `filter${f}.resonance`, `filter${f}.drive`, `filter${f}.keytrack`, `filter${f}.mix`
     ], 42))
     bindEnabledState(engine, `filter${f}.enabled`, panel)
     filterRow.appendChild(panel)
   }
-  centerCol.appendChild(filterRow)
 
   // ------------------------------------------------------------ right column
   const sideCol = el('div', 'col side-col')
@@ -226,19 +226,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   lfoBody.append(lfoSelector, lfoEditor.root, lfoKnobArea)
   lfoPanel.appendChild(lfoBody)
   centerCol.appendChild(lfoPanel)
-
-  // ------------------------------------------------------------ filter visualizers
-  const filterVisualRow = el('div', 'filter-visual-row')
-  filterViews.forEach((view, index) => {
-    const filter = index + 1
-    const panel = el('section', 'panel filter-visual-panel')
-    const head = el('div', 'panel-head')
-    head.appendChild(el('span', 'panel-title', `FILTER ${filter} RESPONSE`))
-    panel.append(head, view.root)
-    bindEnabledState(engine, `filter${filter}.enabled`, panel)
-    filterVisualRow.appendChild(panel)
-  })
-  centerCol.appendChild(filterVisualRow)
+  centerCol.appendChild(filterRow)
 
   // ------------------------------------------------------------ matrix
   const matrixPanel = el('section', 'panel module-panel matrix-panel')
