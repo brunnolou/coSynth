@@ -10,12 +10,16 @@ import type { SynthEngine } from '../audio/engine'
 import { el, sourceColor, clamp01, showPopup, closePopup } from './common'
 
 const knobRegistry = new Map<HTMLElement, Knob>()
+const MOD_CANVAS_PADDING = 12
 
 export class Knob {
   readonly root: HTMLElement
   private readonly canvas: HTMLCanvasElement
+  private readonly modCanvas: HTMLCanvasElement
   private readonly labelEl: HTMLElement
   private readonly cx: CanvasRenderingContext2D
+  private readonly modCx: CanvasRenderingContext2D
+  private readonly modSize: number
   private dragging = false
   private dragStartY = 0
   private dragStartVal = 0
@@ -29,16 +33,28 @@ export class Knob {
   ) {
     const def = PARAMS[paramIndex]
     this.root = el('div', 'knob')
-    this.canvas = el('canvas')
+    const canvasStack = el('div', 'knob-canvases')
+    canvasStack.style.width = `${size}px`
+    canvasStack.style.height = `${size}px`
+    this.canvas = el('canvas', 'knob-main-canvas')
+    this.modCanvas = el('canvas', 'knob-mod-canvas')
+    this.modSize = size + MOD_CANVAS_PADDING * 2
     const dpr = window.devicePixelRatio || 1
     this.canvas.width = size * dpr
     this.canvas.height = size * dpr
     this.canvas.style.width = `${size}px`
     this.canvas.style.height = `${size}px`
+    this.modCanvas.width = this.modSize * dpr
+    this.modCanvas.height = this.modSize * dpr
+    this.modCanvas.style.width = `${this.modSize}px`
+    this.modCanvas.style.height = `${this.modSize}px`
     this.cx = this.canvas.getContext('2d')!
+    this.modCx = this.modCanvas.getContext('2d')!
     this.cx.scale(dpr, dpr)
+    this.modCx.scale(dpr, dpr)
     this.labelEl = el('div', 'knob-label', label ?? def.name)
-    this.root.appendChild(this.canvas)
+    canvasStack.append(this.canvas, this.modCanvas)
+    this.root.appendChild(canvasStack)
     this.root.appendChild(this.labelEl)
     if (def.moddable) this.root.classList.add('moddable')
     knobRegistry.set(this.root, this)
@@ -100,15 +116,20 @@ export class Knob {
 
   draw(): void {
     const c = this.cx
+    const mc = this.modCx
     const s = this.size
-    const r = s / 2 - 7
+    const ms = this.modSize
+    const r = s / 2 - 8
     const cx = s / 2
     const cy = s / 2
+    const mcx = ms / 2
+    const mcy = ms / 2
     const a0 = 0.75 * Math.PI
     const sweep = 1.5 * Math.PI
     const v = this.engine.getParam(this.paramIndex)
 
     c.clearRect(0, 0, s, s)
+    mc.clearRect(0, 0, ms, ms)
 
     // track
     c.beginPath()
@@ -135,28 +156,28 @@ export class Knob {
     // modulation arcs
     const routes = this.engine.routesForDest(this.paramIndex)
     if (routes.length) {
-      const maxRing = s / 2 - 2
-      let ring = Math.min(r + 3, maxRing)
+      let ring = r + 3.5
       for (const { state } of routes) {
         if (!state.enabled) continue
         const col = sourceColor(state.source)
         const va = a0 + sweep * v
         const depthA = sweep * state.depth
         // static depth range arc
-        c.beginPath()
-        c.arc(cx, cy, ring, Math.min(va, va + depthA), Math.max(va, va + depthA))
-        c.strokeStyle = col + '55'
-        c.lineWidth = 2
-        c.stroke()
+        mc.beginPath()
+        mc.arc(mcx, mcy, ring, Math.min(va, va + depthA), Math.max(va, va + depthA))
+        mc.strokeStyle = col + '55'
+        mc.lineWidth = 2
+        mc.lineCap = 'round'
+        mc.stroke()
         // animated current-value dot
         const src = this.engine.sourceValues[state.source] ?? 0
         const cur = clamp01(v + state.depth * src)
         const ca = a0 + sweep * cur
-        c.beginPath()
-        c.arc(cx + Math.cos(ca) * ring, cy + Math.sin(ca) * ring, 1.5, 0, 2 * Math.PI)
-        c.fillStyle = col
-        c.fill()
-        ring = Math.min(ring + 2.5, maxRing)
+        mc.beginPath()
+        mc.arc(mcx + Math.cos(ca) * ring, mcy + Math.sin(ca) * ring, 1.8, 0, 2 * Math.PI)
+        mc.fillStyle = col
+        mc.fill()
+        ring += 3
       }
     }
 
