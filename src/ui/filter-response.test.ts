@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { filterMagnitude, type FilterResponseParams } from './filter-response'
+import { applyModulation, filterMagnitude, type FilterResponseParams } from './filter-response'
 
 const base: FilterResponseParams = {
   type: 0,
@@ -24,5 +24,17 @@ describe('filterMagnitude', () => {
     for (let type = 0; type < 9; type++) {
       expect(Number.isFinite(filterMagnitude(1000, { ...base, type, resonance: 1 }))).toBe(true)
     }
+  })
+})
+
+describe('applyModulation', () => {
+  it('tracks enabled source values and clamps the result', () => {
+    const routes = [
+      { source: 0, depth: 0.5, enabled: true },
+      { source: 1, depth: -0.25, enabled: true },
+      { source: 2, depth: 1, enabled: false }
+    ]
+    expect(applyModulation(0.3, routes, [0.8, 0.4, 1])).toBeCloseTo(0.6)
+    expect(applyModulation(0.8, [{ source: 0, depth: 1, enabled: true }], [1])).toBe(1)
   })
 })

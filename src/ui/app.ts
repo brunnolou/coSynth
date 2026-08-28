@@ -115,6 +115,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   // ------------------------------------------------------------ center column
   const centerCol = el('div', 'col center-col')
   const filterRow = el('div', 'filter-row')
+  const filterViews: FilterResponseView[] = []
 
   for (let f = 1; f <= 2; f++) {
     const panel = el('section', 'panel filter-panel')
@@ -123,7 +124,9 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     head.appendChild(el('span', 'panel-title', `FILTER ${f}`))
     head.appendChild(paramSelect(engine, `filter${f}.type`))
     panel.appendChild(head)
-    panel.appendChild(new FilterResponseView(engine, f as 1 | 2).root)
+    const filterView = new FilterResponseView(engine, f as 1 | 2)
+    filterViews.push(filterView)
+    panel.appendChild(filterView.root)
     panel.appendChild(knobRow(engine, [
       `filter${f}.cutoff`, `filter${f}.resonance`, `filter${f}.drive`, `filter${f}.keytrack`, `filter${f}.mix`
     ], 42))
@@ -274,6 +277,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     scope.draw()
     wt3d.draw()
     for (const k of animatedKnobs()) k.draw()
+    for (const view of filterViews) if (view.animated) view.draw()
     lfoEditor.draw()
     envDisplay.draw()
     voiceLabel.textContent = `voices ${engine.voiceCount}`

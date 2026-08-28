@@ -1,5 +1,6 @@
 import type { SynthEngine } from '../audio/engine'
 import { FILTER_TYPES, PARAMS, normToValue, paramIndex } from '../shared/params'
+import type { ModSlotState } from '../shared/messages'
 import { el } from './common'
 
 const MIN_FREQ = 20
@@ -26,6 +27,18 @@ export interface FilterResponseParams {
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value))
 const logDistance = (frequency: number, center: number): number => Math.log2(frequency / center)
 const gaussian = (distance: number, width: number): number => Math.exp(-0.5 * (distance / width) ** 2)
+
+export function applyModulation(
+  base: number,
+  routes: readonly Pick<ModSlotState, 'source' | 'depth' | 'enabled'>[],
+  sourceValues: ArrayLike<number>
+): number {
+  let value = base
+  for (const route of routes) {
+    if (route.enabled) value += route.depth * (sourceValues[route.source] ?? 0)
+  }
+  return clamp(value, 0, 1)
+}
 
 /** Approximate the audible magnitude of the synth's filter models for UI display. */
 export function filterMagnitude(frequency: number, params: FilterResponseParams): number {
@@ -91,16 +104,27 @@ export class FilterResponseView {
     for (const name of ['type', 'cutoff', 'resonance', 'drive', 'keytrack', 'mix']) {
       engine.onParam(paramIndex(`filter${filter}.${name}`), () => this.draw())
     }
+    engine.onMatrixChange(() => this.draw())
   }
 
-  private value(name: string): number {
+  get animated(): boolean {
+    return ['cutoff', 'resonance', 'drive', 'keytrack', 'mix'].some(name =>
+      this.engine.routesForDest(paramIndex(`filter${this.filter}.${name}`)).some(({ state }) => state.enabled)
+    )
+  }
+
+  private value(name: string, modulated = true): number {
     const index = paramIndex(`filter${this.filter}.${name}`)
-    return normToValue(PARAMS[index], this.engine.getParam(index))
+    const base = this.engine.getParam(index)
+    const normalized = modulated
+      ? applyModulation(base, this.engine.routesForDest(index).map(({ state }) => state), this.engine.sourceValues)
+      : base
+    return normToValue(PARAMS[index], normalized)
   }
 
   private params(): FilterResponseParams {
     return {
-      type: this.value('type'),
+      type: this.value('type', false),
       cutoff: this.value('cutoff'),
       resonance: this.value('resonance'),
       drive: this.value('drive'),
@@ -121,7 +145,7 @@ export class FilterResponseView {
     this.draw()
   }
 
-  private draw(): void {
+  draw(): void {
     const c = this.context
     const w = this.width
     const h = this.height
