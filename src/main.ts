@@ -3,8 +3,10 @@ import { SynthEngine } from './audio/engine'
 import { buildApp } from './ui/app'
 import { registerWebMcpTools } from './webmcp/register'
 import { bindWebMcpLifecycle } from './webmcp/lifecycle'
+import { agentActivityFor } from './webmcp/activity'
 
 const engine = new SynthEngine()
+const agentActivity = agentActivityFor(engine)
 const app = document.getElementById('app')!
 buildApp(engine, app)
 
@@ -26,7 +28,10 @@ const start = async () => {
   starting = true
   try {
     await engine.start()
-    if (!audioWebMcp) audioWebMcp = registerWebMcpTools(engine, undefined, { audioTools: 'only' })
+    if (!audioWebMcp) {
+      audioWebMcp = registerWebMcpTools(engine, undefined, { audioTools: 'only' })
+      if (document.modelContext) void audioWebMcp.ready.then(() => agentActivity.setToolReadiness(11, false))
+    }
     overlay.remove()
   } catch (err) {
     starting = false
@@ -48,6 +53,7 @@ window.addEventListener('keydown', start, { once: false })
 // Progressive enhancement: WebMCP registration must never block synth startup.
 try {
   const webMcp = registerWebMcpTools(engine, undefined, { audioTools: 'exclude' })
+  if (document.modelContext) void webMcp.ready.then(() => agentActivity.setToolReadiness(9, true))
   bindWebMcpLifecycle({
     ready: webMcp.ready,
     dispose() {

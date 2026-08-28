@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { registerWebMcpTools } from './register'
+import { agentActivityFor } from './activity'
 import type { SynthEngine } from '../audio/engine'
 
 const engine = {} as SynthEngine
@@ -57,6 +58,9 @@ describe('registerWebMcpTools', () => {
     const update = calls.find(tool => tool.name === 'update_parameters')!
     await expect(update.execute({ updates: [{ id: 'missing', value: 1 }] }, { signal: new AbortController().signal }))
       .resolves.toEqual({ ok: false, error: { code: 'tool_error', message: 'Unknown parameter: missing' } })
+    expect(agentActivityFor(engine).snapshot().lastAction).toMatchObject({
+      tool: 'update_parameters', status: 'failed', summary: 'Unknown parameter: missing'
+    })
 
     const controller = new AbortController()
     controller.abort()

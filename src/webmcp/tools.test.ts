@@ -208,6 +208,7 @@ describe('state and parameter tools', () => {
     expect(result.applied[0].normalized).toBeCloseTo(0.8)
     expect(result.applied[1].normalized).toBeCloseTo(Math.log(10) / Math.log(1000))
     expect(result.applied[3].formatted).toBe('PWM')
+    expect(engine.toPreset).toHaveBeenCalledWith('Agent checkpoint')
   })
 
   it.each([

@@ -99,6 +99,8 @@ set `readOnlyHint: false` so clients can classify them as write tools instead
 of leaving them unclassified. Reference-audio analysis also declares that its
 result may contain user-supplied metadata. Discovery responses are paginated to keep individual tool results compact. Request parameter, modulation, and LFO detail in separate `get_synth_state` calls. Expected validation and state failures return `{ ok: false, error: { code, message } }` through the registered WebMCP boundary, while cancellation remains an `AbortError`.
 
+The compact **Agent Activity** strip reports available tools and the latest WebMCP action. Its details dialog lists parameters changed during the current iteration and the latest audio-comparison result. Before the first agent patch mutation, Soundgineer captures an in-memory checkpoint. The checkpoint dialog lets the human keep the iteration or reject it and restore the prior parameters, modulation routes, LFO shapes, and FX order. Checkpoint actions stay disabled during agent playback and rendering.
+
 WebMCP requires a secure context: deploy over HTTPS, or use `localhost` during development. At the time of writing it is an experimental browser feature; use a WebMCP-enabled Chrome build/flag and a compatible client such as ChatGPT's experimental browser integration. Audio still follows browser autoplay policy: a human user gesture must click **CLICK TO START AUDIO** before `play_notes` or `render_audio` can run.
 
 Soundgineer accepts both the current standards callback shape,

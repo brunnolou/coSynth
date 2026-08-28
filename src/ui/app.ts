@@ -12,6 +12,7 @@ import { FxRack } from './fxrack'
 import { Scope } from './scope'
 import { WavetableView } from './wt3d'
 import { Keyboard } from './keyboard'
+import { AgentActivityPanel } from './agent-activity'
 import { PresetBrowser } from './presets'
 import { initMidi } from './midi'
 import { FilterResponseView } from './filter-response'
@@ -261,8 +262,9 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   // ------------------------------------------------------------ layout
   const main = el('main')
   main.append(oscCol, centerCol, sideCol)
+  const agentActivity = new AgentActivityPanel(engine)
   const keyboard = new Keyboard(engine)
-  container.append(header, main, performancePanel, keyboard.root)
+  container.append(header, main, agentActivity.root, performancePanel, keyboard.root)
 
   initMidi(engine, text => {
     midiLabel.textContent = text

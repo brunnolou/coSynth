@@ -171,6 +171,12 @@ try {
       loaded: loaded.loaded,
       loadedRaw: loadedState.patch.parameters.items['master.volume'].raw,
       expectedError,
+      activity: {
+        toolStatus: document.querySelector('.agent-tool-status')?.textContent,
+        similarity: document.querySelector('.agent-similarity')?.textContent,
+        checkpointReady: document.querySelector('.agent-activity-actions button:last-child')?.textContent,
+        changedParameters: [...document.querySelectorAll('.agent-param')].map(element => element.textContent)
+      },
       heldNotes: window.soundgineer.heldNotes.size
     }
   })
@@ -192,6 +198,10 @@ try {
   }
   if (result.expectedError?.ok !== false || !/unknown parameter/i.test(result.expectedError?.error?.message ?? '')) {
     throw new Error(`Structured error check failed: ${JSON.stringify(result.expectedError)}`)
+  }
+  if (result.activity.toolStatus !== '11 tools prontos' || result.activity.checkpointReady !== 'Checkpoint ready' ||
+      !result.activity.similarity?.includes('% similarity') || !result.activity.changedParameters.includes('master.volume')) {
+    throw new Error(`Agent activity check failed: ${JSON.stringify(result.activity)}`)
   }
   const metricKeys = ['peakDb', 'rmsDb', 'clippingCount', 'dcOffset', 'spectralCentroidHz', 'attackMs', 'stereoWidth']
   if (result.reference.source !== 'base64-reference' || result.reference.mimeType !== 'audio/wav' ||

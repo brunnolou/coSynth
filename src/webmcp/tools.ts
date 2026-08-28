@@ -8,6 +8,7 @@ import { analyzeAudio, compareAudioMetrics, type AudioMetrics } from '../shared/
 import { loadPreset, savePreset, validatePresetData, validatePresetName } from '../shared/preset-store'
 import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
 import { analyzeAudioAbortably } from './audio-analysis-task'
+import { agentActivityFor } from './activity'
 
 export const WEBMCP_TOOL_NAMES = [
   'get_synth_state',
@@ -288,6 +289,7 @@ export function createWebMcpTools(
   dependencies: WebMcpToolDependencies = {}
 ): WebMCP.ModelContextTool[] {
   const session = sessionFor(engine)
+  const activity = agentActivityFor(engine)
   const decodeAudio = dependencies.decodeAudio ?? decodeBase64Audio
   const analyzeAudioAsync = dependencies.analyzeAudioAsync ?? analyzeAudioAbortably
 
@@ -551,6 +553,7 @@ export function createWebMcpTools(
           const raw = canonicalRaw(def, update.value)
           return { id, index: paramIndex(id), def, raw, normalized: valueToNorm(def, raw) }
         })
+        activity.ensureCheckpoint()
         for (const update of validated) engine.setParam(update.index, update.normalized)
         return {
           applied: validated.map(update => ({
@@ -584,6 +587,7 @@ export function createWebMcpTools(
         const count = () => engine.modSlots.filter(Boolean).length
         if (action === 'clear') {
           assertObject(input, 'input', ['action'], ['action'])
+          activity.ensureCheckpoint()
           engine.modSlots.forEach((route, slot) => { if (route) engine.setModSlot(slot, null) })
           return { cleared: true, count: count() }
         }
@@ -592,6 +596,7 @@ export function createWebMcpTools(
           const slot = finite(value.slot, 'slot')
           if (!Number.isInteger(slot) || slot < 0 || slot >= MAX_MOD_SLOTS) throw new Error('slot must be an integer in range 0..31')
           if (!engine.modSlots[slot]) throw new Error(`Modulation slot ${slot} is empty`)
+          activity.ensureCheckpoint()
           engine.setModSlot(slot, null)
           return { removed: slot, count: count() }
         }
@@ -606,6 +611,7 @@ export function createWebMcpTools(
           if (depth < -1 || depth > 1) throw new Error('depth must be in range -1..1')
           if (value.enabled !== undefined && typeof value.enabled !== 'boolean') throw new Error('enabled must be boolean')
           const route = { ...current, depth, enabled: value.enabled === undefined ? current.enabled : value.enabled }
+          activity.ensureCheckpoint()
           engine.setModSlot(slot, route)
           return { route: routeValue(slot, route), count: count() }
         }
@@ -632,6 +638,7 @@ export function createWebMcpTools(
           depth,
           enabled: value.enabled === undefined ? (existing?.enabled ?? true) : value.enabled
         }
+        activity.ensureCheckpoint()
         engine.setModSlot(slot, route)
         return { route: routeValue(slot, route), count: count() }
       }
@@ -825,7 +832,10 @@ export function createWebMcpTools(
         const preset = loadPreset(name)
         if (!preset) throw new Error(`Preset not found: ${name}`)
         const validated = validatePresetData(preset)
+        activity.ensureCheckpoint()
+        const before = engine.values.slice()
         engine.loadPreset(validated)
+        activity.recordChangedParameters(PARAMS.flatMap((def, index) => before[index] === engine.values[index] ? [] : [def.id]))
         return { name, loaded: true }
       }
     }

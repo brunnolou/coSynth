@@ -1,4 +1,5 @@
 import type { SynthEngine } from '../audio/engine'
+import { agentActivityFor, type AgentActivityStore } from './activity'
 import { createWebMcpTools } from './tools'
 
 export interface WebMcpRegistration {
@@ -12,22 +13,30 @@ export interface WebMcpRegistrationOptions {
 
 const AUDIO_TOOL_NAMES = new Set(['play_notes', 'render_audio'])
 
-function registeredTool(tool: WebMCP.ModelContextTool): WebMCP.ModelContextTool {
+function registeredTool(tool: WebMCP.ModelContextTool, activity: AgentActivityStore): WebMCP.ModelContextTool {
   const execute = tool.execute
   return {
     ...tool,
     async execute(input, options) {
+      const actionId = activity.startAction(tool.name)
       try {
-        return await execute(input, options)
+        const result = await execute(input, options)
+        activity.finishAction(actionId, tool.name, input, result)
+        return result
       } catch (error) {
-        if (error instanceof Error && error.name === 'AbortError') throw error
-        return {
+        if (error instanceof Error && error.name === 'AbortError') {
+          activity.failAction(actionId, tool.name, error)
+          throw error
+        }
+        const result = {
           ok: false,
           error: {
             code: error instanceof Error && error.name !== 'Error' ? error.name : 'tool_error',
             message: error instanceof Error ? error.message : 'The tool could not complete the request'
           }
         }
+        activity.finishAction(actionId, tool.name, input, result)
+        return result
       }
     }
   }
@@ -45,9 +54,10 @@ export function registerWebMcpTools(
   }
 
   const audioTools = options.audioTools ?? 'include'
+  const activity = agentActivityFor(engine)
   const tools = createWebMcpTools(engine, controller.signal)
     .filter(tool => audioTools === 'include' || (audioTools === 'only') === AUDIO_TOOL_NAMES.has(tool.name))
-    .map(registeredTool)
+    .map(tool => registeredTool(tool, activity))
   const registrations = tools.map(tool => {
     try {
       return Promise.resolve(modelContext.registerTool(tool, { signal: controller.signal }))
