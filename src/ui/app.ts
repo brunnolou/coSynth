@@ -114,6 +114,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ center column
   const centerCol = el('div', 'col center-col')
+  const filterRow = el('div', 'filter-row')
 
   for (let f = 1; f <= 2; f++) {
     const panel = el('section', 'panel filter-panel')
@@ -126,8 +127,9 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
       `filter${f}.cutoff`, `filter${f}.resonance`, `filter${f}.drive`, `filter${f}.keytrack`, `filter${f}.mix`
     ], 42))
     bindEnabledState(engine, `filter${f}.enabled`, panel)
-    centerCol.appendChild(panel)
+    filterRow.appendChild(panel)
   }
+  centerCol.appendChild(filterRow)
 
   // ------------------------------------------------------------ right column
   const sideCol = el('div', 'col side-col')
