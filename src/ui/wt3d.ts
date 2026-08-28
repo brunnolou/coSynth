@@ -7,6 +7,13 @@ import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
 
 const POINTS = 128
+const FLOOR_Y = -1.15
+const FLOOR_VERTS = new Float32Array([
+  0, FLOOR_Y, 0,
+  1, FLOOR_Y, 0,
+  0, FLOOR_Y, 1,
+  1, FLOOR_Y, 1
+])
 
 const VERT = `#version 300 es
 precision highp float;
@@ -40,8 +47,10 @@ export class WavetableView {
   private prog: WebGLProgram | null = null
   private framesVbo: WebGLBuffer | null = null
   private morphVbo: WebGLBuffer | null = null
+  private floorVbo: WebGLBuffer | null = null
   private framesVao: WebGLVertexArrayObject | null = null
   private morphVao: WebGLVertexArrayObject | null = null
+  private floorVao: WebGLVertexArrayObject | null = null
   private numFrames = 0
   private osc = 0
   private uColor: WebGLUniformLocation | null = null
@@ -105,14 +114,22 @@ export class WavetableView {
 
     this.framesVbo = gl.createBuffer()
     this.morphVbo = gl.createBuffer()
+    this.floorVbo = gl.createBuffer()
     this.framesVao = gl.createVertexArray()
     this.morphVao = gl.createVertexArray()
-    for (const [vao, vbo] of [[this.framesVao, this.framesVbo], [this.morphVao, this.morphVbo]] as const) {
+    this.floorVao = gl.createVertexArray()
+    for (const [vao, vbo] of [
+      [this.framesVao, this.framesVbo],
+      [this.morphVao, this.morphVbo],
+      [this.floorVao, this.floorVbo]
+    ] as const) {
       gl.bindVertexArray(vao)
       gl.bindBuffer(gl.ARRAY_BUFFER, vbo)
       gl.enableVertexAttribArray(0)
       gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0)
     }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.floorVbo)
+    gl.bufferData(gl.ARRAY_BUFFER, FLOOR_VERTS, gl.STATIC_DRAW)
     gl.bindVertexArray(null)
   }
 
@@ -171,6 +188,12 @@ export class WavetableView {
       if (state.enabled) morph += state.depth * (this.engine.sourceValues[state.source] ?? 0)
     }
     morph = Math.max(0, Math.min(1, morph))
+
+    // Front and back rails establish a floor beneath the wavetable stack.
+    gl.bindVertexArray(this.floorVao)
+    gl.uniform1f(this.uZ, -1)
+    gl.uniform4f(this.uColor, 0.22, 0.32, 0.46, 0.72)
+    gl.drawArrays(gl.LINES, 0, 4)
 
     // frame strips
     gl.bindVertexArray(this.framesVao)
