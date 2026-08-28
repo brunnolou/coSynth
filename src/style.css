@@ -324,6 +324,19 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   min-width: 0;
 }
 .filter-panel { min-width: 0; }
+.filter-response {
+  height: 64px;
+  margin: 2px 0 4px;
+  background: #101218;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.filter-response canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
 .routing-wrap {
   display: flex;
   align-items: center;

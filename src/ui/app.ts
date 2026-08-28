@@ -14,6 +14,7 @@ import { WavetableView } from './wt3d'
 import { Keyboard } from './keyboard'
 import { PresetBrowser } from './presets'
 import { initMidi } from './midi'
+import { FilterResponseView } from './filter-response'
 
 export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   engine.primeTables()
@@ -122,6 +123,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     head.appendChild(el('span', 'panel-title', `FILTER ${f}`))
     head.appendChild(paramSelect(engine, `filter${f}.type`))
     panel.appendChild(head)
+    panel.appendChild(new FilterResponseView(engine, f as 1 | 2).root)
     panel.appendChild(knobRow(engine, [
       `filter${f}.cutoff`, `filter${f}.resonance`, `filter${f}.drive`, `filter${f}.keytrack`, `filter${f}.mix`
     ], 42))
