@@ -153,9 +153,12 @@ main {
   min-width: 0;
 }
 .performance-panel {
-  grid-column: 1 / 4;
-  grid-row: 2;
+  position: sticky;
+  bottom: 0;
+  z-index: 20;
+  flex: 0 0 auto;
   min-width: 0;
+  margin: 0 4px 4px;
 }
 
 .panel {

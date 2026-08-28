@@ -241,8 +241,6 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ performance sources
   const performancePanel = el('section', 'panel performance-panel')
-  const performanceHead = el('div', 'panel-head')
-  performanceHead.appendChild(el('span', 'panel-title', 'PERFORMANCE'))
   const srcRow = el('div', 'source-row')
   const macroKnobs = el('div', 'knob-row')
   for (let m = 1; m <= 4; m++) {
@@ -257,7 +255,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     perfBadges.appendChild(sourceBadge(engine, id))
   }
   srcRow.appendChild(perfBadges)
-  performancePanel.append(performanceHead, srcRow)
+  performancePanel.appendChild(srcRow)
 
   // ------------------------------------------------------------ effects
   const fxPanel = el('section', 'panel fx-panel')
@@ -268,9 +266,9 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ layout
   const main = el('main')
-  main.append(oscCol, centerCol, sideCol, performancePanel)
+  main.append(oscCol, centerCol, sideCol)
   const keyboard = new Keyboard(engine)
-  container.append(header, main, keyboard.root)
+  container.append(header, main, performancePanel, keyboard.root)
 
   initMidi(engine, text => {
     midiLabel.textContent = text
