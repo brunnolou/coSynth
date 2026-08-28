@@ -1,12 +1,13 @@
 import type { SynthEngine } from '../audio/engine'
 import { FILTER_TYPES, PARAMS, normToValue, paramIndex } from '../shared/params'
-import type { ModSlotState } from '../shared/messages'
+import { modSourceIndex, type ModSlotState } from '../shared/messages'
 import { el } from './common'
 
 const MIN_FREQ = 20
 const MAX_FREQ = 20000
 const MIN_DB = -36
 const MAX_DB = 12
+const KEY_TRACK_SOURCE = modSourceIndex('keytrack')
 const FORMANTS = [
   [800, 1150, 2900],
   [400, 2000, 2800],
@@ -38,6 +39,12 @@ export function applyModulation(
     if (route.enabled) value += route.depth * (sourceValues[route.source] ?? 0)
   }
   return clamp(value, 0, 1)
+}
+
+/** Match the voice DSP's note-following cutoff shift. The source spans +/-36 semitones around C4. */
+export function applyKeyTracking(cutoff: number, amount: number, keyTrackSource: number): number {
+  const noteOffset = clamp(keyTrackSource, -1, 1) * 36
+  return cutoff * 2 ** ((noteOffset / 12) * amount)
 }
 
 /** Approximate the audible magnitude of the synth's filter models for UI display. */
@@ -108,6 +115,7 @@ export class FilterResponseView {
   }
 
   get animated(): boolean {
+    if (this.engine.getParam(paramIndex(`filter${this.filter}.keytrack`)) > 0.001) return true
     return ['cutoff', 'resonance', 'drive', 'keytrack', 'mix'].some(name =>
       this.engine.routesForDest(paramIndex(`filter${this.filter}.${name}`)).some(({ state }) => state.enabled)
     )
@@ -123,12 +131,18 @@ export class FilterResponseView {
   }
 
   private params(): FilterResponseParams {
+    const keytrack = this.value('keytrack')
+    const cutoff = applyKeyTracking(
+      this.value('cutoff'),
+      keytrack,
+      this.engine.sourceValues[KEY_TRACK_SOURCE] ?? 0
+    )
     return {
       type: this.value('type', false),
-      cutoff: this.value('cutoff'),
+      cutoff,
       resonance: this.value('resonance'),
       drive: this.value('drive'),
-      keytrack: this.value('keytrack'),
+      keytrack,
       mix: this.value('mix')
     }
   }
@@ -171,8 +185,8 @@ export class FilterResponseView {
     }
 
     if (params.keytrack > 0) {
-      const low = clamp(params.cutoff * 2 ** (-2 * params.keytrack), MIN_FREQ, MAX_FREQ)
-      const high = clamp(params.cutoff * 2 ** (2 * params.keytrack), MIN_FREQ, MAX_FREQ)
+      const low = clamp(params.cutoff * 2 ** (-3 * params.keytrack), MIN_FREQ, MAX_FREQ)
+      const high = clamp(params.cutoff * 2 ** (3 * params.keytrack), MIN_FREQ, MAX_FREQ)
       const x1 = frequencyToX(low, w)
       const x2 = frequencyToX(high, w)
       c.fillStyle = '#53a8ff0c'

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { applyModulation, filterMagnitude, type FilterResponseParams } from './filter-response'
+import { applyKeyTracking, applyModulation, filterMagnitude, type FilterResponseParams } from './filter-response'
 
 const base: FilterResponseParams = {
   type: 0,
@@ -36,5 +36,13 @@ describe('applyModulation', () => {
     ]
     expect(applyModulation(0.3, routes, [0.8, 0.4, 1])).toBeCloseTo(0.6)
     expect(applyModulation(0.8, [{ source: 0, depth: 1, enabled: true }], [1])).toBe(1)
+  })
+})
+
+describe('applyKeyTracking', () => {
+  it('moves cutoff by the played note offset and tracking amount', () => {
+    expect(applyKeyTracking(1000, 1, 1 / 3)).toBeCloseTo(2000)
+    expect(applyKeyTracking(1000, 1, -1 / 3)).toBeCloseTo(500)
+    expect(applyKeyTracking(1000, 0, 1)).toBe(1000)
   })
 })
