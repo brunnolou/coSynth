@@ -31,7 +31,8 @@ void main() {
   float cy = cos(0.55), sy = sin(0.55);
   p = vec3(p.x * cy + p.z * sy, p.y, -p.x * sy + p.z * cy);
   // pitch
-  float cx = cos(0.42), sx = sin(0.42);
+  // Negative pitch places the camera above the floor, looking down.
+  float cx = cos(-0.42), sx = sin(-0.42);
   p = vec3(p.x, p.y * cx - p.z * sx, p.y * sx + p.z * cx);
   float zc = p.z + 2.6;
   float zoom = 1.55;
