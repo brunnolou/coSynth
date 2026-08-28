@@ -71,7 +71,6 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
       `osc${o}.morph`, `osc${o}.level`, `osc${o}.pan`, `osc${o}.transpose`, `osc${o}.fine`, `osc${o}.sync`,
       `osc${o}.unison`, `osc${o}.detune`, `osc${o}.blend`, `osc${o}.spread`, `osc${o}.phase`, `osc${o}.phase_rand`
     ], 42)
-    oscKnobs.classList.add('osc-knob-row')
     panel.appendChild(oscKnobs)
     bindEnabledState(engine, `osc${o}.enabled`, panel)
     oscCol.appendChild(panel)
