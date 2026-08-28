@@ -12,6 +12,10 @@ const FLOOR_VERTS = new Float32Array([
   0, FLOOR_Y, 0,
   1, FLOOR_Y, 0,
   0, FLOOR_Y, 1,
+  1, FLOOR_Y, 1,
+  0, FLOOR_Y, 0,
+  0, FLOOR_Y, 1,
+  1, FLOOR_Y, 0,
   1, FLOOR_Y, 1
 ])
 
@@ -189,11 +193,11 @@ export class WavetableView {
     }
     morph = Math.max(0, Math.min(1, morph))
 
-    // Front and back rails establish a floor beneath the wavetable stack.
+    // Four rails establish a floor beneath the wavetable stack.
     gl.bindVertexArray(this.floorVao)
     gl.uniform1f(this.uZ, -1)
     gl.uniform4f(this.uColor, 0.22, 0.32, 0.46, 0.72)
-    gl.drawArrays(gl.LINES, 0, 4)
+    gl.drawArrays(gl.LINES, 0, 8)
 
     // frame strips
     gl.bindVertexArray(this.framesVao)
