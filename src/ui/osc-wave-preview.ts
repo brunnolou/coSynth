@@ -1,7 +1,9 @@
 import type { SynthEngine } from '../audio/engine'
 import { PARAMS, normToValue, paramIndex } from '../shared/params'
 import type { Wavetable } from '../shared/wavetable-gen'
+import { nextSnapPoint, SNAP_EPSILON, wavetableSnapPoints } from '../shared/wavetable-snap'
 import { el } from './common'
+import './osc-wave-preview.css'
 
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, value))
 
@@ -41,12 +43,52 @@ export class OscWavePreview {
     this.syncIndex = paramIndex(`osc${osc + 1}.sync`)
 
     new ResizeObserver(() => this.resize()).observe(this.root)
-    engine.onParam(this.morphIndex, () => this.draw())
+    engine.onParam(this.morphIndex, () => {
+      this.refreshInteraction()
+      this.draw()
+    })
     engine.onParam(this.syncIndex, () => this.draw())
     engine.onTableChange(changedOsc => {
-      if (changedOsc === osc) this.draw()
+      if (changedOsc === osc) {
+        this.refreshInteraction()
+        this.draw()
+      }
     })
     engine.onMatrixChange(() => this.draw())
+    this.root.addEventListener('click', () => {
+      const next = nextSnapPoint(wavetableSnapPoints(engine.currentTables[osc]), engine.getParam(this.morphIndex))
+      if (next) engine.setParam(this.morphIndex, next.position)
+    })
+    this.root.addEventListener('keydown', event => {
+      if (this.root.getAttribute('role') !== 'button' || (event.key !== 'Enter' && event.key !== ' ')) return
+      event.preventDefault()
+      event.stopPropagation()
+      // Reuse click so keyboard activation also selects this oscillator's 3D view.
+      if (!event.repeat) this.root.click()
+    })
+    this.refreshInteraction()
+  }
+
+  private refreshInteraction(): void {
+    const points = wavetableSnapPoints(this.engine.currentTables[this.osc])
+    const morph = this.engine.getParam(this.morphIndex)
+    const next = nextSnapPoint(points, morph)
+    this.root.classList.toggle('has-snap-points', !!next)
+    if (!next) {
+      this.root.removeAttribute('role')
+      this.root.removeAttribute('tabindex')
+      this.root.removeAttribute('aria-label')
+      this.root.removeAttribute('title')
+      this.canvas.removeAttribute('aria-hidden')
+      return
+    }
+    const current = points.find(point => Math.abs(point.position - morph) <= SNAP_EPSILON)
+    const label = `Oscillator ${this.osc + 1}. Base shape: ${current?.label ?? 'between shapes'}. Next: ${next.label}. Click to cycle.`
+    this.root.setAttribute('role', 'button')
+    this.root.tabIndex = 0
+    this.root.title = label
+    this.root.setAttribute('aria-label', label)
+    this.canvas.setAttribute('aria-hidden', 'true')
   }
 
   get animated(): boolean {

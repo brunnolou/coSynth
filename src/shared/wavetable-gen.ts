@@ -31,12 +31,19 @@ export function buildMips(data: Float32Array, frameSize: number, numFrames: numb
   return out
 }
 
+export interface WavetableSnapPoint {
+  label: string
+  /** Base morph position, normalized to 0..1. */
+  position: number
+}
+
 export interface Wavetable {
   name: string
   frameSize: number
   numFrames: number
   /** numFrames * frameSize, frames concatenated. */
   data: Float32Array
+  snapPoints?: readonly WavetableSnapPoint[]
 }
 
 function normalizeTable(data: Float32Array): void {
@@ -122,6 +129,13 @@ const triFrame = () => additive(k => (k % 2 === 1 ? ((k % 4 === 1 ? 1 : -1) * 8)
 const sawFrame = () => additive(k => (2 / Math.PI) * (1 / k), 800)
 const squareFrame = () => additive(k => (k % 2 === 1 ? 4 / (Math.PI * k) : 0), 800)
 
+const BASIC_SHAPE_RECIPES = [
+  { label: 'Sine', createFrame: sineFrame },
+  { label: 'Triangle', createFrame: triFrame },
+  { label: 'Saw', createFrame: sawFrame },
+  { label: 'Square', createFrame: squareFrame }
+] as const
+
 function pwmFrame(width: number): Float32Array {
   return additive(k => ((2 / (Math.PI * k)) * Math.sin(Math.PI * k * width)) * 2, 600)
 }
@@ -167,9 +181,16 @@ function digitalFrame(seed: number): Float32Array {
 export function generateWavetable(name: string): Wavetable {
   let data: Float32Array
   let numFrames = 32
+  let snapPoints: readonly WavetableSnapPoint[] | undefined
   switch (name) {
     case 'Basic Shapes':
-      data = spectralMorph([sineFrame(), triFrame(), sawFrame(), squareFrame()], numFrames)
+      // Eleven intervals per recipe segment put every named shape on a frame.
+      numFrames = (BASIC_SHAPE_RECIPES.length - 1) * 11 + 1
+      data = spectralMorph(BASIC_SHAPE_RECIPES.map(recipe => recipe.createFrame()), numFrames)
+      snapPoints = BASIC_SHAPE_RECIPES.map((recipe, index) => ({
+        label: recipe.label,
+        position: index / (BASIC_SHAPE_RECIPES.length - 1)
+      }))
       break
     case 'Harmonic Sweep':
       data = spectralMorph(
@@ -205,7 +226,7 @@ export function generateWavetable(name: string): Wavetable {
     default:
       data = spectralMorph([sineFrame(), sawFrame()], numFrames)
   }
-  return { name, frameSize: FRAME_SIZE, numFrames, data }
+  return { name, frameSize: FRAME_SIZE, numFrames, data, ...(snapPoints ? { snapPoints } : {}) }
 }
 
 // ------------------------------------------------------------ WAV import
