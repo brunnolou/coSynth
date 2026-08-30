@@ -1,5 +1,5 @@
 import type { SynthEngine } from '../audio/engine'
-import { FILTER_TYPES, PARAMS, normToValue, paramIndex } from '../shared/params'
+import { FILTER_TYPE_LABELS, PARAMS, normToValue, paramIndex } from '../shared/params'
 import { modSourceIndex, type ModSlotState } from '../shared/messages'
 import { el } from './common'
 
@@ -235,6 +235,6 @@ export class FilterResponseView {
 
     c.fillStyle = '#8d93a3'
     c.font = '8px system-ui, sans-serif'
-    c.fillText(FILTER_TYPES[params.type] ?? '', 5, 10)
+    c.fillText(FILTER_TYPE_LABELS[params.type] ?? '', 5, 10)
   }
 }

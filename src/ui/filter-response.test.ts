@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { FILTER_TYPES, FILTER_TYPE_LABELS } from '../shared/params'
 import { applyKeyTracking, applyModulation, filterMagnitude, type FilterResponseParams } from './filter-response'
 
 const base: FilterResponseParams = {
@@ -11,6 +12,15 @@ const base: FilterResponseParams = {
 }
 
 describe('filterMagnitude', () => {
+  it('has a full display name for every stable filter type', () => {
+    expect(FILTER_TYPE_LABELS).toHaveLength(FILTER_TYPES.length)
+    expect(FILTER_TYPE_LABELS.slice(0, 6)).toEqual([
+      'Low Pass 12dB', 'Low Pass 24dB',
+      'High Pass 12dB', 'High Pass 24dB',
+      'Band Pass 12dB', 'Band Pass 24dB'
+    ])
+  })
+
   it('rolls off frequencies above a low-pass cutoff', () => {
     expect(filterMagnitude(100, base)).toBeGreaterThan(filterMagnitude(10000, base))
   })

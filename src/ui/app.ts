@@ -1,6 +1,6 @@
 // Assembles the full synth UI.
 
-import { paramIndex } from '../shared/params'
+import { FILTER_TYPE_LABELS, paramIndex } from '../shared/params'
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
 import { Knob, sourceBadge, animatedKnobs } from './knob'
@@ -146,7 +146,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     const head = el('div', 'panel-head')
     head.appendChild(paramToggle(engine, `filter${f}.enabled`, '●'))
     head.appendChild(el('span', 'panel-title', `FILTER ${f}`))
-    head.appendChild(paramSelect(engine, `filter${f}.type`))
+    head.appendChild(paramSelect(engine, `filter${f}.type`, { choiceLabels: FILTER_TYPE_LABELS }))
     panel.appendChild(head)
     const filterView = new FilterResponseView(engine, f as 1 | 2)
     filterViews.push(filterView)

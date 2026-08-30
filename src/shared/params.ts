@@ -21,6 +21,17 @@ export interface ParamDef {
 }
 
 export const FILTER_TYPES = ['LP 12', 'LP 24', 'HP 12', 'HP 24', 'BP 12', 'BP 24', 'Notch', 'Comb', 'Formant']
+export const FILTER_TYPE_LABELS = [
+  'Low Pass 12dB',
+  'Low Pass 24dB',
+  'High Pass 12dB',
+  'High Pass 24dB',
+  'Band Pass 12dB',
+  'Band Pass 24dB',
+  'Notch',
+  'Comb',
+  'Formant'
+]
 export const SUB_SHAPES = ['Sine', 'Triangle', 'Saw', 'Square']
 export const NOISE_TYPES = ['White', 'Pink', 'Sample']
 export const DIST_TYPES = ['Soft Clip', 'Hard Clip', 'Wavefold', 'Bitcrush']

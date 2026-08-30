@@ -6,6 +6,7 @@ import { el } from './common'
 import { Knob } from './knob'
 
 export interface ParamSelectOptions {
+  choiceLabels?: readonly string[]
   separatorBefore?: string
   onSelect?: (choice: string, index: number) => boolean | void
 }
@@ -22,7 +23,7 @@ export function paramSelect(engine: SynthEngine, id: string, options: ParamSelec
       separator.value = ''
       sel.appendChild(separator)
     }
-    const o = el('option', undefined, c) as HTMLOptionElement
+    const o = el('option', undefined, options.choiceLabels?.[i] ?? c) as HTMLOptionElement
     o.value = String(i)
     sel.appendChild(o)
   })
