@@ -176,7 +176,7 @@ try {
       activity: {
         toolStatus: document.querySelector('.agent-tool-status')?.textContent,
         undoEnabled: !document.querySelector('[data-guide-id="button.history.undo"]')?.disabled,
-        changedParameters: [...document.querySelectorAll('.agent-param')].map(element => element.textContent),
+        changedParameters: [...document.querySelectorAll('.agent-param, .history-change')].map(element => element.textContent),
         retainedComparison: history.items.some(entry => Number.isFinite(entry.comparison?.similarity)),
         soundCount: history.total,
         replayCount: replays.items.filter(entry => entry.kind === 'performance').length
@@ -205,7 +205,7 @@ try {
     throw new Error(`Structured error check failed: ${JSON.stringify(result.expectedError)}`)
   }
   if (result.activity.toolStatus !== '17 tools ready' || !result.activity.undoEnabled ||
-      !result.activity.retainedComparison || !result.activity.changedParameters.includes('master.volume') ||
+      !result.activity.retainedComparison || !result.activity.changedParameters.some(text => text === 'master.volume' || text.startsWith('master.volume:')) ||
       result.activity.soundCount < 5 || result.activity.replayCount !== 2) {
     throw new Error(`Agent activity check failed: ${JSON.stringify(result.activity)}`)
   }
