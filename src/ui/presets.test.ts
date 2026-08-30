@@ -27,13 +27,9 @@ describe('preset UI boundaries', () => {
     expect(engine.loadPreset).not.toHaveBeenCalled()
   })
 
-  it('reports unavailable storage from SAVE without throwing through the UI', () => {
-    const alert = vi.fn()
-    vi.stubGlobal('alert', alert)
+  it('returns storage failures to the save dialog without using a native alert', () => {
     const engine = { toPreset: vi.fn(() => validPreset()) } as unknown as SynthEngine
-    const storage = { setItem() { throw new DOMException('quota', 'QuotaExceededError') } } as unknown as Storage
-    expect(savePresetFromUi(engine, 'Imported', storage)).toBe(false)
-    expect(alert).toHaveBeenCalledWith(expect.stringMatching(/could not save preset/i))
-    vi.unstubAllGlobals()
+    const storage = { getItem: () => null, setItem() { throw new DOMException('quota', 'QuotaExceededError') } } as unknown as Storage
+    expect(() => savePresetFromUi(engine, 'Imported', storage)).toThrow(/quota/)
   })
 })

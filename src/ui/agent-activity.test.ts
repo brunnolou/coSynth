@@ -8,6 +8,7 @@ let panel: AgentActivityPanel
 let view: SoundHistoryView
 let replays: ReplayEntry[]
 let services: HistoryServices
+let performing: boolean
 const listeners = new Set<() => void>()
 const refresh = () => { for (const listener of listeners) listener() }
 beforeEach(() => {
@@ -21,11 +22,12 @@ beforeEach(() => {
     ], currentId: 'b', revision: 2, canUndo: true, canRedo: false, gestureActive: false, navigating: false, retainedAssetBytes: 1024
   }
   replays = [{ id: 'g', kind: 'guide', label: 'Pluck guide', timestamp: 1, status: 'completed', steps: [{ title: 'Oscillator' }] }]
+  performing = false
   const subscribe = (listener: () => void) => { listeners.add(listener); return () => listeners.delete(listener) }
   services = {
     history: { snapshot: () => view, subscribe, navigate: vi.fn().mockResolvedValue(view), beginGesture: vi.fn(), endGesture: vi.fn(), coalesce: vi.fn() },
-    replays: { snapshot: () => replays, subscribe, latestPerformanceId: () => undefined, replay: vi.fn().mockResolvedValue(undefined) },
-    performance: { active: false, subscribe, stop: vi.fn().mockResolvedValue(undefined) }
+    replays: { snapshot: () => replays, subscribe, latestPerformanceId: () => [...replays].reverse().find(entry => entry.kind === 'performance')?.id, replay: vi.fn().mockResolvedValue(undefined) },
+    performance: { get active() { return performing }, subscribe, stop: vi.fn().mockResolvedValue(undefined) }
   }
   panel = new AgentActivityPanel({} as SynthEngine, services)
   document.body.append(panel.root)
@@ -56,6 +58,43 @@ it('retains focused row buttons and expanded details when activity/history refre
   expect(panel.root.querySelector('[data-history-id="a"] button')).toBe(action)
   expect(document.activeElement).toBe(action)
   expect(details.open).toBe(true)
+})
+
+it('adds decorative icons without replacing the toolbar labels', () => {
+  for (const [id, label] of [['undo', 'Undo'], ['redo', 'Redo'], ['open', 'History'], ['play', 'Play again']]) {
+    const button = panel.root.querySelector(`[data-guide-id="button.history.${id}"]`)!
+    expect(button.textContent).toBe(label)
+    expect(button.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true')
+    expect(button.querySelector('svg')?.getAttribute('focusable')).toBe('false')
+  }
+})
+
+it('hides Play again until a performance exists and keeps Stop available during playback', async () => {
+  const play = panel.root.querySelector('[data-guide-id="button.history.play"]') as HTMLButtonElement
+  expect(play.hidden).toBe(true) // A walkthrough alone is not an audio replay.
+  replays.push({ id: 'p', kind: 'performance', label: 'Melody', timestamp: 2, status: 'completed',
+    notes: [{ midi: 60, velocity: 0.5, start: 0, duration: 1 }] })
+  refresh()
+  expect(play.hidden).toBe(false)
+  expect(play.disabled).toBe(false)
+  play.click()
+  await Promise.resolve()
+  expect(services.replays.replay).toHaveBeenCalledWith('p')
+  performing = true
+  replays = []
+  refresh()
+  expect(play.hidden).toBe(false)
+  expect(play.disabled).toBe(false)
+  expect(play.textContent).toBe('Stop')
+  expect(play.querySelector('svg')).not.toBeNull()
+  play.click()
+  await Promise.resolve()
+  expect(services.performance.stop).toHaveBeenCalledOnce()
+  performing = false
+  refresh()
+  expect(play.hidden).toBe(true)
+  expect(play.textContent).toBe('Play again')
+  expect(play.querySelector('svg')).not.toBeNull()
 })
 
 it('shows one or two valued changes directly, grouping only larger edits under Details', () => {

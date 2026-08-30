@@ -6,6 +6,7 @@ import { listPresets, savePreset, validatePresetData } from '../shared/preset-st
 import type { SynthEngine, PresetData } from '../audio/engine'
 import { el } from './common'
 import { guideTarget } from './guide-target'
+import { ModalDialog } from './dialog'
 import { ChevronLeft, ChevronRight, Cog, createElement } from 'lucide'
 import './presets.css'
 
@@ -552,14 +553,8 @@ const FACTORY: Partial<PresetData>[] = [
 
 const MAX_IMPORT_BYTES = 1024 * 1024
 
-export function savePresetFromUi(engine: SynthEngine, name: string, storage?: Storage): boolean {
-  try {
-    savePreset(engine.toPreset(name), storage)
-    return true
-  } catch (error) {
-    alert(`Could not save preset: ${error instanceof Error ? error.message : String(error)}`)
-    return false
-  }
+export function savePresetFromUi(engine: SynthEngine, name: string, storage?: Storage): PresetData {
+  return savePreset(engine.toPreset(name), storage)
 }
 
 export async function importPresetFile(engine: SynthEngine, file: File, storage?: Storage): Promise<PresetData> {
@@ -635,14 +630,67 @@ export class PresetBrowser {
       if (event.relatedTarget && !actions.contains(event.relatedTarget as Node)) closeActions()
     })
 
+    const saveDialog = new ModalDialog('Save preset', 'preset-save')
+    saveDialog.root.classList.add('preset-save-dialog')
+    saveDialog.root.setAttribute('aria-label', 'Save preset')
+    const saveForm = el('form', 'preset-save-form')
+    saveForm.id = 'preset-save-form'
+    saveForm.noValidate = true
+    const nameLabel = el('label', '', 'Preset name')
+    nameLabel.htmlFor = 'preset-save-name'
+    const nameInput = el('input', 'preset-name-input')
+    nameInput.id = 'preset-save-name'
+    nameInput.name = 'presetName'
+    nameInput.type = 'text'
+    nameInput.required = true
+    nameInput.maxLength = 80
+    nameInput.autocomplete = 'off'
+    guideTarget(nameInput, 'input.preset.name', 'Preset name', 'input')
+    const help = el('p', 'preset-save-help', 'Saved in this browser. An existing name replaces that saved preset. Use Export for a downloadable backup.')
+    help.id = 'preset-save-help'
+    const saveError = el('p', 'preset-save-error')
+    saveError.id = 'preset-save-error'
+    saveError.setAttribute('role', 'alert')
+    nameInput.setAttribute('aria-describedby', `${help.id} ${saveError.id}`)
+    const cancel = el('button', 'agent-btn', 'Cancel')
+    cancel.type = 'button'
+    cancel.addEventListener('click', () => saveDialog.close())
+    const confirmSave = el('button', 'agent-btn primary', 'Save')
+    confirmSave.type = 'submit'
+    confirmSave.setAttribute('form', saveForm.id)
+    guideTarget(confirmSave, 'button.preset.save-confirm', 'Confirm save preset', 'button')
+    saveForm.append(nameLabel, nameInput, help, saveError)
+    saveDialog.body.append(saveForm)
+    saveDialog.footer.append(cancel, confirmSave)
+    saveDialog.root.addEventListener('close', () => trigger.focus())
+    nameInput.addEventListener('input', () => { saveError.textContent = '' })
+    nameInput.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' || event.isComposing || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return
+      event.preventDefault()
+      if (!event.repeat) saveForm.requestSubmit(confirmSave)
+    })
+    saveForm.addEventListener('submit', event => {
+      event.preventDefault()
+      try {
+        const saved = savePresetFromUi(this.engine, nameInput.value)
+        this.refresh(`user:${saved.name}`)
+        saveDialog.close()
+      } catch (error) {
+        saveError.textContent = `Could not save preset: ${error instanceof Error ? error.message : String(error)}`
+        nameInput.focus()
+      }
+    })
+
     const save = el('button', 'hdr-btn', 'Save')
     guideTarget(save, 'button.preset.save', 'Save preset', 'button')
     save.title = 'Save current patch to the browser'
     save.addEventListener('click', () => {
       closeActions(true)
-      const name = prompt('Preset name?', 'My Patch')
-      if (!name) return
-      if (savePresetFromUi(this.engine, name)) this.refresh(`user:${name.trim()}`)
+      nameInput.value = this.select.value.startsWith('user:') ? this.select.value.slice(5) : 'My Patch'
+      saveError.textContent = ''
+      saveDialog.open()
+      nameInput.focus()
+      nameInput.select()
     })
 
     const exportBtn = el('button', 'hdr-btn', 'Export')
@@ -684,7 +732,7 @@ export class PresetBrowser {
     for (const button of [save, exportBtn, importBtn]) button.type = 'button'
     menu.append(save, exportBtn, importBtn)
     actions.append(trigger, menu)
-    this.root.append(previous, this.select, next, actions, file)
+    this.root.append(previous, this.select, next, actions, file, saveDialog.root)
     this.refresh('factory:Init')
   }
 

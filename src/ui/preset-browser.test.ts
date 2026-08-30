@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SynthEngine } from '../audio/engine'
-import { savePreset } from '../shared/preset-store'
+import { savePreset, loadPreset, listPresets } from '../shared/preset-store'
 import { PresetBrowser } from './presets'
 
 describe('compact preset browser', () => {
@@ -10,11 +10,19 @@ describe('compact preset browser', () => {
   const select = () => browser.root.querySelector('select')!
   const actions = () => browser.root.querySelector('details')!
   const trigger = () => browser.root.querySelector('summary')!
+  const dialog = () => browser.root.querySelector('dialog')!
+  const nameInput = () => dialog().querySelector('input')!
+  const submit = () => (dialog().querySelector('button[type="submit"]') as HTMLButtonElement).click()
   const button = (name: string) => [...browser.root.querySelectorAll('button')]
     .find(button => button.getAttribute('aria-label') === name || button.textContent === name)!
   const toggle = () => actions().dispatchEvent(new Event('toggle'))
 
   beforeEach(() => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: function (this: HTMLDialogElement) { this.open = true } })
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', { configurable: true, value: function (this: HTMLDialogElement) {
+      this.open = false
+      this.dispatchEvent(new Event('close'))
+    } })
     localStorage.clear()
     engine = new SynthEngine()
     vi.spyOn(engine, 'loadPreset')
@@ -61,14 +69,84 @@ describe('compact preset browser', () => {
   })
 
   it('includes saved presets in navigation and keeps Save functional', () => {
-    vi.spyOn(window, 'prompt').mockReturnValue('Saved patch')
+    const nativePrompt = vi.spyOn(window, 'prompt').mockImplementation(() => { throw new Error('prompt() is not supported.') })
     button('Save').click()
+    expect(nativePrompt).not.toHaveBeenCalled()
+    expect(dialog().open).toBe(true)
+    expect(document.activeElement).toBe(nameInput())
+    nameInput().value = '  Saved patch  '
+    submit()
+    expect(dialog().open).toBe(false)
+    expect(document.activeElement).toBe(trigger())
     expect(select().value).toBe('user:Saved patch')
     button('Next preset').click()
     expect(select().value).toBe('factory:Init')
     button('Previous preset').click()
     expect(select().value).toBe('user:Saved patch')
     expect(engine.loadPreset).toHaveBeenLastCalledWith(expect.objectContaining({ name: 'Saved patch' }))
+  })
+
+  it('saves on Enter without submitting during composition or modified shortcuts', () => {
+    button('Save').click()
+    nameInput().value = 'Keyboard save'
+    for (const options of [{ isComposing: true }, { repeat: true }, { metaKey: true }, { ctrlKey: true }, { altKey: true }, { shiftKey: true }]) {
+      nameInput().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true, ...options }))
+      expect(listPresets()).toHaveLength(0)
+    }
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+    nameInput().dispatchEvent(enter)
+    expect(enter.defaultPrevented).toBe(true)
+    expect(dialog().open).toBe(false)
+    expect(select().value).toBe('user:Keyboard save')
+  })
+
+  it('validates names inline, keeps the dialog open, and allows correction', () => {
+    const nativeAlert = vi.spyOn(window, 'alert').mockImplementation(() => { throw new Error('Native alert used') })
+    button('Save').click()
+    for (const invalid of ['   ', 'x'.repeat(81)]) {
+      nameInput().value = invalid
+      submit()
+      expect(dialog().open).toBe(true)
+      expect(dialog().querySelector('[role="alert"]')?.textContent).toMatch(/1-80 printable characters/)
+      expect(listPresets()).toHaveLength(0)
+    }
+    nameInput().value = 'Fixed name'
+    nameInput().dispatchEvent(new Event('input'))
+    expect(dialog().querySelector('[role="alert"]')?.textContent).toBe('')
+    submit()
+    expect(loadPreset('Fixed name')).not.toBeNull()
+    expect(nativeAlert).not.toHaveBeenCalled()
+  })
+
+  it('reports storage errors inline and can retry without losing the typed name', () => {
+    const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('quota', 'QuotaExceededError') })
+    button('Save').click()
+    nameInput().value = 'Keep this name'
+    submit()
+    expect(dialog().open).toBe(true)
+    expect(nameInput().value).toBe('Keep this name')
+    expect(dialog().querySelector('[role="alert"]')?.textContent).toMatch(/Could not save preset:.*quota/)
+    write.mockRestore()
+    submit()
+    expect(dialog().open).toBe(false)
+    expect(select().value).toBe('user:Keep this name')
+  })
+
+  it('cancels without saving or changing the sound and reuses a selected user preset name', () => {
+    const before = engine.captureSoundState()
+    button('Save').click()
+    nameInput().value = 'Do not save'
+    button('Cancel').click()
+    expect(listPresets()).toHaveLength(0)
+    expect(engine.captureSoundState()).toEqual(before)
+    expect(engine.loadPreset).not.toHaveBeenCalled()
+    button('Save').click()
+    nameInput().value = 'My sound'
+    submit()
+    expect(engine.captureSoundState()).toEqual(before)
+    button('Save').click()
+    expect(nameInput().value).toBe('My sound')
+    expect((dialog().querySelector('input') as HTMLInputElement).maxLength).toBe(80)
   })
 
   it('loads existing user presets when created', () => {
