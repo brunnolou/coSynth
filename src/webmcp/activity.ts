@@ -1,4 +1,4 @@
-import type { PresetData, SynthEngine } from '../audio/engine'
+import type { SynthEngine } from '../audio/engine'
 import type { AudioMetricsComparison } from '../shared/audio-analysis'
 
 export interface AgentAction {
@@ -16,8 +16,6 @@ export interface AgentActivitySnapshot {
   lastAction: AgentAction | null
   changedParameters: string[]
   comparison: AudioMetricsComparison | null
-  checkpointAvailable: boolean
-  checkpointCreatedAt: number | null
   performanceActive: boolean
 }
 
@@ -34,7 +32,13 @@ const TOOL_LABELS: Record<string, string> = {
   analyze_reference_audio: 'Analyzed reference audio',
   compare_audio: 'Compared audio',
   save_preset: 'Saved preset',
-  load_preset: 'Loaded preset'
+  load_preset: 'Loaded preset',
+  get_ui_targets: 'Found teaching targets',
+  show_ui_guide: 'Updated teaching guide',
+  get_history: 'Read history',
+  navigate_history: 'Restored sound history',
+  replay_history: 'Replayed history',
+  stop_performance: 'Stopped performance'
 }
 
 function objectValue(value: unknown): Record<string, unknown> | null {
@@ -46,7 +50,6 @@ function objectValue(value: unknown): Record<string, unknown> | null {
 export class AgentActivityStore {
   private readonly listeners = new Set<Listener>()
   private readonly performanceActions = new Set<number>()
-  private checkpoint: PresetData | null = null
   private actionId = 0
   private state: AgentActivitySnapshot = {
     readyTools: 0,
@@ -54,12 +57,10 @@ export class AgentActivityStore {
     lastAction: null,
     changedParameters: [],
     comparison: null,
-    checkpointAvailable: false,
-    checkpointCreatedAt: null,
     performanceActive: false
   }
 
-  constructor(private readonly engine: SynthEngine) {}
+  constructor(_engine: SynthEngine) {}
 
   snapshot(): AgentActivitySnapshot {
     return {
@@ -84,47 +85,9 @@ export class AgentActivityStore {
     this.emit()
   }
 
-  ensureCheckpoint(): void {
-    if (this.checkpoint) return
-    this.checkpoint = this.engine.toPreset('Agent checkpoint')
-    this.state.checkpointAvailable = true
-    this.state.checkpointCreatedAt = Date.now()
-    this.state.changedParameters = []
-    this.state.comparison = null
-    this.emit()
-  }
-
-  recordChangedParameters(ids: string[]): void {
-    this.addChangedParameters(ids)
-    this.emit()
-  }
-
-  acceptCheckpoint(): boolean {
-    if (!this.checkpoint || this.state.performanceActive) return false
-    this.checkpoint = null
-    this.state.checkpointAvailable = false
-    this.state.checkpointCreatedAt = null
-    this.state.lastAction = this.humanAction('Kept agent changes')
-    this.emit()
-    return true
-  }
-
-  restoreCheckpoint(): boolean {
-    if (!this.checkpoint || this.state.performanceActive) return false
-    const checkpoint = this.checkpoint
-    this.checkpoint = null
-    this.engine.loadPreset(checkpoint)
-    this.state.checkpointAvailable = false
-    this.state.checkpointCreatedAt = null
-    this.state.changedParameters = []
-    this.state.comparison = null
-    this.state.lastAction = this.humanAction('Restored previous state')
-    this.emit()
-    return true
-  }
-
   startAction(tool: string): number {
     const id = ++this.actionId
+    if (['update_parameters', 'set_modulation', 'load_preset'].includes(tool)) this.state.changedParameters = []
     this.state.lastAction = {
       id,
       tool,
@@ -195,6 +158,8 @@ export class AgentActivityStore {
   }
 
   private successSummary(tool: string, output: Record<string, unknown> | null): string {
+    if (tool === 'show_ui_guide') return output?.cleared ? 'Guide cleared' : `${output?.stepCount ?? 0} guide steps shown`
+    if (tool === 'get_ui_targets' && Array.isArray(output?.items)) return `${output.items.length} targets returned`
     if (tool === 'update_parameters' && Array.isArray(output?.applied)) return `${output.applied.length} parameter${output.applied.length === 1 ? '' : 's'}`
     if (tool === 'play_notes' && typeof output?.noteCount === 'number') return `${output.noteCount} note${output.noteCount === 1 ? '' : 's'}`
     if (tool === 'compare_audio') {
@@ -207,17 +172,6 @@ export class AgentActivityStore {
 
   private addChangedParameters(ids: string[]): void {
     this.state.changedParameters = [...new Set([...this.state.changedParameters, ...ids])]
-  }
-
-  private humanAction(label: string): AgentAction {
-    return {
-      id: ++this.actionId,
-      tool: 'human_checkpoint',
-      label,
-      status: 'completed',
-      summary: 'Completed',
-      timestamp: Date.now()
-    }
   }
 
   private emit(): void {

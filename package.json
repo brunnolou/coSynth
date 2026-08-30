@@ -21,6 +21,8 @@
     "webmcp-types": "^0.1.5"
   },
   "dependencies": {
-    "lucide": "^1.37.0"
+    "driver.js": "^1.8.0",
+    "lucide": "^1.37.0",
+    "micromark": "^4.0.2"
   }
 }

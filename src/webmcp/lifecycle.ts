@@ -6,7 +6,7 @@ interface HotLifecycle {
 
 /** Attach bfcache-aware page and HMR cleanup to an idempotent registration. */
 export function bindWebMcpLifecycle(
-  registration: WebMcpRegistration,
+  registration: Pick<WebMcpRegistration, 'ready' | 'dispose'>,
   target: EventTarget = window,
   hot?: HotLifecycle
 ): () => void {

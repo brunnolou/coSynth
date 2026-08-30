@@ -5,6 +5,7 @@ import { FX_IDS } from '../shared/messages'
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
 import { bindEnabledState, paramToggle, paramSelect, knobRow } from './controls'
+import { guideTarget } from './guide-target'
 
 const FX_LABELS: Record<string, string> = {
   chorus: 'CHORUS',
@@ -31,16 +32,21 @@ const FX_KNOBS: Record<string, string[]> = {
 export class FxRack {
   readonly root: HTMLElement
   private readonly units = new Map<number, HTMLElement>()
+  private readonly unsubscribe: () => void
 
   constructor(private readonly engine: SynthEngine) {
     this.root = el('div', 'fx-rack')
     for (let i = 0; i < FX_IDS.length; i++) this.units.set(i, this.buildUnit(i))
     this.render()
+    this.unsubscribe = engine.onFxOrder(() => this.render())
   }
+
+  dispose(): void { this.unsubscribe() }
 
   private buildUnit(fx: number): HTMLElement {
     const id = FX_IDS[fx]
     const unit = el('div', 'fx-unit')
+    guideTarget(unit, `fx.${id}`, id === 'delay' ? 'Delay / echo effect' : `${FX_LABELS[id]} effect`, 'panel')
     const head = el('div', 'fx-head')
     head.appendChild(paramToggle(this.engine, `${id}.enabled`, '●'))
     head.appendChild(el('span', 'fx-name', FX_LABELS[id]))
@@ -48,6 +54,8 @@ export class FxRack {
     head.appendChild(spacer)
     const up = el('button', 'fx-move', '▲')
     const down = el('button', 'fx-move', '▼')
+    guideTarget(up, `button.fx.${id}.up`, `Move ${FX_LABELS[id]} earlier`, 'button')
+    guideTarget(down, `button.fx.${id}.down`, `Move ${FX_LABELS[id]} later`, 'button')
     up.addEventListener('click', () => this.move(fx, -1))
     down.addEventListener('click', () => this.move(fx, 1))
     head.append(up, down)
@@ -75,7 +83,6 @@ export class FxRack {
     order.splice(pos, 1)
     order.splice(to, 0, fx)
     this.engine.setFxOrder(order)
-    this.render()
   }
 
   private render(): void {

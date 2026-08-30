@@ -18,12 +18,15 @@ import { initMidi } from './midi'
 import { FilterResponseView } from './filter-response'
 import { OscWavePreview } from './osc-wave-preview'
 import { ModalDialog } from './dialog'
+import { guideTarget } from './guide-target'
+import type { HistoryServices } from '../history/types'
 
-export function buildApp(engine: SynthEngine, container: HTMLElement): void {
+export function buildApp(engine: SynthEngine, container: HTMLElement, services: HistoryServices): () => void {
   engine.primeTables()
 
   // ------------------------------------------------------------ header
   const header = el('header')
+  guideTarget(header, 'panel.header', 'Main toolbar', 'panel')
   header.appendChild(el('div', 'logo', 'SOUNDGINEER'))
   header.appendChild(new PresetBrowser(engine).root)
   const hdrRight = el('div', 'hdr-right')
@@ -31,6 +34,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   hdrRight.appendChild(new Knob(engine, paramIndex('master.bpm'), 40).root)
   const voiceLabel = el('span', 'hdr-stat hdr-voices', 'voices 0')
   const midiLabel = el('button', 'hdr-stat hdr-midi', 'MIDI: …')
+  guideTarget(midiLabel, 'button.midi', 'MIDI status and help', 'button')
   midiLabel.type = 'button'
   midiLabel.disabled = true
   const midiDialog = new ModalDialog('MIDI unavailable in ChatGPT')
@@ -47,6 +51,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   const hdrStats = el('div', 'hdr-stats')
   hdrStats.append(voiceLabel, midiLabel)
   const meter = el('div', 'meter')
+  guideTarget(meter, 'visualizer.meter', 'Output level meters', 'visualizer')
   const meterLTrack = el('div', 'meter-track')
   const meterRTrack = el('div', 'meter-track')
   const meterL = el('div', 'meter-bar')
@@ -55,17 +60,20 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   meterRTrack.appendChild(meterR)
   meter.append(meterLTrack, meterRTrack)
   const scope = new Scope(engine)
+  guideTarget(scope.root, 'visualizer.scope', 'Waveform / spectrum toggle', 'visualizer')
   hdrRight.append(hdrStats, meter, scope.root)
   header.appendChild(hdrRight)
 
   // ------------------------------------------------------------ oscillators
   const oscCol = el('div', 'col osc-col')
   const wt3d = new WavetableView(engine)
+  guideTarget(wt3d.root, 'visualizer.wavetable', '3D oscillator wavetable', 'visualizer')
   const oscWavePreviews: OscWavePreview[] = []
   wt3d.root.classList.add('osc-preview')
   oscCol.appendChild(wt3d.root)
   for (let o = 1; o <= 3; o++) {
     const panel = el('section', 'panel')
+    guideTarget(panel, `panel.osc${o}`, `Oscillator ${o}`, 'panel')
     panel.addEventListener('click', () => wt3d.setOsc(o - 1))
     const head = el('div', 'panel-head')
     head.appendChild(paramToggle(engine, `osc${o}.enabled`, '●'))
@@ -89,6 +97,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     })
     wavetableSelect.title = 'Choose a wavetable. Custom imports a single-cycle or Serum-format WAV.'
     const wavePreview = new OscWavePreview(engine, o - 1)
+    guideTarget(wavePreview.root, `visualizer.osc${o}`, `Oscillator ${o} waveform`, 'visualizer')
     oscWavePreviews.push(wavePreview)
     head.append(wavetableSelect, file, wavePreview.root)
     panel.appendChild(head)
@@ -103,6 +112,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // sub
   const subPanel = el('section', 'panel')
+  guideTarget(subPanel, 'panel.sub', 'Sub oscillator', 'panel')
   const subHead = el('div', 'panel-head')
   subHead.appendChild(paramToggle(engine, 'sub.enabled', '●'))
   subHead.appendChild(el('span', 'panel-title', 'SUB'))
@@ -114,11 +124,13 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // noise
   const noisePanel = el('section', 'panel')
+  guideTarget(noisePanel, 'panel.noise', 'Noise oscillator', 'panel')
   const noiseHead = el('div', 'panel-head')
   noiseHead.appendChild(paramToggle(engine, 'noise.enabled', '●'))
   noiseHead.appendChild(el('span', 'panel-title', 'NOISE'))
   noiseHead.appendChild(paramSelect(engine, 'noise.type'))
   const sampleBtn = el('button', 'hdr-btn', 'SMP')
+  guideTarget(sampleBtn, 'button.noise.sample', 'Import noise sample', 'button')
   sampleBtn.title = 'Load a WAV into the sample slot (Noise type: Sample)'
   const sampleFile = el('input') as HTMLInputElement
   sampleFile.type = 'file'
@@ -143,12 +155,14 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   for (let f = 1; f <= 2; f++) {
     const panel = el('section', 'panel filter-panel')
+    guideTarget(panel, `panel.filter${f}`, `Filter ${f}`, 'panel')
     const head = el('div', 'panel-head')
     head.appendChild(paramToggle(engine, `filter${f}.enabled`, '●'))
     head.appendChild(el('span', 'panel-title', `FILTER ${f}`))
     head.appendChild(paramSelect(engine, `filter${f}.type`, { choiceLabels: FILTER_TYPE_LABELS }))
     panel.appendChild(head)
     const filterView = new FilterResponseView(engine, f as 1 | 2)
+    guideTarget(filterView.root, `visualizer.filter${f}`, `Filter ${f} response`, 'visualizer')
     filterViews.push(filterView)
     panel.appendChild(filterView.root)
     panel.appendChild(knobRow(engine, [
@@ -161,6 +175,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   // ------------------------------------------------------------ right column
   const sideCol = el('div', 'col side-col')
   const distPanel = el('section', 'panel filter-panel')
+  guideTarget(distPanel, 'panel.shape', 'Waveshaper', 'panel')
   const distHead = el('div', 'panel-head')
   distHead.appendChild(paramToggle(engine, 'dist.enabled', '●'))
   distHead.appendChild(el('span', 'panel-title', 'SHAPE'))
@@ -176,9 +191,11 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ envelopes
   const envPanel = el('section', 'panel module-panel env-panel')
+  guideTarget(envPanel, 'panel.env', 'Envelope editor', 'panel')
   const envBody = el('div', 'mod-tab')
   const envSelector = el('div', 'sub-tabs')
   const envDisplay = new EnvDisplay(engine, 1)
+  guideTarget(envDisplay.root, 'visualizer.env', 'Selected envelope shape', 'visualizer')
   const envKnobArea = el('div')
   let currentEnv = 1
   const renderEnvKnobs = () => {
@@ -193,6 +210,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   for (let e = 1; e <= 6; e++) {
     const wrap = el('div', 'sub-tab-wrap')
     const b = el('button', e === 1 ? 'sub-tab on' : 'sub-tab', `ENV ${e}${e === 1 ? ' · AMP' : ''}`) as HTMLButtonElement
+    guideTarget(b, `tab.env${e}`, e === 1 ? 'Env 1 amplitude envelope' : `Env ${e}`, 'tab')
     b.addEventListener('click', () => {
       currentEnv = e
       envBtns.forEach((x, i) => x.classList.toggle('on', i === e - 1))
@@ -210,9 +228,11 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ LFOs
   const lfoPanel = el('section', 'panel module-panel lfo-panel')
+  guideTarget(lfoPanel, 'panel.lfo', 'LFO editor', 'panel')
   const lfoBody = el('div', 'mod-tab')
   const lfoSelector = el('div', 'sub-tabs')
   const lfoEditor = new LfoEditor(engine, 0)
+  guideTarget(lfoEditor.root, 'visualizer.lfo', 'Selected LFO shape', 'visualizer')
   const lfoKnobArea = el('div')
   let currentLfo = 1
   const renderLfoKnobs = () => {
@@ -230,6 +250,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   for (let l = 1; l <= 8; l++) {
     const wrap = el('div', 'sub-tab-wrap')
     const b = el('button', l === 1 ? 'sub-tab on' : 'sub-tab', `LFO ${l}`) as HTMLButtonElement
+    guideTarget(b, `tab.lfo${l}`, `LFO ${l}`, 'tab')
     b.addEventListener('click', () => {
       currentLfo = l
       lfoBtns.forEach((x, i) => x.classList.toggle('on', i === l - 1))
@@ -248,13 +269,16 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ matrix
   const matrixPanel = el('section', 'panel module-panel matrix-panel')
+  guideTarget(matrixPanel, 'panel.matrix', 'Modulation matrix', 'panel')
   const matrixHead = el('div', 'panel-head')
   matrixHead.appendChild(el('span', 'panel-title', 'MATRIX'))
-  matrixPanel.append(matrixHead, new ModMatrix(engine).root)
+  const matrix = new ModMatrix(engine)
+  matrixPanel.append(matrixHead, matrix.root)
   centerCol.appendChild(matrixPanel)
 
   // ------------------------------------------------------------ performance sources
   const performancePanel = el('section', 'panel performance-panel')
+  guideTarget(performancePanel, 'panel.performance', 'Macros and performance sources', 'panel')
   const srcRow = el('div', 'source-row')
   const macroKnobs = el('div', 'knob-row')
   for (let m = 1; m <= 4; m++) {
@@ -273,15 +297,17 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
 
   // ------------------------------------------------------------ effects
   const fxPanel = el('section', 'panel fx-panel')
+  guideTarget(fxPanel, 'panel.fx', 'Effects rack', 'panel')
   const fxHead = el('div', 'panel-head')
   fxHead.appendChild(el('span', 'panel-title', 'FX'))
-  fxPanel.append(fxHead, new FxRack(engine).root)
+  const fxRack = new FxRack(engine)
+  fxPanel.append(fxHead, fxRack.root)
   sideCol.appendChild(fxPanel)
 
   // ------------------------------------------------------------ layout
   const main = el('main')
   main.append(oscCol, centerCol, sideCol)
-  const agentActivity = new AgentActivityPanel(engine)
+  const agentActivity = new AgentActivityPanel(engine, services)
   const keyboard = new Keyboard(engine)
   container.append(header, main, agentActivity.root, performancePanel, keyboard.root, midiDialog.root)
 
@@ -296,6 +322,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   })
 
   // ------------------------------------------------------------ animation loop
+  let frame = 0
   const tick = () => {
     scope.draw()
     wt3d.draw()
@@ -309,7 +336,14 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     meterR.style.width = `${Math.min(engine.peakR * 100, 100)}%`
     meterL.classList.toggle('hot', engine.peakL > 1)
     meterR.classList.toggle('hot', engine.peakR > 1)
-    requestAnimationFrame(tick)
+    frame = requestAnimationFrame(tick)
   }
-  requestAnimationFrame(tick)
+  frame = requestAnimationFrame(tick)
+  return () => {
+    cancelAnimationFrame(frame)
+    agentActivity.dispose()
+    keyboard.dispose()
+    matrix.dispose()
+    fxRack.dispose()
+  }
 }

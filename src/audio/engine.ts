@@ -31,6 +31,48 @@ export interface RecordedAudio {
 
 export type NoteOwner = symbol
 
+/** Structured state is frozen; imported PCM buffers are shared and never mutated. */
+export interface SoundSnapshot {
+  readonly values: readonly number[]
+  readonly modSlots: readonly (Readonly<ModSlotState> | null)[]
+  readonly lfoShapes: readonly (readonly Readonly<LfoPoint>[])[]
+  readonly fxOrder: readonly number[]
+  readonly customTables: readonly (Wavetable | null)[]
+  readonly noiseSample: Readonly<{ data: Float32Array; sampleRate: number }> | null
+}
+
+export interface SoundChange {
+  label: string
+  changed: string[]
+  coalesceKey?: string
+  /** A complete operation must not join an unrelated pending human gesture. */
+  atomic?: boolean
+}
+
+/** Buffer identity lets history count shared imported assets only once. */
+export function soundStateAssets(state: SoundSnapshot): readonly { byteLength: number }[] {
+  const assets = new Set<ArrayBufferLike>()
+  for (const table of state.customTables) if (table) assets.add(table.data.buffer)
+  if (state.noiseSample) assets.add(state.noiseSample.data.buffer)
+  return [...assets]
+}
+
+function changedSoundFields(before: SoundSnapshot, after: SoundSnapshot): string[] {
+  const changed = before.values.flatMap((value, i) => value !== after.values[i] ? [PARAMS[i].id] : [])
+  before.modSlots.forEach((slot, i) => {
+    if (JSON.stringify(slot) !== JSON.stringify(after.modSlots[i])) changed.push(`mod.${i}`)
+  })
+  before.lfoShapes.forEach((shape, i) => {
+    if (JSON.stringify(shape) !== JSON.stringify(after.lfoShapes[i])) changed.push(`lfo${i + 1}.shape`)
+  })
+  if (JSON.stringify(before.fxOrder) !== JSON.stringify(after.fxOrder)) changed.push('fx.order')
+  before.customTables.forEach((table, i) => {
+    if (table !== after.customTables[i]) changed.push(`osc${i + 1}.customTable`)
+  })
+  if (before.noiseSample !== after.noiseSample) changed.push('noise.sample')
+  return changed
+}
+
 const OSC_WT_IDX = [1, 2, 3].map(o => paramIndex(`osc${o}.wavetable`))
 const CUSTOM_WT = WAVETABLE_NAMES.indexOf('Custom')
 
@@ -72,6 +114,10 @@ export class SynthEngine {
   private readonly paramListeners: (Set<ParamListener> | undefined)[] = new Array(NUM_PARAMS)
   private readonly matrixListeners = new Set<() => void>()
   private readonly tableListeners = new Set<(osc: number) => void>()
+  private readonly fxOrderListeners = new Set<() => void>()
+  private readonly soundListeners = new Set<(change: SoundChange) => void>()
+  private batchDepth = 0
+  private noiseSample: SoundSnapshot['noiseSample'] = null
   private readonly tableCache = new Map<string, Wavetable>()
   private readonly customTables: (Wavetable | null)[] = [null, null, null]
   /** main-thread copy of each osc's current table, for the 3D view */
@@ -114,6 +160,56 @@ export class SynthEngine {
     for (let l = 0; l < 8; l++) this.post({ type: 'lfoShape', lfo: l, points: this.lfoShapes[l] })
     this.post({ type: 'fxOrder', order: this.fxOrder })
     for (let o = 0; o < 3; o++) this.sendWavetable(o)
+    this.sendSample()
+  }
+
+  captureSoundState(): SoundSnapshot {
+    return Object.freeze({
+      values: Object.freeze(Array.from(this.values)),
+      modSlots: Object.freeze(this.modSlots.map(slot => slot ? Object.freeze({ ...slot }) : null)),
+      lfoShapes: Object.freeze(this.lfoShapes.map(shape => Object.freeze(shape.map(point => Object.freeze({ ...point }))))),
+      fxOrder: Object.freeze(this.fxOrder.slice()),
+      customTables: Object.freeze(this.customTables.slice()),
+      noiseSample: this.noiseSample
+    })
+  }
+
+  restoreSoundState(state: SoundSnapshot): void {
+    this.batchSoundChange('Restore sound', () => {
+      this.values.set(state.values)
+      state.modSlots.forEach((slot, i) => { this.modSlots[i] = slot ? { ...slot } : null })
+      state.lfoShapes.forEach((shape, i) => { this.lfoShapes[i] = shape.map(point => ({ ...point })) })
+      this.fxOrder = [...state.fxOrder]
+      state.customTables.forEach((table, i) => { this.customTables[i] = table })
+      this.noiseSample = state.noiseSample
+      this.allNotesOff()
+      this.syncAll()
+      for (let i = 0; i < NUM_PARAMS; i++) this.paramListeners[i]?.forEach(fn => fn(this.values[i]))
+      this.notifyMatrix()
+      this.fxOrderListeners.forEach(fn => fn())
+    })
+  }
+
+  onSoundChange(fn: (change: SoundChange) => void): () => void {
+    this.soundListeners.add(fn)
+    return () => this.soundListeners.delete(fn)
+  }
+
+  batchSoundChange<T>(label: string, fn: () => T): T {
+    const before = this.batchDepth === 0 ? this.captureSoundState() : null
+    this.batchDepth++
+    try { return fn() }
+    finally {
+      this.batchDepth--
+      if (before) {
+        const changed = changedSoundFields(before, this.captureSoundState())
+        if (changed.length) this.notifySound({ label, changed, atomic: true })
+      }
+    }
+  }
+
+  private notifySound(change: SoundChange): void {
+    if (this.batchDepth === 0) this.soundListeners.forEach(fn => fn(change))
   }
 
   private onWorkletMessage(msg: FromWorklet): void {
@@ -133,14 +229,16 @@ export class SynthEngine {
 
   // ------------------------------------------------------------ parameters
 
-  setParam(index: number, value: number): void {
-    value = Math.max(0, Math.min(1, value))
+  setParam(index: number, value: number, options?: { coalesceKey?: string }): void {
+    if (!Number.isInteger(index) || index < 0 || index >= NUM_PARAMS || !Number.isFinite(value)) return
+    value = Math.fround(Math.max(0, Math.min(1, value)))
     if (this.values[index] === value) return
     this.values[index] = value
     this.post({ type: 'param', index, value })
     this.paramListeners[index]?.forEach(fn => fn(value))
     const osc = OSC_WT_IDX.indexOf(index)
     if (osc >= 0) this.sendWavetable(osc)
+    this.notifySound({ label: `Change ${PARAMS[index].id}`, changed: [PARAMS[index].id], ...options })
   }
 
   setParamById(id: string, value: number): void {
@@ -198,16 +296,28 @@ export class SynthEngine {
   async importWavetableFile(osc: number, file: File): Promise<void> {
     const buf = await file.arrayBuffer()
     const wav = decodeWav(buf)
-    this.customTables[osc] = wavToWavetable(file.name.replace(/\.wav$/i, ''), wav)
-    // switch the osc to the Custom slot, which also triggers the upload
-    this.setParam(OSC_WT_IDX[osc], CUSTOM_WT / (WAVETABLE_NAMES.length - 1))
-    this.sendWavetable(osc)
+    const table = Object.freeze(wavToWavetable(file.name.replace(/\.wav$/i, ''), wav))
+    this.batchSoundChange(`Import OSC ${osc + 1} wavetable`, () => {
+      this.customTables[osc] = table
+      // Changing an existing Custom slot still needs to upload the new asset.
+      this.setParam(OSC_WT_IDX[osc], CUSTOM_WT / (WAVETABLE_NAMES.length - 1))
+      this.sendWavetable(osc)
+    })
   }
 
   async importSampleFile(file: File): Promise<void> {
     const buf = await file.arrayBuffer()
     const wav = decodeWav(buf)
-    this.post({ type: 'sample', data: wav.channelData, sampleRate: wav.sampleRate }, [wav.channelData.buffer])
+    this.batchSoundChange('Import noise sample', () => {
+      this.noiseSample = Object.freeze({ data: wav.channelData, sampleRate: wav.sampleRate })
+      this.sendSample()
+    })
+  }
+
+  private sendSample(): void {
+    if (!this.node) return
+    const data = this.noiseSample ? new Float32Array(this.noiseSample.data) : new Float32Array(0)
+    this.post({ type: 'sample', data, sampleRate: this.noiseSample?.sampleRate ?? 44100 }, [data.buffer])
   }
 
   // ------------------------------------------------------------ mod matrix
@@ -222,9 +332,11 @@ export class SynthEngine {
   }
 
   setModSlot(slot: number, state: ModSlotState | null): void {
-    this.modSlots[slot] = state
+    if (JSON.stringify(this.modSlots[slot]) === JSON.stringify(state)) return
+    this.modSlots[slot] = state ? { ...state } : null
     this.post({ type: 'mod', slot, state })
     this.notifyMatrix()
+    this.notifySound({ label: 'Edit modulation route', changed: [`mod.${slot}`] })
   }
 
   /** Create (or reuse) a route source -> dest. Returns the slot, or -1 if full. */
@@ -248,15 +360,25 @@ export class SynthEngine {
   // ------------------------------------------------------------ LFO shapes
 
   setLfoShape(lfo: number, points: LfoPoint[]): void {
-    this.lfoShapes[lfo] = points
+    if (JSON.stringify(this.lfoShapes[lfo]) === JSON.stringify(points)) return
+    this.lfoShapes[lfo] = points.map(point => ({ ...point }))
     this.post({ type: 'lfoShape', lfo, points })
+    this.notifySound({ label: `Edit LFO ${lfo + 1} shape`, changed: [`lfo${lfo + 1}.shape`] })
   }
 
   // ------------------------------------------------------------ FX order
 
   setFxOrder(order: number[]): void {
+    if (JSON.stringify(this.fxOrder) === JSON.stringify(order)) return
     this.fxOrder = order.slice()
     this.post({ type: 'fxOrder', order: this.fxOrder })
+    this.fxOrderListeners.forEach(fn => fn())
+    this.notifySound({ label: 'Reorder effects', changed: ['fx.order'] })
+  }
+
+  onFxOrder(fn: () => void): () => void {
+    this.fxOrderListeners.add(fn)
+    return () => this.fxOrderListeners.delete(fn)
   }
 
   // ------------------------------------------------------------ performance
@@ -301,9 +423,11 @@ export class SynthEngine {
     this.post({ type: 'aftertouch', value: v })
   }
   allNotesOff(): void {
+    const notes = [...this.heldNotes]
     this.noteOwners.clear()
     this.heldNotes.clear()
     this.post({ type: 'allNotesOff' })
+    notes.forEach(note => this.noteListeners.forEach(fn => fn(note, false)))
   }
 
   /**
@@ -428,6 +552,10 @@ export class SynthEngine {
   }
 
   loadPreset(preset: Partial<PresetData>): void {
+    this.batchSoundChange(`Load preset${preset.name ? ` ${preset.name}` : ''}`, () => this.applyPreset(preset))
+  }
+
+  private applyPreset(preset: Partial<PresetData>): void {
     // reset to defaults first so presets don't need every param
     const defs = defaultValues()
     this.values.set(defs)
@@ -469,5 +597,6 @@ export class SynthEngine {
     else for (let o = 0; o < 3; o++) this.sendWavetable(o) // still update UI table views
     for (let i = 0; i < NUM_PARAMS; i++) this.paramListeners[i]?.forEach(fn => fn(this.values[i]))
     this.notifyMatrix()
+    this.fxOrderListeners.forEach(fn => fn())
   }
 }

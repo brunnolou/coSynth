@@ -14,6 +14,7 @@ describe('registerWebMcpTools', () => {
     const registration = registerWebMcpTools(engine, undefined)
     await expect(registration.ready).resolves.toBeUndefined()
     expect(() => registration.dispose()).not.toThrow()
+    expect(registration.registeredCount).toBe(0)
   })
 
   it('registers each of the eleven tools exactly once with a shared lifecycle signal', async () => {
@@ -33,6 +34,7 @@ describe('registerWebMcpTools', () => {
     ])
     expect(new Set(calls.map(call => call.signal)).size).toBe(1)
     expect(calls[0].signal?.aborted).toBe(false)
+    expect(registration.registeredCount).toBe(11)
     registration.dispose()
     expect(calls[0].signal?.aborted).toBe(true)
   })
@@ -78,9 +80,31 @@ describe('registerWebMcpTools', () => {
       return Promise.resolve()
     })
 
-    await expect(registerWebMcpTools(engine, modelContext).ready).resolves.toBeUndefined()
+    const registration = registerWebMcpTools(engine, modelContext)
+    await expect(registration.ready).resolves.toBeUndefined()
+    expect(registration.registeredCount).toBe(9)
     expect(attempted).toHaveLength(11)
     expect(warn).toHaveBeenCalledTimes(2)
     warn.mockRestore()
+  })
+
+  it('registers injected teaching tools before audio without patch checkpoints', async () => {
+    const calls: WebMCP.ModelContextTool[] = []
+    const engine = {} as SynthEngine
+    const guide = { show: vi.fn(() => ({ shown: true, stepCount: 1, warnings: [] })), listTargets: vi.fn(() => ({ items: [], total: 0, offset: 0, limit: 5 })) }
+    const registration = registerWebMcpTools(engine, context(tool => { calls.push(tool) }), { audioTools: 'exclude', guide })
+    await registration.ready
+    expect(registration.registeredCount).toBe(11)
+    const show = calls.find(t => t.name === 'show_ui_guide')!
+    const get = calls.find(t => t.name === 'get_ui_targets')!
+    expect(show.annotations?.readOnlyHint).toBe(false)
+    expect(get.annotations?.readOnlyHint).toBe(true)
+    const input = { steps: [{ target: { id: 'fx.delay' } }] }
+    await show.execute(input, { signal: new AbortController().signal })
+    expect(guide.show).toHaveBeenCalledWith(input)
+    expect(agentActivityFor(engine).snapshot()).toMatchObject({ changedParameters: [], lastAction: { summary: '1 guide steps shown' } })
+    registration.dispose()
+    await expect(show.execute(input, { signal: new AbortController().signal })).rejects.toMatchObject({ name: 'AbortError' })
+    expect(guide.show).toHaveBeenCalledTimes(1)
   })
 })

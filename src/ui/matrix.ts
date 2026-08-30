@@ -5,6 +5,7 @@ import { PARAMS } from '../shared/params'
 import { MOD_SOURCES, MAX_MOD_SLOTS } from '../shared/messages'
 import type { SynthEngine } from '../audio/engine'
 import { el, sourceColor } from './common'
+import { guideTarget } from './guide-target'
 
 const MODDABLE = PARAMS.map((d, i) => ({ d, i })).filter(({ d }) => d.moddable)
 
@@ -16,6 +17,8 @@ function destLabel(i: number): string {
 export class ModMatrix {
   readonly root: HTMLElement
   private readonly rows: HTMLElement
+  private readonly rowUpdates = new Map<number, { root: HTMLElement; update: () => void }>()
+  private readonly unsubscribe: () => void
 
   constructor(private readonly engine: SynthEngine) {
     this.root = el('div', 'matrix')
@@ -28,6 +31,7 @@ export class ModMatrix {
     )
     this.rows = el('div', 'matrix-rows')
     const add = el('button', 'matrix-add', '+ Add route')
+    guideTarget(add, 'button.matrix.add', 'Add modulation route', 'button')
     add.addEventListener('click', () => {
       const slot = this.engine.modSlots.findIndex(s => s === null)
       if (slot >= 0) {
@@ -35,15 +39,20 @@ export class ModMatrix {
       }
     })
     this.root.append(head, this.rows, add)
-    engine.onMatrixChange(() => this.render())
+    this.unsubscribe = engine.onMatrixChange(() => this.render())
     this.render()
   }
 
   private render(): void {
-    this.rows.textContent = ''
+    for (const [slot, row] of this.rowUpdates) {
+      if (!this.engine.modSlots[slot]) { row.root.remove(); this.rowUpdates.delete(slot) }
+    }
+    let index = 0
     for (let slot = 0; slot < MAX_MOD_SLOTS; slot++) {
       const state = this.engine.modSlots[slot]
       if (!state) continue
+      const existing = this.rowUpdates.get(slot)
+      if (existing) { existing.update(); index++; continue }
       const row = el('div', 'matrix-row')
 
       const src = el('select', 'param-select') as HTMLSelectElement
@@ -55,7 +64,8 @@ export class ModMatrix {
       src.value = String(state.source)
       src.style.borderLeft = `3px solid ${sourceColor(state.source)}`
       src.addEventListener('change', () => {
-        this.engine.setModSlot(slot, { ...state, source: Number(src.value) })
+        const current = this.engine.modSlots[slot]
+        if (current) this.engine.setModSlot(slot, { ...current, source: Number(src.value) })
       })
 
       const depthWrap = el('div', 'matrix-depth')
@@ -79,21 +89,42 @@ export class ModMatrix {
       }
       dest.value = String(state.dest)
       dest.addEventListener('change', () => {
-        this.engine.setModSlot(slot, { ...state, dest: Number(dest.value) })
+        const current = this.engine.modSlots[slot]
+        if (current) this.engine.setModSlot(slot, { ...current, dest: Number(dest.value) })
       })
 
       const controls = el('div', 'matrix-controls')
       const enable = el('button', `toggle${state.enabled ? ' on' : ''}`, '●')
       enable.title = 'Enable/bypass'
       enable.addEventListener('click', () => {
-        this.engine.setModSlot(slot, { ...state, enabled: !state.enabled })
+        const current = this.engine.modSlots[slot]
+        if (current) this.engine.setModSlot(slot, { ...current, enabled: !current.enabled })
       })
       const del = el('button', 'mod-del', '✕')
+      guideTarget(row, `matrix.slot${slot}`, `Modulation slot ${slot}`, 'row')
+      guideTarget(src, `matrix.slot${slot}.source`, `Slot ${slot} source`, 'select')
+      guideTarget(dest, `matrix.slot${slot}.destination`, `Slot ${slot} destination`, 'select')
+      guideTarget(depth, `matrix.slot${slot}.depth`, `Slot ${slot} depth`, 'slider')
+      guideTarget(enable, `matrix.slot${slot}.enabled`, `Slot ${slot} enable`, 'button')
+      guideTarget(del, `matrix.slot${slot}.remove`, `Remove slot ${slot}`, 'button')
       del.addEventListener('click', () => this.engine.setModSlot(slot, null))
       controls.append(enable, del)
 
       row.append(src, depthWrap, dest, controls)
-      this.rows.appendChild(row)
+      this.rowUpdates.set(slot, { root: row, update: () => {
+        const current = this.engine.modSlots[slot]
+        if (!current) return
+        src.value = String(current.source)
+        src.style.borderLeft = `3px solid ${sourceColor(current.source)}`
+        dest.value = String(current.dest)
+        depth.value = String(Math.round(current.depth * 100))
+        depthLabel.textContent = `${Math.round(current.depth * 100)}%`
+        enable.classList.toggle('on', current.enabled)
+      } })
+      this.rows.insertBefore(row, this.rows.children[index] ?? null)
+      index++
     }
   }
+
+  dispose(): void { this.unsubscribe() }
 }

@@ -64,7 +64,7 @@ function handle(engine: SynthEngine, data: Uint8Array): void {
       else if (cc === 120 || cc === 123) engine.allNotesOff()
       else {
         const macro = MACRO_CCS.indexOf(cc)
-        if (macro >= 0) engine.setParam(paramIndex(`macro${macro + 1}.value`), v)
+        if (macro >= 0) engine.setParam(paramIndex(`macro${macro + 1}.value`), v, { coalesceKey: `midi:macro${macro + 1}` })
       }
       break
     }

@@ -51,14 +51,14 @@ try {
     Object.defineProperty(window, '__webMcpTools', { value: tools })
   })
   await shimmed.page.goto(url, { waitUntil: 'networkidle' })
-  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 9)
+  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 15)
   const toolsBeforeAudio = await shimmed.page.evaluate(() => [...window.__webMcpTools.keys()])
   if (toolsBeforeAudio.includes('play_notes') || toolsBeforeAudio.includes('render_audio')) {
     throw new Error('Audio tools were exposed before audio startup')
   }
   await shimmed.page.click('#start-btn')
   await shimmed.page.waitForFunction(() => !document.getElementById('start-overlay'), { timeout: 10000 })
-  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 11)
+  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 17)
 
   const result = await shimmed.page.evaluate(async () => {
     const tools = window.__webMcpTools
@@ -140,6 +140,8 @@ try {
     const loaded = await call('load_preset', { name: 'WebMCP Smoke' })
     const loadedState = await call('get_synth_state', { search: 'master.volume' })
     const expectedError = await call('update_parameters', { updates: [{ id: 'missing', value: 1 }] })
+    const history = await call('get_history', { view: 'sounds', limit: 20 })
+    const replays = await call('get_history', { view: 'replays', limit: 20 })
     return {
       names, running: state.runtime.running,
       schemaCount: schema.parameters.items.length,
@@ -173,9 +175,11 @@ try {
       expectedError,
       activity: {
         toolStatus: document.querySelector('.agent-tool-status')?.textContent,
-        similarity: document.querySelector('.agent-similarity')?.textContent,
-        checkpointReady: document.querySelector('.agent-activity-actions button:last-child')?.textContent,
-        changedParameters: [...document.querySelectorAll('.agent-param')].map(element => element.textContent)
+        undoEnabled: !document.querySelector('[data-guide-id="button.history.undo"]')?.disabled,
+        changedParameters: [...document.querySelectorAll('.agent-param')].map(element => element.textContent),
+        retainedComparison: history.items.some(entry => Number.isFinite(entry.comparison?.similarity)),
+        soundCount: history.total,
+        replayCount: replays.items.filter(entry => entry.kind === 'performance').length
       },
       heldNotes: window.soundgineer.heldNotes.size
     }
@@ -184,7 +188,8 @@ try {
   const expectedNames = [
     'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
     'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
-    'compare_audio', 'save_preset', 'load_preset'
+    'compare_audio', 'save_preset', 'load_preset', 'get_ui_targets', 'show_ui_guide',
+    'get_history', 'navigate_history', 'replay_history', 'stop_performance'
   ]
   if (JSON.stringify([...result.names].sort()) !== JSON.stringify([...expectedNames].sort())) throw new Error(`Unexpected tools: ${result.names}`)
   if (!result.running || !result.schemaCount || result.appliedRaw !== 0.8) throw new Error('State/schema/update check failed')
@@ -199,8 +204,9 @@ try {
   if (result.expectedError?.ok !== false || !/unknown parameter/i.test(result.expectedError?.error?.message ?? '')) {
     throw new Error(`Structured error check failed: ${JSON.stringify(result.expectedError)}`)
   }
-  if (result.activity.toolStatus !== '11 tools prontos' || result.activity.checkpointReady !== 'Checkpoint ready' ||
-      !result.activity.similarity?.includes('% similarity') || !result.activity.changedParameters.includes('master.volume')) {
+  if (result.activity.toolStatus !== '17 tools ready' || !result.activity.undoEnabled ||
+      !result.activity.retainedComparison || !result.activity.changedParameters.includes('master.volume') ||
+      result.activity.soundCount < 5 || result.activity.replayCount !== 2) {
     throw new Error(`Agent activity check failed: ${JSON.stringify(result.activity)}`)
   }
   const metricKeys = ['peakDb', 'rmsDb', 'clippingCount', 'dcOffset', 'spectralCentroidHz', 'attackMs', 'stereoWidth']

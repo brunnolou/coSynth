@@ -1,172 +1,249 @@
 import type { SynthEngine } from '../audio/engine'
-import type { AudioMetricsComparison } from '../shared/audio-analysis'
+import type { HistoryServices, ReplayEntry, SoundEntrySummary } from '../history/types'
 import { agentActivityFor, type AgentActivitySnapshot } from '../webmcp/activity'
 import { el } from './common'
 import { ModalDialog } from './dialog'
+import { guideTarget } from './guide-target'
 
-const METRIC_LABELS: Record<keyof AudioMetricsComparison['details'], string> = {
-  peakDb: 'Peak',
-  rmsDb: 'RMS',
-  clippingCount: 'Clipping',
-  dcOffset: 'DC offset',
-  spectralCentroidHz: 'Centroid',
-  attackMs: 'Attack',
-  stereoWidth: 'Stereo width'
+function button(label: string): HTMLButtonElement {
+  const node = el('button', 'agent-btn', label)
+  node.type = 'button'
+  return node
 }
 
-function button(label: string, className = 'agent-btn'): HTMLButtonElement {
-  const result = el('button', className, label)
-  result.type = 'button'
-  return result
-}
+interface HistoryRow { root: HTMLElement; label: HTMLElement; meta: HTMLElement; direct: HTMLElement; details: HTMLElement; action: HTMLButtonElement; signature: string }
 
-function field(label: string, value: string): HTMLElement {
-  const row = el('div', 'agent-field')
-  row.append(el('span', 'agent-field-label', label), el('span', 'agent-field-value', value))
-  return row
-}
-
-function formatMetric(key: keyof AudioMetricsComparison['details'], value: number): string {
-  if (key === 'peakDb' || key === 'rmsDb') return `${value.toFixed(1)} dB`
-  if (key === 'attackMs') return `${value.toFixed(1)} ms`
-  if (key === 'spectralCentroidHz') return `${Math.round(value)} Hz`
-  if (key === 'clippingCount') return String(Math.round(value))
-  return value.toFixed(3)
-}
-
+/** One view for human and AI edits, with a separate list of replayable actions. */
 export class AgentActivityPanel {
-  readonly root: HTMLElement
-  private readonly store
+  readonly root = el('section', 'panel agent-activity-panel')
+  private readonly undo = button('Undo')
+  private readonly redo = button('Redo')
+  private readonly play = button('Play again')
   private readonly toolStatus = el('span', 'agent-tool-status', 'Checking agent tools…')
   private readonly lastAction = el('span', 'agent-last-action', 'No agent activity yet')
-  private readonly checkpointButton = button('Checkpoint')
-  private readonly detailsDialog = new ModalDialog('Agent Activity')
-  private readonly checkpointDialog = new ModalDialog('Iteration checkpoint')
+  private readonly error = el('span', 'history-error')
+  private readonly dialogError = el('span', 'history-error')
+  private readonly dialog = new ModalDialog('History', 'history')
+  private readonly soundTab = button('Sound history')
+  private readonly replayTab = button('Replays')
+  private readonly soundList = el('div', 'history-list')
+  private readonly alternatives = el('details', 'history-alternatives')
+  private readonly alternativeList = el('div', 'history-list')
+  private readonly replayList = el('div', 'history-list')
+  private readonly soundView = el('div', 'history-view')
+  private readonly replayView = el('div', 'history-view')
+  private readonly retention = el('p', 'history-retention')
+  private readonly soundRows = new Map<string, HistoryRow>()
+  private readonly replayRows = new Map<string, HistoryRow>()
+  private readonly disposeListeners: (() => void)[] = []
   private state: AgentActivitySnapshot
+  private pending = 0
+  private disposed = false
 
-  constructor(engine: SynthEngine) {
-    this.store = agentActivityFor(engine)
-    this.state = this.store.snapshot()
-    this.root = el('section', 'panel agent-activity-panel')
-    const title = el('span', 'panel-title', 'AGENT ACTIVITY')
-    const detailsButton = button('Details')
-    detailsButton.addEventListener('click', () => this.detailsDialog.open())
-    this.checkpointButton.addEventListener('click', () => this.checkpointDialog.open())
-
+  constructor(engine: SynthEngine, private readonly services: HistoryServices) {
+    const activity = agentActivityFor(engine)
+    this.state = activity.snapshot()
+    const open = button('History')
+    guideTarget(this.root, 'panel.agent', 'History and agent activity', 'panel')
+    for (const [node, id, label] of [
+      [this.undo, 'undo', 'Undo sound edit'], [this.redo, 'redo', 'Redo sound edit'],
+      [open, 'open', 'Open history'], [this.play, 'play', 'Replay or stop performance']
+    ] as const) guideTarget(node, `button.history.${id}`, label, 'button')
+    this.undo.title = 'Undo (⌘/Ctrl+Z)'
+    this.redo.title = 'Redo (⌘/Ctrl+Shift+Z)'
+    this.undo.addEventListener('click', () => this.navigate('undo'))
+    this.redo.addEventListener('click', () => this.navigate('redo'))
+    open.addEventListener('click', () => this.dialog.open())
+    this.play.addEventListener('click', () => {
+      if (services.performance.active) this.run(() => services.performance.stop())
+      else {
+        const id = services.replays.latestPerformanceId()
+        if (id) this.run(() => services.replays.replay(id))
+      }
+    })
     const summary = el('div', 'agent-activity-summary')
-    summary.append(title, this.toolStatus, this.lastAction)
+    summary.append(this.toolStatus, this.lastAction)
     const actions = el('div', 'agent-activity-actions')
-    actions.append(detailsButton, this.checkpointButton)
-    this.root.append(summary, actions, this.detailsDialog.root, this.checkpointDialog.root)
+    actions.append(this.undo, this.redo, open, this.play)
+    this.error.setAttribute('role', 'alert')
+    this.dialogError.setAttribute('role', 'alert')
+    this.root.append(actions, summary, this.error, this.dialog.root)
 
-    this.store.subscribe(state => {
-      this.state = state
-      this.render()
+    const tabs = el('div', 'history-tabs')
+    tabs.setAttribute('role', 'tablist')
+    tabs.setAttribute('aria-label', 'History views')
+    for (const [tab, id, view] of [[this.soundTab, 'sound', this.soundView], [this.replayTab, 'replays', this.replayView]] as const) {
+      tab.setAttribute('role', 'tab')
+      tab.id = `history-tab-${id}`
+      tab.setAttribute('aria-controls', `history-view-${id}`)
+      view.id = `history-view-${id}`
+      view.setAttribute('role', 'tabpanel')
+      view.setAttribute('aria-labelledby', tab.id)
+      tab.addEventListener('click', () => this.selectTab(id))
+      tab.addEventListener('keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+        event.preventDefault()
+        const next = event.key === 'Home' ? 'sound' : event.key === 'End' ? 'replays' : id === 'sound' ? 'replays' : 'sound'
+        this.selectTab(next)
+        ;(next === 'sound' ? this.soundTab : this.replayTab).focus()
+      })
+    }
+    tabs.append(this.soundTab, this.replayTab)
+    this.alternatives.append(el('summary', '', 'Earlier alternatives'), this.alternativeList)
+    this.soundView.append(this.soundList, this.alternatives)
+    this.replayView.append(el('p', 'agent-empty', 'Performances use the current sound. Walkthroughs reopen at step one.'), this.replayList)
+    this.dialog.body.append(tabs, this.soundView, this.replayView)
+    this.dialog.footer.append(this.dialogError, this.retention)
+    this.selectTab('sound')
+    this.disposeListeners.push(
+      activity.subscribe(state => { this.state = state; this.render() }),
+      services.history.subscribe(() => this.render()),
+      services.replays.subscribe(() => this.render()),
+      services.performance.subscribe(() => this.render())
+    )
+    this.render()
+  }
+
+  dispose(): void {
+    this.disposed = true
+    for (const unsubscribe of this.disposeListeners) unsubscribe()
+    this.dialog.close()
+  }
+
+  private selectTab(tab: 'sound' | 'replays'): void {
+    this.soundView.hidden = tab !== 'sound'
+    this.replayView.hidden = tab !== 'replays'
+    for (const [button, active] of [[this.soundTab, tab === 'sound'], [this.replayTab, tab === 'replays']] as const) {
+      button.setAttribute('aria-selected', String(active))
+      button.tabIndex = active ? 0 : -1
+    }
+  }
+
+  private navigate(action: 'undo' | 'redo' | 'restore', id?: string): void {
+    this.run(() => this.services.history.navigate(action, id))
+  }
+
+  private run(action: () => Promise<unknown>): void {
+    this.error.textContent = ''
+    this.dialogError.textContent = ''
+    // Do not lock Stop behind a playback promise that resolves only when audio ends.
+    this.pending++
+    this.render()
+    void Promise.resolve().then(action).catch(error => {
+      if (error instanceof Error && error.name === 'AbortError') return
+      if (!this.disposed) this.error.textContent = this.dialogError.textContent = error instanceof Error ? error.message : String(error)
+    }).finally(() => {
+      this.pending--
+      if (!this.disposed) this.render()
     })
   }
 
   private render(): void {
-    this.toolStatus.textContent = this.state.readyTools === 0
-      ? 'Agent tools unavailable'
-      : this.state.audioToolsLocked
-        ? `${this.state.readyTools} tools prontos · inicia áudio para desbloquear 2`
-        : `${this.state.readyTools} tools prontos`
-
-    const action = this.state.lastAction
-    this.lastAction.textContent = action
-      ? `${action.label} · ${action.summary}`
-      : 'No agent activity yet'
-    this.lastAction.dataset.status = action?.status ?? 'idle'
-
-    this.checkpointButton.disabled = !this.state.checkpointAvailable || this.state.performanceActive
-    this.checkpointButton.textContent = this.state.checkpointAvailable ? 'Checkpoint ready' : 'Checkpoint'
-    this.renderDetails()
-    this.renderCheckpoint()
+    if (this.disposed) return
+    const { history, replays, performance } = this.services
+    const view = history.snapshot()
+    const busy = view.navigating
+    this.undo.disabled = !view.canUndo || busy
+    this.redo.disabled = !view.canRedo || busy
+    this.play.textContent = performance.active ? 'Stop' : 'Play again'
+    this.play.disabled = !performance.active && (this.pending > 0 || !replays.latestPerformanceId() || busy)
+    this.toolStatus.textContent = this.state.readyTools === 0 ? 'Agent tools unavailable'
+      : `${this.state.readyTools} tools ready${this.state.audioToolsLocked ? ' · Start audio to unlock 2' : ''}`
+    this.lastAction.textContent = this.state.lastAction ? `${this.state.lastAction.label} · ${this.state.lastAction.summary}` : 'No agent activity yet'
+    this.lastAction.dataset.status = this.state.lastAction?.status ?? 'idle'
+    this.retention.textContent = `In memory only · Up to 120 entries per tab · Older assets: ${(view.retainedAssetBytes / 1048576).toFixed(1)} / 128 MiB · Reload clears history.`
+    const ids = new Set(view.entries.map(entry => entry.id))
+    for (const [id, row] of this.soundRows) if (!ids.has(id)) { row.root.remove(); this.soundRows.delete(id) }
+    for (const entry of view.entries) {
+      let row = this.soundRows.get(entry.id)
+      if (!row) {
+        row = this.createRow(() => this.navigate('restore', entry.id), 'Restore')
+        this.soundRows.set(entry.id, row)
+      }
+      this.updateSound(row, entry, busy)
+    }
+    this.placeRows(this.soundList, view.entries.filter(entry => entry.activePath).map(entry => this.soundRows.get(entry.id)!.root))
+    this.placeRows(this.alternativeList, view.entries.filter(entry => !entry.activePath).map(entry => this.soundRows.get(entry.id)!.root))
+    this.alternatives.hidden = !view.entries.some(entry => !entry.activePath)
+    const entries = replays.snapshot()
+    const replayIds = new Set(entries.map(entry => entry.id))
+    for (const [id, row] of this.replayRows) if (!replayIds.has(id)) { row.root.remove(); this.replayRows.delete(id) }
+    for (const entry of entries) {
+      let row = this.replayRows.get(entry.id)
+      if (!row) {
+        row = this.createRow(() => {
+          this.dialog.close()
+          this.run(() => this.services.replays.replay(entry.id))
+        }, entry.kind === 'guide' ? 'Open walkthrough' : 'Play again')
+        this.replayRows.set(entry.id, row)
+      }
+      this.updateReplay(row, entry, busy || performance.active)
+    }
+    this.placeRows(this.replayList, entries.map(entry => this.replayRows.get(entry.id)!.root))
+    this.replayList.dataset.empty = entries.length ? '' : 'No saved performances or walkthroughs yet.'
   }
 
-  private renderDetails(): void {
-    const body = this.detailsDialog.body
-    body.textContent = ''
-    body.appendChild(field('Tools', this.toolStatus.textContent ?? ''))
-
-    if (this.state.lastAction) {
-      body.append(
-        field('Last action', this.state.lastAction.label),
-        field('Result', this.state.lastAction.summary),
-        field('Status', this.state.lastAction.status),
-        field('Time', new Date(this.state.lastAction.timestamp).toLocaleTimeString())
-      )
-    } else {
-      body.appendChild(el('p', 'agent-empty', 'No WebMCP action has run yet.'))
-    }
-
-    const changedSection = el('section', 'agent-modal-section')
-    changedSection.appendChild(el('h3', 'agent-section-title', 'Changed parameters'))
-    const changed = el('div', 'agent-param-list')
-    if (this.state.changedParameters.length) {
-      for (const id of this.state.changedParameters) changed.appendChild(el('code', 'agent-param', id))
-    } else {
-      changed.appendChild(el('span', 'agent-empty', 'No parameter changes in this iteration.'))
-    }
-    changedSection.appendChild(changed)
-    body.appendChild(changedSection)
-
-    const comparisonSection = el('section', 'agent-modal-section')
-    comparisonSection.appendChild(el('h3', 'agent-section-title', 'Latest comparison'))
-    if (!this.state.comparison) {
-      comparisonSection.appendChild(el('p', 'agent-empty', 'No comparison result yet.'))
-    } else {
-      comparisonSection.appendChild(el('div', 'agent-similarity', `${Math.round(this.state.comparison.similarity * 100)}% similarity`))
-      const table = el('div', 'agent-metrics')
-      for (const key of Object.keys(METRIC_LABELS) as (keyof AudioMetricsComparison['details'])[]) {
-        const detail = this.state.comparison.details[key]
-        const row = el('div', 'agent-metric-row')
-        row.append(
-          el('span', 'agent-metric-name', METRIC_LABELS[key]),
-          el('span', 'agent-metric-value', formatMetric(key, detail.candidate)),
-          el('span', detail.delta > 0 ? 'agent-delta positive' : detail.delta < 0 ? 'agent-delta negative' : 'agent-delta', `${detail.delta > 0 ? '+' : ''}${formatMetric(key, detail.delta)}`)
-        )
-        table.appendChild(row)
-      }
-      comparisonSection.appendChild(table)
-    }
-    body.appendChild(comparisonSection)
-
-    const footer = this.detailsDialog.footer
-    footer.textContent = ''
-    const close = button('Close', 'agent-btn primary')
-    close.addEventListener('click', () => this.detailsDialog.close())
-    footer.appendChild(close)
+  private createRow(onClick: () => void, actionLabel: string): HistoryRow {
+    const root = el('article', 'history-row')
+    const label = el('strong', 'history-row-label')
+    const meta = el('span', 'history-row-meta')
+    const direct = el('div', 'history-row-changes')
+    const details = el('details', 'history-row-details')
+    details.append(el('summary', '', 'Details'), el('div', 'history-change-list'))
+    const action = button(actionLabel)
+    action.addEventListener('click', onClick)
+    const head = el('div', 'history-row-head')
+    const text = el('div', 'history-row-text')
+    text.append(label, meta)
+    head.append(text, action)
+    root.append(head, direct, details)
+    return { root, label, meta, direct, details, action, signature: '' }
   }
 
-  private renderCheckpoint(): void {
-    const body = this.checkpointDialog.body
-    body.textContent = ''
-    if (this.state.checkpointAvailable) {
-      body.appendChild(el('p', '', 'Soundgineer saved the state from before this agent iteration. Rejecting restores parameters, modulation routes, LFO shapes, and FX order.'))
-      if (this.state.changedParameters.length) {
-        const changed = el('div', 'agent-param-list')
-        for (const id of this.state.changedParameters) changed.appendChild(el('code', 'agent-param', id))
-        body.appendChild(changed)
+  private updateSound(row: HistoryRow, entry: SoundEntrySummary, busy: boolean): void {
+    row.label.textContent = `${entry.current ? 'Current · ' : ''}${entry.label}`
+    row.root.classList.toggle('current', entry.current)
+    row.root.dataset.historyId = entry.id
+    row.meta.textContent = `${entry.origin === 'ai' ? 'AI' : entry.origin === 'initial' ? 'Starting sound' : 'Human'} · ${new Date(entry.timestamp).toLocaleTimeString()}`
+    row.action.disabled = entry.current || busy
+    const grouped = entry.changed.length > 2
+    row.direct.hidden = !entry.changed.length || grouped
+    row.details.hidden = !grouped && !entry.comparison
+    const signature = JSON.stringify([entry.changed, entry.changeDetails, entry.comparison])
+    if (signature === row.signature) return
+    row.signature = signature
+    const change = (id: string) => entry.changeDetails?.find(detail => detail.id === id)
+    const changeNodes = entry.changed.map(id => {
+      const detail = change(id)
+      return detail ? el('span', 'history-change', `${id}: ${detail.before} → ${detail.after}`) : el('code', 'agent-param', id)
+    })
+    row.direct.replaceChildren(...(grouped ? [] : changeNodes))
+    const content = row.details.lastElementChild!
+    content.replaceChildren(...(grouped ? changeNodes : []))
+    if (entry.comparison) {
+      content.append(el('p', '', `${Math.round(entry.comparison.similarity * 100)}% similarity`))
+      for (const [metric, value] of Object.entries(entry.comparison.details)) {
+        content.append(el('div', 'history-comparison', `${metric}: ${value.candidate.toFixed(2)} (${value.delta >= 0 ? '+' : ''}${value.delta.toFixed(2)})`))
       }
-      if (this.state.performanceActive) body.appendChild(el('p', 'agent-warning', 'Wait for playback or rendering to finish before choosing.'))
-    } else {
-      body.appendChild(el('p', 'agent-empty', 'No agent iteration is waiting for review.'))
     }
+  }
 
-    const footer = this.checkpointDialog.footer
-    footer.textContent = ''
-    const keep = button('Keep changes')
-    const reject = button('Reject iteration', 'agent-btn danger')
-    keep.disabled = !this.state.checkpointAvailable || this.state.performanceActive
-    reject.disabled = !this.state.checkpointAvailable || this.state.performanceActive
-    keep.addEventListener('click', () => {
-      if (this.store.acceptCheckpoint()) this.checkpointDialog.close()
+  private updateReplay(row: HistoryRow, entry: ReplayEntry, busy: boolean): void {
+    row.label.textContent = entry.label
+    row.root.dataset.replayId = entry.id
+    row.meta.textContent = `${entry.kind === 'guide' ? 'Walkthrough' : 'Performance'} · ${entry.status} · ${new Date(entry.timestamp).toLocaleTimeString()}`
+    row.action.disabled = busy
+    const signature = JSON.stringify([entry.notes?.length, entry.steps?.length, entry.duration])
+    if (signature !== row.signature) {
+      row.signature = signature
+      row.details.lastElementChild!.textContent = entry.kind === 'guide' ? `${entry.steps?.length ?? 0} steps` : `${entry.notes?.length ?? 0} notes${entry.duration === undefined ? '' : ` · ${entry.duration.toFixed(2)} seconds`}`
+    }
+  }
+
+  /** Keep existing nodes in place unless the actual order changed, preserving focus/details. */
+  private placeRows(parent: HTMLElement, rows: HTMLElement[]): void {
+    rows.forEach((row, index) => {
+      if (parent.children[index] !== row) parent.insertBefore(row, parent.children[index] ?? null)
     })
-    reject.addEventListener('click', () => {
-      if (this.store.restoreCheckpoint()) this.checkpointDialog.close()
-    })
-    footer.append(keep, reject)
   }
 }
-

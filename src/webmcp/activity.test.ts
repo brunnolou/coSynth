@@ -32,35 +32,25 @@ describe('AgentActivityStore', () => {
     expect(listener).toHaveBeenCalled()
   })
 
-  it('restores the checkpoint captured before an agent mutation', () => {
+  it('reports only the latest mutation instead of retaining a disposable checkpoint', () => {
     const { engine, store } = setup()
-    store.ensureCheckpoint()
     const id = store.startAction('update_parameters')
     store.finishAction(id, 'update_parameters', {}, { applied: [{ id: 'osc1.level' }] })
-
-    expect(store.snapshot().checkpointAvailable).toBe(true)
-    expect(store.restoreCheckpoint()).toBe(true)
-    expect(engine.loadPreset).toHaveBeenCalledWith(expect.objectContaining({ name: 'Agent checkpoint' }))
-    expect(store.snapshot()).toMatchObject({
-      checkpointAvailable: false,
-      changedParameters: [],
-      lastAction: { label: 'Restored previous state' }
-    })
+    const second = store.startAction('update_parameters')
+    store.finishAction(second, 'update_parameters', {}, { applied: [{ id: 'osc2.level' }] })
+    expect(store.snapshot().changedParameters).toEqual(['osc2.level'])
+    expect(engine.toPreset).not.toHaveBeenCalled()
+    expect(engine.loadPreset).not.toHaveBeenCalled()
   })
 
-  it('does not restore or accept while a performance is active', () => {
-    const { engine, store } = setup()
-    store.ensureCheckpoint()
+  it('tracks concurrent performance completion without losing the active operation', () => {
+    const { store } = setup()
     const id = store.startAction('render_audio')
     const rejectedConcurrent = store.startAction('play_notes')
     store.failAction(rejectedConcurrent, 'play_notes', new Error('A WebMCP performance is already in progress'))
-    expect(store.restoreCheckpoint()).toBe(false)
-    expect(store.acceptCheckpoint()).toBe(false)
-    expect(engine.loadPreset).not.toHaveBeenCalled()
-
+    expect(store.snapshot().performanceActive).toBe(true)
     store.finishAction(id, 'render_audio', {}, { duration: 1.25 })
-    expect(store.acceptCheckpoint()).toBe(true)
-    expect(store.snapshot()).toMatchObject({ checkpointAvailable: false, lastAction: { label: 'Kept agent changes' } })
+    expect(store.snapshot().performanceActive).toBe(false)
   })
 
   it('keeps the latest comparison for review', () => {
