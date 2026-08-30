@@ -5,12 +5,23 @@ import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
 import { Knob } from './knob'
 
-export function paramSelect(engine: SynthEngine, id: string): HTMLSelectElement {
+export interface ParamSelectOptions {
+  separatorBefore?: string
+  onSelect?: (choice: string, index: number) => boolean | void
+}
+
+export function paramSelect(engine: SynthEngine, id: string, options: ParamSelectOptions = {}): HTMLSelectElement {
   const index = paramIndex(id)
   const def = PARAMS[index]
   const choices = def.choices ?? []
   const sel = el('select', 'param-select') as HTMLSelectElement
   choices.forEach((c, i) => {
+    if (c === options.separatorBefore) {
+      const separator = el('option', undefined, '──────────') as HTMLOptionElement
+      separator.disabled = true
+      separator.value = ''
+      sel.appendChild(separator)
+    }
     const o = el('option', undefined, c) as HTMLOptionElement
     o.value = String(i)
     sel.appendChild(o)
@@ -20,7 +31,12 @@ export function paramSelect(engine: SynthEngine, id: string): HTMLSelectElement 
   }
   sync()
   sel.addEventListener('change', () => {
-    engine.setParam(index, valueToNorm(def, Number(sel.value)))
+    const selected = Number(sel.value)
+    if (options.onSelect?.(choices[selected], selected) === false) {
+      sync()
+      return
+    }
+    engine.setParam(index, valueToNorm(def, selected))
   })
   engine.onParam(index, sync)
   return sel

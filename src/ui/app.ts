@@ -70,9 +70,6 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     const head = el('div', 'panel-head')
     head.appendChild(paramToggle(engine, `osc${o}.enabled`, '●'))
     head.appendChild(el('span', 'panel-title', `OSC ${o}`))
-    head.appendChild(paramSelect(engine, `osc${o}.wavetable`))
-    const importBtn = el('button', 'hdr-btn', 'WAV')
-    importBtn.title = 'Import single-cycle or Serum-format wavetable WAV'
     const file = el('input') as HTMLInputElement
     file.type = 'file'
     file.accept = '.wav'
@@ -82,10 +79,18 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
       if (f) engine.importWavetableFile(o - 1, f).catch(err => alert(`Import failed: ${err}`))
       file.value = ''
     })
-    importBtn.addEventListener('click', () => file.click())
+    const wavetableSelect = paramSelect(engine, `osc${o}.wavetable`, {
+      separatorBefore: 'Custom',
+      onSelect: choice => {
+        if (choice !== 'Custom') return
+        file.click()
+        return false
+      }
+    })
+    wavetableSelect.title = 'Choose a wavetable. Custom imports a single-cycle or Serum-format WAV.'
     const wavePreview = new OscWavePreview(engine, o - 1)
     oscWavePreviews.push(wavePreview)
-    head.append(importBtn, file, wavePreview.root)
+    head.append(wavetableSelect, file, wavePreview.root)
     panel.appendChild(head)
     const oscKnobs = knobRow(engine, [
       `osc${o}.morph`, `osc${o}.level`, `osc${o}.pan`, `osc${o}.transpose`, `osc${o}.fine`, `osc${o}.sync`,
