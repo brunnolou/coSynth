@@ -74,6 +74,24 @@ header {
   font-size: 11px;
   white-space: nowrap;
 }
+.hdr-midi {
+  appearance: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+}
+.hdr-midi:disabled { cursor: default; }
+.hdr-midi.is-error {
+  color: #ff6f7b;
+  cursor: pointer;
+}
+.hdr-midi.is-error:hover {
+  color: #ff9aa3;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .hdr-stats {
   display: flex;
   flex-direction: column;
@@ -261,6 +279,11 @@ main {
   justify-content: flex-end;
   align-items: center;
   gap: 6px;
+}
+.midi-recommendation {
+  margin-bottom: 0;
+  color: var(--text);
+  font-weight: 600;
 }
 .agent-field {
   display: grid;

@@ -6,9 +6,22 @@ import type { SynthEngine } from '../audio/engine'
 
 const MACRO_CCS = [20, 21, 22, 23]
 
-export async function initMidi(engine: SynthEngine, onStatus: (text: string) => void): Promise<void> {
+export type MidiStatus = {
+  state: 'ready' | 'no-inputs' | 'unavailable' | 'blocked' | 'error'
+  text: string
+}
+
+export function isMidiPermissionBlocked(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const candidate = error as { name?: unknown; message?: unknown }
+  const name = typeof candidate.name === 'string' ? candidate.name : ''
+  const message = typeof candidate.message === 'string' ? candidate.message : ''
+  return name === 'NotAllowedError' || name === 'SecurityError' || /permission|denied|not allowed/i.test(message)
+}
+
+export async function initMidi(engine: SynthEngine, onStatus: (status: MidiStatus) => void): Promise<void> {
   if (!('requestMIDIAccess' in navigator)) {
-    onStatus('MIDI: unavailable')
+    onStatus({ state: 'unavailable', text: 'MIDI: unavailable' })
     return
   }
   try {
@@ -19,12 +32,16 @@ export async function initMidi(engine: SynthEngine, onStatus: (text: string) => 
         count++
         input.onmidimessage = e => handle(engine, e.data as Uint8Array)
       })
-      onStatus(count > 0 ? `MIDI: ${count} input${count > 1 ? 's' : ''}` : 'MIDI: no inputs')
+      onStatus(count > 0
+        ? { state: 'ready', text: `MIDI: ${count} input${count > 1 ? 's' : ''}` }
+        : { state: 'no-inputs', text: 'MIDI: no inputs' })
     }
     attach()
     access.onstatechange = attach
-  } catch {
-    onStatus('MIDI: denied')
+  } catch (error) {
+    onStatus(isMidiPermissionBlocked(error)
+      ? { state: 'blocked', text: 'MIDI: blocked' }
+      : { state: 'error', text: 'MIDI: error' })
   }
 }
 

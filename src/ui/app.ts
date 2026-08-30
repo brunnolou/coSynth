@@ -17,6 +17,7 @@ import { PresetBrowser } from './presets'
 import { initMidi } from './midi'
 import { FilterResponseView } from './filter-response'
 import { OscWavePreview } from './osc-wave-preview'
+import { ModalDialog } from './dialog'
 
 export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   engine.primeTables()
@@ -29,7 +30,20 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   hdrRight.appendChild(new Knob(engine, paramIndex('master.volume'), 40).root)
   hdrRight.appendChild(new Knob(engine, paramIndex('master.bpm'), 40).root)
   const voiceLabel = el('span', 'hdr-stat hdr-voices', 'voices 0')
-  const midiLabel = el('span', 'hdr-stat', 'MIDI: …')
+  const midiLabel = el('button', 'hdr-stat hdr-midi', 'MIDI: …')
+  midiLabel.type = 'button'
+  midiLabel.disabled = true
+  const midiDialog = new ModalDialog('MIDI unavailable in ChatGPT')
+  midiDialog.body.append(
+    el('p', '', "OpenAI MIDI support isn't working in the ChatGPT browser."),
+    el('p', '', "Hardware permission can't be granted here, even after enabling browser flags, as of August 2026."),
+    el('p', 'midi-recommendation', 'Open Soundgineer in Chrome or another browser to test MIDI hardware.')
+  )
+  const midiDialogClose = el('button', 'agent-btn primary', 'Close')
+  midiDialogClose.type = 'button'
+  midiDialogClose.addEventListener('click', () => midiDialog.close())
+  midiDialog.footer.appendChild(midiDialogClose)
+  midiLabel.addEventListener('click', () => midiDialog.open())
   const hdrStats = el('div', 'hdr-stats')
   hdrStats.append(voiceLabel, midiLabel)
   const meter = el('div', 'meter')
@@ -264,10 +278,14 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
   main.append(oscCol, centerCol, sideCol)
   const agentActivity = new AgentActivityPanel(engine)
   const keyboard = new Keyboard(engine)
-  container.append(header, main, agentActivity.root, performancePanel, keyboard.root)
+  container.append(header, main, agentActivity.root, performancePanel, keyboard.root, midiDialog.root)
 
-  initMidi(engine, text => {
-    midiLabel.textContent = text
+  initMidi(engine, status => {
+    midiLabel.textContent = status.text
+    const blocked = status.state === 'blocked'
+    midiLabel.disabled = !blocked
+    midiLabel.classList.toggle('is-error', blocked)
+    midiLabel.title = blocked ? 'Why MIDI hardware is blocked' : ''
   })
 
   // ------------------------------------------------------------ animation loop
