@@ -8,6 +8,7 @@ import { PARAMS, formatValue, defaultNorm } from '../shared/params'
 import { MOD_SOURCES } from '../shared/messages'
 import type { SynthEngine } from '../audio/engine'
 import { el, sourceColor, clamp01, showPopup, closePopup } from './common'
+import { guideTarget } from './guide-target'
 
 const knobRegistry = new Map<HTMLElement, Knob>()
 const MOD_CANVAS_PADDING = 12
@@ -33,6 +34,7 @@ export class Knob {
   ) {
     const def = PARAMS[paramIndex]
     this.root = el('div', 'knob')
+    guideTarget(this.root, `param.${def.id}`, `${def.group} ${def.name}`, 'knob')
     const canvasStack = el('div', 'knob-canvases')
     canvasStack.style.width = `${size}px`
     canvasStack.style.height = `${size}px`
@@ -207,8 +209,10 @@ export class Knob {
         slider.min = '-100'
         slider.max = '100'
         slider.value = String(Math.round(state.depth * 100))
+        guideTarget(slider, `mod-menu.slot${slot}.depth`, `${MOD_SOURCES[state.source].name} modulation depth`, 'slider')
         slider.addEventListener('input', () => {
-          this.engine.setModSlot(slot, { ...state, depth: Number(slider.value) / 100 })
+          const current = this.engine.modSlots[slot]
+          if (current) this.engine.setModSlot(slot, { ...current, depth: Number(slider.value) / 100 })
         })
         const del = el('button', 'mod-del', '✕')
         del.addEventListener('click', () => {
@@ -254,13 +258,25 @@ class ModDragController {
     document.body.classList.add('mod-dragging')
     this.move(e)
     const onMove = (ev: PointerEvent) => this.move(ev)
-    const onUp = (ev: PointerEvent) => {
+    const cleanup = () => {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onCancel)
+    }
+    const onUp = (ev: PointerEvent) => {
+      cleanup()
       this.drop(ev)
+    }
+    const onCancel = () => {
+      cleanup()
+      document.body.classList.remove('mod-dragging')
+      this.ghost?.remove()
+      this.ghost = null
+      this.engine = null
     }
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onCancel)
   }
 
   private move(e: PointerEvent): void {
@@ -292,6 +308,7 @@ export const modDrag = new ModDragController()
 export function sourceBadge(engine: SynthEngine, sourceId: string): HTMLElement {
   const i = MOD_SOURCES.findIndex(s => s.id === sourceId)
   const badge = el('div', 'source-badge', MOD_SOURCES[i].name)
+  guideTarget(badge, `source.${sourceId}`, `${MOD_SOURCES[i].name} modulation source`, 'source')
   badge.style.borderColor = sourceColor(i)
   badge.title = 'Drag onto a knob to assign modulation'
   badge.addEventListener('pointerdown', e => {

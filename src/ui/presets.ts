@@ -5,6 +5,7 @@ import { paramDef, valueToNorm } from '../shared/params'
 import { listPresets, savePreset, validatePresetData } from '../shared/preset-store'
 import type { SynthEngine, PresetData } from '../audio/engine'
 import { el } from './common'
+import { guideTarget } from './guide-target'
 import { ChevronLeft, ChevronRight, Cog, createElement } from 'lucide'
 import './presets.css'
 
@@ -578,6 +579,7 @@ export class PresetBrowser {
     this.root = el('div', 'presets')
     this.select = el('select', 'param-select preset-select') as HTMLSelectElement
     this.select.setAttribute('aria-label', 'Preset')
+    guideTarget(this.select, 'select.preset', 'Preset browser', 'select')
     this.select.addEventListener('change', () => this.load(this.select.value))
 
     const iconButton = (label: string, icon: typeof Cog) => {
@@ -634,6 +636,7 @@ export class PresetBrowser {
     })
 
     const save = el('button', 'hdr-btn', 'Save')
+    guideTarget(save, 'button.preset.save', 'Save preset', 'button')
     save.title = 'Save current patch to the browser'
     save.addEventListener('click', () => {
       closeActions(true)
@@ -643,6 +646,7 @@ export class PresetBrowser {
     })
 
     const exportBtn = el('button', 'hdr-btn', 'Export')
+    guideTarget(exportBtn, 'button.preset.export', 'Export preset', 'button')
     exportBtn.title = 'Download patch as JSON'
     exportBtn.addEventListener('click', () => {
       closeActions(true)
@@ -656,6 +660,7 @@ export class PresetBrowser {
     })
 
     const importBtn = el('button', 'hdr-btn', 'Import')
+    guideTarget(importBtn, 'button.preset.import', 'Import preset', 'button')
     const file = el('input') as HTMLInputElement
     file.type = 'file'
     file.accept = '.json'

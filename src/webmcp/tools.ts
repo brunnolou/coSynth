@@ -4,11 +4,12 @@ import {
   type ParamDef
 } from '../shared/params'
 import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type ModSlotState } from '../shared/messages'
-import { analyzeAudio, compareAudioMetrics, type AudioMetrics } from '../shared/audio-analysis'
+import { analyzeAudio, compareAudioMetrics, type AudioMetrics, type AudioMetricsComparison } from '../shared/audio-analysis'
 import { loadPreset, savePreset, validatePresetData, validatePresetName } from '../shared/preset-store'
 import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
 import { analyzeAudioAbortably } from './audio-analysis-task'
-import { agentActivityFor } from './activity'
+import { PerformanceManager, performNotes, assertNotesAvailable, validatePerformanceNotes } from '../history/performance'
+import type { ReplayStore } from '../history/replays'
 
 export const WEBMCP_TOOL_NAMES = [
   'get_synth_state',
@@ -33,12 +34,15 @@ const MAX_MIME_TYPE_LENGTH = 127
 const MAX_PAGE_SIZE = 5
 
 type Input = Record<string, unknown>
-interface ValidNote { midi: number; velocity: number; start: number; duration: number }
 type DecodeAudio = typeof decodeBase64Audio
 
 export interface WebMcpToolDependencies {
   decodeAudio?: DecodeAudio
   analyzeAudioAsync?: typeof analyzeAudioAbortably
+  performance?: PerformanceManager
+  replays?: ReplayStore
+  currentSoundEntryId?: () => string
+  onComparison?: (comparison: AudioMetricsComparison, soundEntryId?: string) => void
 }
 
 interface ReferenceAnalysis {
@@ -53,11 +57,11 @@ interface ReferenceAnalysis {
 }
 
 interface WebMcpSessionState {
-  lastRender: { metrics: AudioMetrics; sampleRate: number; channels: number; url: string } | null
+  lastRender: { metrics: AudioMetrics; sampleRate: number; channels: number; url: string; soundEntryId?: string } | null
   lastReference: ReferenceAnalysis | null
   referenceGeneration: number
   activeReferenceController: AbortController | null
-  performanceInProgress: boolean
+  performance: PerformanceManager
 }
 
 const sessions = new WeakMap<SynthEngine, WebMcpSessionState>()
@@ -70,7 +74,7 @@ function sessionFor(engine: SynthEngine): WebMcpSessionState {
       lastReference: null,
       referenceGeneration: 0,
       activeReferenceController: null,
-      performanceInProgress: false
+      performance: new PerformanceManager()
     }
     sessions.set(engine, session)
   }
@@ -145,34 +149,6 @@ function filteredParameters(group?: string, search?: string): ParamDef[] {
   )
 }
 
-function validateNotes(value: unknown, maxSeconds: number): { notes: ValidNote[]; duration: number } {
-  if (!Array.isArray(value) || value.length === 0) throw new Error('notes must be a non-empty array')
-  if (value.length > MAX_NOTES) throw new Error(`notes is limited to ${MAX_NOTES} entries`)
-  const notes = value.map((item, index) => {
-    const note = assertObject(item, `notes[${index}]`, ['midi', 'velocity', 'start', 'duration'], ['midi', 'velocity', 'start', 'duration'])
-    const midi = finite(note.midi, `notes[${index}].midi`)
-    if (!Number.isInteger(midi) || midi < 0 || midi > 127) throw new Error(`notes[${index}].midi must be an integer in range 0..127`)
-    const velocity = finite(note.velocity, `notes[${index}].velocity`)
-    if (velocity < 0 || velocity > 1) throw new Error(`notes[${index}].velocity must be in range 0..1`)
-    const start = finite(note.start, `notes[${index}].start`)
-    if (start < 0) throw new Error(`notes[${index}].start must be >= 0`)
-    const duration = finite(note.duration, `notes[${index}].duration`)
-    if (duration <= 0) throw new Error(`notes[${index}].duration must be > 0`)
-    return { midi, velocity, start, duration }
-  })
-  const duration = clean(Math.max(...notes.map(note => note.start + note.duration)))
-  if (duration > maxSeconds) throw new Error(`Note sequence is limited to ${maxSeconds} seconds`)
-  const lastEndByMidi = new Map<number, number>()
-  for (const note of [...notes].sort((a, b) => a.start - b.start)) {
-    const previousEnd = lastEndByMidi.get(note.midi)
-    if (previousEnd !== undefined && note.start < previousEnd) {
-      throw new Error(`Note intervals overlap for MIDI ${note.midi}`)
-    }
-    lastEndByMidi.set(note.midi, note.start + note.duration)
-  }
-  return { notes, duration }
-}
-
 function abortError(): Error {
   const error = new Error('Execution aborted')
   error.name = 'AbortError'
@@ -204,51 +180,6 @@ function validateReferenceName(value: unknown): string | undefined {
 function validateAudioMimeType(value: unknown): string | undefined {
   if (value === undefined) return undefined
   return normalizeAudioMimeType(value)
-}
-
-function wait(seconds: number, signal: AbortSignal): Promise<void> {
-  throwIfAborted(signal)
-  if (seconds <= 0) return Promise.resolve()
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(done, seconds * 1000)
-    signal.addEventListener('abort', aborted, { once: true })
-    function cleanup() {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', aborted)
-    }
-    function done() { cleanup(); resolve() }
-    function aborted() { cleanup(); reject(abortError()) }
-  })
-}
-
-async function performNotes(engine: SynthEngine, notes: ValidNote[], signal: AbortSignal): Promise<void> {
-  const owner = Symbol('webmcp-performance')
-  const events = notes.flatMap(note => [
-    { time: note.start, on: true, note },
-    { time: note.start + note.duration, on: false, note }
-  ]).sort((a, b) => a.time - b.time || Number(a.on) - Number(b.on))
-  const started = new Set<number>()
-  let elapsed = 0
-  try {
-    for (const event of events) {
-      await wait(event.time - elapsed, signal)
-      throwIfAborted(signal)
-      if (event.on) {
-        engine.noteOn(event.note.midi, event.note.velocity, owner)
-        started.add(event.note.midi)
-      } else if (started.delete(event.note.midi)) {
-        engine.noteOff(event.note.midi, owner)
-      }
-      elapsed = event.time
-    }
-  } finally {
-    for (const midi of started) engine.noteOff(midi, owner)
-  }
-}
-
-function assertNotesAvailable(engine: SynthEngine, notes: readonly ValidNote[]): void {
-  const held = notes.find(note => engine.heldNotes.has(note.midi))
-  if (held) throw new Error(`MIDI note ${held.midi} is already held by another input`)
 }
 
 function canonicalRaw(def: ParamDef, value: unknown): number {
@@ -289,7 +220,7 @@ export function createWebMcpTools(
   dependencies: WebMcpToolDependencies = {}
 ): WebMCP.ModelContextTool[] {
   const session = sessionFor(engine)
-  const activity = agentActivityFor(engine)
+  const performance = dependencies.performance ?? session.performance
   const decodeAudio = dependencies.decodeAudio ?? decodeBase64Audio
   const analyzeAudioAsync = dependencies.analyzeAudioAsync ?? analyzeAudioAbortably
 
@@ -355,17 +286,11 @@ export function createWebMcpTools(
   }
 
   async function runPerformance<T>(signal: AbortSignal, task: (signal: AbortSignal) => Promise<T>): Promise<T> {
-    if (session.performanceInProgress) throw new Error('A WebMCP performance is already in progress')
-    session.performanceInProgress = true
-    try {
-      return await runAbortable(signal, task)
-    } finally {
-      session.performanceInProgress = false
-    }
+    return performance.run(operationSignal => runAbortable(operationSignal, task), signal)
   }
 
   function assertPerformanceIdle(action: string): void {
-    if (session.performanceInProgress) throw new Error(`${action} is unavailable while a WebMCP performance is in progress`)
+    if (performance.active) throw new Error(`${action} is unavailable while a performance is in progress`)
   }
 
   function currentCandidate() {
@@ -553,7 +478,6 @@ export function createWebMcpTools(
           const raw = canonicalRaw(def, update.value)
           return { id, index: paramIndex(id), def, raw, normalized: valueToNorm(def, raw) }
         })
-        activity.ensureCheckpoint()
         for (const update of validated) engine.setParam(update.index, update.normalized)
         return {
           applied: validated.map(update => ({
@@ -587,7 +511,6 @@ export function createWebMcpTools(
         const count = () => engine.modSlots.filter(Boolean).length
         if (action === 'clear') {
           assertObject(input, 'input', ['action'], ['action'])
-          activity.ensureCheckpoint()
           engine.modSlots.forEach((route, slot) => { if (route) engine.setModSlot(slot, null) })
           return { cleared: true, count: count() }
         }
@@ -596,7 +519,6 @@ export function createWebMcpTools(
           const slot = finite(value.slot, 'slot')
           if (!Number.isInteger(slot) || slot < 0 || slot >= MAX_MOD_SLOTS) throw new Error('slot must be an integer in range 0..31')
           if (!engine.modSlots[slot]) throw new Error(`Modulation slot ${slot} is empty`)
-          activity.ensureCheckpoint()
           engine.setModSlot(slot, null)
           return { removed: slot, count: count() }
         }
@@ -611,7 +533,6 @@ export function createWebMcpTools(
           if (depth < -1 || depth > 1) throw new Error('depth must be in range -1..1')
           if (value.enabled !== undefined && typeof value.enabled !== 'boolean') throw new Error('enabled must be boolean')
           const route = { ...current, depth, enabled: value.enabled === undefined ? current.enabled : value.enabled }
-          activity.ensureCheckpoint()
           engine.setModSlot(slot, route)
           return { route: routeValue(slot, route), count: count() }
         }
@@ -638,7 +559,6 @@ export function createWebMcpTools(
           depth,
           enabled: value.enabled === undefined ? (existing?.enabled ?? true) : value.enabled
         }
-        activity.ensureCheckpoint()
         engine.setModSlot(slot, route)
         return { route: routeValue(slot, route), count: count() }
       }
@@ -654,12 +574,19 @@ export function createWebMcpTools(
       async execute(input, options) {
         return runPerformance(invocationSignal(options), async operationSignal => {
           const value = assertObject(input, 'input', ['notes'], ['notes'])
-          const sequence = validateNotes(value.notes, MAX_PLAY_SECONDS)
+          const sequence = validatePerformanceNotes(value.notes, MAX_PLAY_SECONDS)
           if (!engine.running) throw new Error('Start audio with a user gesture before playing notes')
           assertNotesAvailable(engine, sequence.notes)
           throwIfAborted(operationSignal)
-          await performNotes(engine, sequence.notes, operationSignal)
-          return { noteCount: sequence.notes.length, duration: sequence.duration, completed: true }
+          const replayId = dependencies.replays?.startPerformance(sequence.notes, sequence.duration, 'AI note sequence', dependencies.currentSoundEntryId?.())
+          try {
+            await performNotes(engine, sequence.notes, operationSignal)
+            if (replayId) dependencies.replays!.finishPerformance(replayId, 'completed')
+            return { noteCount: sequence.notes.length, duration: sequence.duration, completed: true }
+          } catch (error) {
+            if (replayId) dependencies.replays!.finishPerformance(replayId, operationSignal.aborted ? 'cancelled' : 'failed')
+            throw error
+          }
         })
       }
     },
@@ -678,7 +605,7 @@ export function createWebMcpTools(
       async execute(input, options) {
         return runPerformance(invocationSignal(options), async operationSignal => {
           const value = assertObject(input, 'input', ['notes', 'duration'], ['notes'])
-          const sequence = validateNotes(value.notes, MAX_RENDER_SECONDS)
+          const sequence = validatePerformanceNotes(value.notes, MAX_RENDER_SECONDS)
           if (!engine.running) throw new Error('Start audio with a user gesture before rendering audio')
           const duration = value.duration === undefined
             ? Math.min(MAX_RENDER_SECONDS, clean(sequence.duration + 0.25))
@@ -687,18 +614,23 @@ export function createWebMcpTools(
           if (duration < sequence.duration) throw new Error('Render duration must cover the complete note sequence')
           assertNotesAvailable(engine, sequence.notes)
           throwIfAborted(operationSignal)
+          const soundEntryId = dependencies.currentSoundEntryId?.()
+          const replayId = dependencies.replays?.startPerformance(sequence.notes, duration, 'AI rendered sequence', soundEntryId)
           const controller = new AbortController()
           const forwardAbort = () => controller.abort()
           operationSignal.addEventListener('abort', forwardAbort, { once: true })
-          const recordingTask = engine.recordOutput(duration, controller.signal)
-          const notesTask = performNotes(engine, sequence.notes, controller.signal)
+          let recordingTask: ReturnType<SynthEngine['recordOutput']> | undefined
+          let notesTask: Promise<void> | undefined
           try {
+            recordingTask = engine.recordOutput(duration, controller.signal)
+            notesTask = performNotes(engine, sequence.notes, controller.signal)
             const [recording] = await Promise.all([recordingTask, notesTask])
             throwIfAborted(operationSignal)
             const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal)
             if (session.lastRender) URL.revokeObjectURL(session.lastRender.url)
             const url = URL.createObjectURL(recording.blob)
-            session.lastRender = { metrics, sampleRate: recording.sampleRate, channels: recording.channelData.length, url }
+            session.lastRender = { metrics, sampleRate: recording.sampleRate, channels: recording.channelData.length, url, soundEntryId }
+            if (replayId) dependencies.replays!.finishPerformance(replayId, 'completed')
             return {
               renderMode: 'realtime',
               mimeType: recording.mimeType,
@@ -711,6 +643,7 @@ export function createWebMcpTools(
           } catch (error) {
             controller.abort()
             await Promise.allSettled([recordingTask, notesTask])
+            if (replayId) dependencies.replays!.finishPerformance(replayId, operationSignal.aborted ? 'cancelled' : 'failed')
             throw error
           } finally {
             controller.abort()
@@ -795,10 +728,12 @@ export function createWebMcpTools(
         if (!session.lastReference) throw new Error('Call analyze_reference_audio first before compare_audio')
         const candidate = currentCandidate()
         if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
+        const comparison = compareAudioMetrics(session.lastReference.metrics, candidate.metrics)
+        dependencies.onComparison?.(comparison, candidate.source === 'last-render' ? session.lastRender?.soundEntryId : dependencies.currentSoundEntryId?.())
         return {
           reference: session.lastReference,
           candidate,
-          comparison: compareAudioMetrics(session.lastReference.metrics, candidate.metrics)
+          comparison
         }
       }
     },
@@ -832,10 +767,7 @@ export function createWebMcpTools(
         const preset = loadPreset(name)
         if (!preset) throw new Error(`Preset not found: ${name}`)
         const validated = validatePresetData(preset)
-        activity.ensureCheckpoint()
-        const before = engine.values.slice()
         engine.loadPreset(validated)
-        activity.recordChangedParameters(PARAMS.flatMap((def, index) => before[index] === engine.values[index] ? [] : [def.id]))
         return { name, loaded: true }
       }
     }

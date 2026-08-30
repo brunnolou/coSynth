@@ -5,6 +5,7 @@
 import { paramIndex } from '../shared/params'
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
+import { guideTarget } from './guide-target'
 
 const POINTS = 128
 const FLOOR_Y = -1.15
@@ -69,6 +70,7 @@ export class WavetableView {
     const tabs = el('div', 'wt3d-tabs')
     for (let o = 0; o < 3; o++) {
       const b = el('button', o === 0 ? 'scope-tab on' : 'scope-tab', `OSC ${o + 1}`) as HTMLButtonElement
+      guideTarget(b, `tab.osc${o + 1}`, `Oscillator ${o + 1} wavetable preview`, 'tab')
       b.addEventListener('click', () => this.setOsc(o))
       this.oscTabs.push(b)
       tabs.appendChild(b)

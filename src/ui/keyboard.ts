@@ -2,6 +2,8 @@
 
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
+import { guideTarget } from './guide-target'
+import { isTextEditing } from './history-bindings'
 
 const KEYMAP: Record<string, number> = {
   KeyA: 0, KeyW: 1, KeyS: 2, KeyE: 3, KeyD: 4, KeyF: 5, KeyT: 6,
@@ -18,12 +20,16 @@ export class Keyboard {
   private readonly keyEls = new Map<number, HTMLElement>()
   private readonly pointerNotes = new Map<number, number>()
   private readonly keyboardNotes = new Map<string, number>()
+  private readonly disposeListeners: (() => void)[] = []
 
   constructor(private readonly engine: SynthEngine) {
     this.root = el('div', 'keyboard-wrap')
+    guideTarget(this.root, 'panel.keyboard', 'Playable keyboard', 'panel')
     const octDown = el('button', 'oct-btn', '−')
     const octLabel = el('span', 'oct-label', 'C3–C6')
     const octUp = el('button', 'oct-btn', '+')
+    guideTarget(octDown, 'button.octave.down', 'Keyboard octave down', 'button')
+    guideTarget(octUp, 'button.octave.up', 'Keyboard octave up', 'button')
     const setOct = (o: number) => {
       this.octave = Math.max(0, Math.min(7, o))
       octLabel.textContent = `C${this.octave - 1}–C${this.octave + 2}`
@@ -81,8 +87,8 @@ export class Keyboard {
     keys.addEventListener('pointerup', release)
     keys.addEventListener('pointercancel', release)
 
-    window.addEventListener('keydown', e => {
-      if (e.repeat || e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return
+    const keydown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.repeat || e.metaKey || e.ctrlKey || e.altKey || isTextEditing(e.target) || e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return
       if (e.code === 'KeyZ') { setOct(this.octave - 1); return }
       if (e.code === 'KeyX') { setOct(this.octave + 1); return }
       const off = KEYMAP[e.code]
@@ -91,20 +97,31 @@ export class Keyboard {
       if (this.keyboardNotes.has(e.code)) return
       this.keyboardNotes.set(e.code, note)
       engine.noteOn(note, 0.8)
-    })
-    window.addEventListener('keyup', e => {
+    }
+    const keyup = (e: KeyboardEvent) => {
       const note = this.keyboardNotes.get(e.code)
       if (note !== undefined) {
         engine.noteOff(note)
         this.keyboardNotes.delete(e.code)
       }
-    })
+    }
+    window.addEventListener('keydown', keydown)
+    window.addEventListener('keyup', keyup)
+    this.disposeListeners.push(() => window.removeEventListener('keydown', keydown), () => window.removeEventListener('keyup', keyup))
 
-    engine.onNote((note, on) => {
+    this.disposeListeners.push(engine.onNote((note, on) => {
       this.keyEls.get(note)?.classList.toggle('held', on)
-    })
+    }))
 
     this.root.append(bar, keys)
+  }
+
+  dispose(): void {
+    for (const cleanup of this.disposeListeners) cleanup()
+    for (const note of this.keyboardNotes.values()) this.engine.noteOff(note)
+    for (const note of this.pointerNotes.values()) this.engine.noteOff(note)
+    this.keyboardNotes.clear()
+    this.pointerNotes.clear()
   }
 
   private noteFromEvent(e: PointerEvent): number {

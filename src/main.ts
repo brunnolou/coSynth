@@ -1,14 +1,25 @@
+import 'driver.js/dist/driver.css'
 import './style.css'
 import { SynthEngine } from './audio/engine'
 import { buildApp } from './ui/app'
 import { registerWebMcpTools } from './webmcp/register'
 import { bindWebMcpLifecycle } from './webmcp/lifecycle'
 import { agentActivityFor } from './webmcp/activity'
+import { UiGuideController } from './ui/guide'
+import { guideTarget } from './ui/guide-target'
+import { createHistoryServices } from './history/services'
+import { bindHistoryInteractions, isTextEditing } from './ui/history-bindings'
 
 const engine = new SynthEngine()
 const agentActivity = agentActivityFor(engine)
 const app = document.getElementById('app')!
-buildApp(engine, app)
+const guide = new UiGuideController(app)
+const services = createHistoryServices(engine, guide)
+const disposeApp = buildApp(engine, app, services)
+const disposeInteractions = bindHistoryInteractions(app, services.history, error => {
+  const action = agentActivity.startAction('navigate_history')
+  agentActivity.failAction(action, 'navigate_history', error)
+})
 
 // Browsers require a user gesture before audio can start.
 const overlay = document.createElement('div')
@@ -20,17 +31,23 @@ overlay.innerHTML = `
     <button id="start-btn">CLICK TO START AUDIO</button>
   </div>`
 document.body.appendChild(overlay)
+guide.registerOverlay(overlay)
+overlay.dataset.guideBlocking = ''
+guideTarget(overlay, 'panel.audio-start', 'Start audio screen', 'panel')
+guideTarget(overlay.querySelector<HTMLButtonElement>('#start-btn')!, 'button.audio.start', 'Start audio', 'button')
 
 let starting = false
+let webMcp: ReturnType<typeof registerWebMcpTools> | null = null
 let audioWebMcp: ReturnType<typeof registerWebMcpTools> | null = null
+const updateReadiness = () => agentActivity.setToolReadiness((webMcp?.registeredCount ?? 0) + (audioWebMcp?.registeredCount ?? 0), !audioWebMcp)
 const start = async () => {
   if (starting) return
   starting = true
   try {
     await engine.start()
     if (!audioWebMcp) {
-      audioWebMcp = registerWebMcpTools(engine, undefined, { audioTools: 'only' })
-      if (document.modelContext) void audioWebMcp.ready.then(() => agentActivity.setToolReadiness(11, false))
+      audioWebMcp = registerWebMcpTools(engine, undefined, { audioTools: 'only', services })
+      if (document.modelContext) void audioWebMcp.ready.then(updateReadiness)
     }
     overlay.remove()
   } catch (err) {
@@ -45,20 +62,29 @@ const start = async () => {
   }
 }
 overlay.addEventListener('pointerdown', start)
-window.addEventListener('keydown', start, { once: false })
+const startFromKey = (event: KeyboardEvent) => {
+  if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || isTextEditing(event.target)) return
+  if (!guide.isActive()) void start()
+}
+window.addEventListener('keydown', startFromKey)
 
 // expose for debugging / smoke tests
 ;(window as unknown as { soundgineer: SynthEngine }).soundgineer = engine
 
 // Progressive enhancement: WebMCP registration must never block synth startup.
 try {
-  const webMcp = registerWebMcpTools(engine, undefined, { audioTools: 'exclude' })
-  if (document.modelContext) void webMcp.ready.then(() => agentActivity.setToolReadiness(9, true))
+  webMcp = registerWebMcpTools(engine, undefined, { audioTools: 'exclude', guide, services })
+  if (document.modelContext) void webMcp.ready.then(updateReadiness)
   bindWebMcpLifecycle({
     ready: webMcp.ready,
     dispose() {
-      webMcp.dispose()
+      webMcp?.dispose()
       audioWebMcp?.dispose()
+      window.removeEventListener('keydown', startFromKey)
+      disposeInteractions()
+      disposeApp()
+      services.dispose()
+      guide.dispose()
     }
   }, window, import.meta.hot)
 } catch (error) {
