@@ -1,0 +1,44 @@
+.presets .preset-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 26px;
+  height: 26px;
+  padding: 4px;
+  flex-shrink: 0;
+}
+
+.preset-actions { position: relative; }
+.preset-actions > summary { list-style: none; }
+.preset-actions > summary::-webkit-details-marker { display: none; }
+.preset-actions[open] > summary { border-color: var(--accent); }
+
+.preset-actions-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  min-width: 132px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px #0006;
+}
+
+.preset-actions-menu > button {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border-color: transparent;
+  background: transparent;
+  text-align: left;
+  font-size: 12px;
+}
+
+.preset-actions-menu > button:hover { background: var(--panel-2); }
+.presets :is(button, summary):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

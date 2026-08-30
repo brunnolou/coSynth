@@ -290,7 +290,9 @@ export function buildApp(engine: SynthEngine, container: HTMLElement): void {
     const blocked = status.state === 'blocked'
     midiLabel.disabled = !blocked
     midiLabel.classList.toggle('is-error', blocked)
-    midiLabel.title = blocked ? 'Why MIDI hardware is blocked' : ''
+    midiLabel.title = blocked
+      ? 'MIDI access is blocked here in the ChatGPT desktop browser. To test MIDI, export your preset, open Soundgineer in Chrome, import the preset, and allow MIDI input when prompted. Click for details.'
+      : ''
   })
 
   // ------------------------------------------------------------ animation loop

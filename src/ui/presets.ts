@@ -5,6 +5,8 @@ import { paramDef, valueToNorm } from '../shared/params'
 import { listPresets, savePreset, validatePresetData } from '../shared/preset-store'
 import type { SynthEngine, PresetData } from '../audio/engine'
 import { el } from './common'
+import { ChevronLeft, ChevronRight, Cog, createElement } from 'lucide'
+import './presets.css'
 
 /** Convenience: author factory presets in raw units, store normalized. */
 function P(raw: Record<string, number>): Record<string, number> {
@@ -575,19 +577,75 @@ export class PresetBrowser {
   constructor(private readonly engine: SynthEngine) {
     this.root = el('div', 'presets')
     this.select = el('select', 'param-select preset-select') as HTMLSelectElement
+    this.select.setAttribute('aria-label', 'Preset')
     this.select.addEventListener('change', () => this.load(this.select.value))
 
-    const save = el('button', 'hdr-btn', 'SAVE')
+    const iconButton = (label: string, icon: typeof Cog) => {
+      const button = el('button', 'hdr-btn preset-icon-btn')
+      button.type = 'button'
+      button.title = label
+      button.setAttribute('aria-label', label)
+      button.append(createElement(icon, { width: 16, height: 16, 'aria-hidden': 'true' }))
+      return button
+    }
+    const previous = iconButton('Previous preset', ChevronLeft)
+    const next = iconButton('Next preset', ChevronRight)
+    previous.addEventListener('click', () => this.step(-1))
+    next.addEventListener('click', () => this.step(1))
+
+    const actions = el('details', 'preset-actions')
+    const trigger = el('summary', 'hdr-btn preset-icon-btn')
+    trigger.title = 'Preset actions'
+    trigger.tabIndex = 0
+    trigger.setAttribute('role', 'button')
+    trigger.setAttribute('aria-label', 'Preset actions')
+    trigger.setAttribute('aria-expanded', 'false')
+    trigger.append(createElement(Cog, { width: 16, height: 16, 'aria-hidden': 'true' }))
+    const menu = el('div', 'preset-actions-menu')
+    const closeActions = (restoreFocus = false) => {
+      actions.open = false
+      trigger.setAttribute('aria-expanded', 'false')
+      if (restoreFocus) trigger.focus()
+    }
+    const outsideClick = (event: PointerEvent) => {
+      if (!actions.contains(event.target as Node)) closeActions()
+    }
+    actions.addEventListener('toggle', () => {
+      trigger.setAttribute('aria-expanded', String(actions.open))
+      document.removeEventListener('pointerdown', outsideClick)
+      if (actions.open) document.addEventListener('pointerdown', outsideClick)
+    })
+    actions.addEventListener('keydown', event => {
+      event.stopPropagation()
+      if (event.target === trigger && (event.key === 'Enter' || event.key === ' ')) {
+        event.preventDefault()
+        if (!event.repeat) {
+          actions.open = !actions.open
+          trigger.setAttribute('aria-expanded', String(actions.open))
+        }
+      }
+      if (event.key === 'Escape' && actions.open) {
+        event.preventDefault()
+        closeActions(true)
+      }
+    })
+    actions.addEventListener('focusout', event => {
+      if (event.relatedTarget && !actions.contains(event.relatedTarget as Node)) closeActions()
+    })
+
+    const save = el('button', 'hdr-btn', 'Save')
     save.title = 'Save current patch to the browser'
     save.addEventListener('click', () => {
+      closeActions(true)
       const name = prompt('Preset name?', 'My Patch')
       if (!name) return
       if (savePresetFromUi(this.engine, name)) this.refresh(`user:${name.trim()}`)
     })
 
-    const exportBtn = el('button', 'hdr-btn', 'EXPORT')
+    const exportBtn = el('button', 'hdr-btn', 'Export')
     exportBtn.title = 'Download patch as JSON'
     exportBtn.addEventListener('click', () => {
+      closeActions(true)
       const preset = this.engine.toPreset('Exported Patch')
       const blob = new Blob([JSON.stringify(preset, null, 2)], { type: 'application/json' })
       const a = el('a') as HTMLAnchorElement
@@ -597,7 +655,7 @@ export class PresetBrowser {
       URL.revokeObjectURL(a.href)
     })
 
-    const importBtn = el('button', 'hdr-btn', 'IMPORT')
+    const importBtn = el('button', 'hdr-btn', 'Import')
     const file = el('input') as HTMLInputElement
     file.type = 'file'
     file.accept = '.json'
@@ -613,10 +671,23 @@ export class PresetBrowser {
       }
       file.value = ''
     })
-    importBtn.addEventListener('click', () => file.click())
+    importBtn.addEventListener('click', () => {
+      closeActions(true)
+      file.click()
+    })
 
-    this.root.append(this.select, save, exportBtn, importBtn, file)
+    for (const button of [save, exportBtn, importBtn]) button.type = 'button'
+    menu.append(save, exportBtn, importBtn)
+    actions.append(trigger, menu)
+    this.root.append(previous, this.select, next, actions, file)
     this.refresh('factory:Init')
+  }
+
+  private step(direction: -1 | 1): void {
+    const count = this.select.options.length
+    if (!count) return
+    this.select.selectedIndex = (this.select.selectedIndex + direction + count) % count
+    this.load(this.select.value)
   }
 
   private refresh(selected: string): void {
