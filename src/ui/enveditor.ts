@@ -74,6 +74,24 @@ export class EnvDisplay {
     const X = (t: number) => (t / total) * (w - 8) + 4
     const Y = (v: number) => (1 - v) * (h - 10) + 5
 
+    // Time divisions make the envelope controls legible in milliseconds.
+    c.strokeStyle = '#252832'
+    c.lineWidth = 1
+    for (let time = 0.1; time < total; time += 0.1) {
+      const x = X(time)
+      c.beginPath()
+      c.moveTo(x, 0)
+      c.lineTo(x, h)
+      c.stroke()
+    }
+    for (const level of [0.25, 0.5, 0.75]) {
+      const y = Y(level)
+      c.beginPath()
+      c.moveTo(0, y)
+      c.lineTo(w, y)
+      c.stroke()
+    }
+
     c.beginPath()
     c.moveTo(X(0), Y(0))
     c.lineTo(X(del), Y(0))
@@ -89,7 +107,10 @@ export class EnvDisplay {
     c.lineTo(X(total), Y(0) + 5)
     c.lineTo(X(0), Y(0) + 5)
     c.closePath()
-    c.fillStyle = '#ff9a3c15'
+    const gradient = c.createLinearGradient(0, 0, 0, h)
+    gradient.addColorStop(0, '#ff9a3c38')
+    gradient.addColorStop(1, '#ff9a3c05')
+    c.fillStyle = gradient
     c.fill()
 
     // live value line
