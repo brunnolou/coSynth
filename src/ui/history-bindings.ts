@@ -1,4 +1,5 @@
 import type { SoundHistoryService } from '../history/types'
+import { KNOB_DRAG_END } from './knob-drag'
 
 export function isTextEditing(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false
@@ -10,7 +11,7 @@ export function isTextEditing(target: EventTarget | null): boolean {
 /** Capture before controls mutate, commit after their final pointer handler. */
 export function bindHistoryInteractions(app: HTMLElement, history: SoundHistoryService, onError: (error: unknown) => void): () => void {
   const win = app.ownerDocument.defaultView!
-  const pointers = new Map<number, Element>()
+  const pointers = new Map<number, { target: Element }>()
   const cleanups: (() => void)[] = []
   let disposed = false
   const label = (node: Element) => node.closest<HTMLElement>('[data-guide-label]')?.dataset.guideLabel ?? (node.closest('.lfo-editor') ? 'LFO shape' : 'Sound control')
@@ -26,7 +27,7 @@ export function bindHistoryInteractions(app: HTMLElement, history: SoundHistoryS
     if (!pointers.size) return
     const active = [...pointers]
     pointers.clear()
-    for (const [pointerId, target] of active) {
+    for (const [pointerId, { target }] of active) {
       const cancel = new Event('pointercancel', { bubbles: true })
       Object.defineProperty(cancel, 'pointerId', { value: pointerId })
       target.dispatchEvent(cancel)
@@ -41,22 +42,27 @@ export function bindHistoryInteractions(app: HTMLElement, history: SoundHistoryS
     if (!node) { history.endGesture(); return }
     if (e.button !== 0 && !node.closest('.lfo-editor')) return
     if (pointers.size === 0) history.beginGesture(label(node))
-    pointers.set(e.pointerId, e.target)
+    pointers.set(e.pointerId, { target: e.target })
   }, true)
   const finishPointer = (event: Event) => {
-    const id = (event as PointerEvent).pointerId
-    if (!pointers.has(id)) return
+    const id = event.type === KNOB_DRAG_END ? (event as CustomEvent<{ pointerId: number }>).detail.pointerId : (event as PointerEvent).pointerId
+    const pointer = pointers.get(id)
+    if (!pointer) return
     // Native control updates and app pointer handlers finish before this microtask.
     queueMicrotask(() => {
+      if (pointers.get(id) !== pointer) return
       pointers.delete(id)
       if (!disposed && pointers.size === 0) history.endGesture()
     })
   }
   listen(win, 'pointerup', finishPointer, true)
   listen(win, 'pointercancel', finishPointer, true)
+  listen(win, KNOB_DRAG_END, finishPointer, true)
   listen(win, 'blur', () => {
     cancelPointers()
   })
+  listen(win, 'pagehide', cancelPointers)
+  listen(app.ownerDocument, 'visibilitychange', () => { if (app.ownerDocument.hidden) cancelPointers() })
   // Keyboard/button clicks and select changes must not join a pending wheel/MIDI group.
   for (const type of ['click', 'change', 'dblclick']) listen(app.ownerDocument, type, event => {
     if (!scoped(event.target) || pointers.size) return

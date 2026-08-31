@@ -1,5 +1,5 @@
 // Canvas knob with Vital-style modulation arcs.
-//  - drag vertically to turn, Shift = fine
+//  - drag up/right to increase, down/left to decrease, Cmd = fine, Shift = coarse
 //  - double-click = reset to default
 //  - right-click = modulation menu (assign sources, adjust depths)
 //  - drop target for drag-to-assign from a modulation source badge
@@ -9,6 +9,8 @@ import { MOD_SOURCES } from '../shared/messages'
 import type { SynthEngine } from '../audio/engine'
 import { el, sourceColor, clamp01, showPopup, closePopup } from './common'
 import { guideTarget } from './guide-target'
+import { startKnobDrag } from './knob-drag'
+import { knobWheelValue, snapKnobValue } from './knob-value'
 
 const knobRegistry = new Map<HTMLElement, Knob>()
 const MOD_CANVAS_PADDING = 12
@@ -21,9 +23,6 @@ export class Knob {
   private readonly cx: CanvasRenderingContext2D
   private readonly modCx: CanvasRenderingContext2D
   private readonly modSize: number
-  private dragging = false
-  private dragStartY = 0
-  private dragStartVal = 0
   private hasRoutes = false
 
   constructor(
@@ -39,6 +38,7 @@ export class Knob {
     canvasStack.style.width = `${size}px`
     canvasStack.style.height = `${size}px`
     this.canvas = el('canvas', 'knob-main-canvas')
+    this.canvas.title = 'Drag up/right to increase, down/left to decrease. Cmd: fine. Shift: coarse. Double-click: reset.'
     this.modCanvas = el('canvas', 'knob-mod-canvas')
     this.modSize = size + MOD_CANVAS_PADDING * 2
     const dpr = window.devicePixelRatio || 1
@@ -62,35 +62,17 @@ export class Knob {
     knobRegistry.set(this.root, this)
 
     this.canvas.addEventListener('pointerdown', e => {
-      if (e.button !== 0) return
-      e.preventDefault()
-      this.dragging = true
-      this.dragStartY = e.clientY
-      this.dragStartVal = engine.getParam(paramIndex)
-      this.canvas.setPointerCapture(e.pointerId)
+      startKnobDrag(this.canvas, e, engine.getParam(paramIndex), value => {
+        engine.setParam(paramIndex, value)
+        this.showValue()
+      }, () => { this.labelEl.textContent = label ?? def.name }, value => snapKnobValue(def, value))
     })
-    this.canvas.addEventListener('pointermove', e => {
-      if (!this.dragging) return
-      const scale = (e.shiftKey ? 0.0005 : 0.005)
-      const v = clamp01(this.dragStartVal + (this.dragStartY - e.clientY) * scale)
-      engine.setParam(paramIndex, v)
-      this.showValue()
-    })
-    const endDrag = () => {
-      if (this.dragging) {
-        this.dragging = false
-        this.labelEl.textContent = label ?? def.name
-      }
-    }
-    this.canvas.addEventListener('pointerup', endDrag)
-    this.canvas.addEventListener('pointercancel', endDrag)
     this.canvas.addEventListener('dblclick', () => {
       engine.setParam(paramIndex, defaultNorm(def))
     })
     this.canvas.addEventListener('wheel', e => {
       e.preventDefault()
-      const step = (e.shiftKey ? 0.002 : 0.02) * (e.deltaY > 0 ? -1 : 1)
-      engine.setParam(paramIndex, clamp01(engine.getParam(paramIndex) + step))
+      engine.setParam(paramIndex, knobWheelValue(def, engine.getParam(paramIndex), e))
       this.showValue()
     }, { passive: false })
     this.canvas.addEventListener('contextmenu', e => {
@@ -128,7 +110,8 @@ export class Knob {
     const mcy = ms / 2
     const a0 = 0.75 * Math.PI
     const sweep = 1.5 * Math.PI
-    const v = this.engine.getParam(this.paramIndex)
+    const def = PARAMS[this.paramIndex]
+    const v = snapKnobValue(def, this.engine.getParam(this.paramIndex))
 
     c.clearRect(0, 0, s, s)
     mc.clearRect(0, 0, ms, ms)
@@ -142,18 +125,16 @@ export class Knob {
     c.stroke()
 
     // value arc (bipolar params draw from center)
-    const def = PARAMS[this.paramIndex]
     const bipolar = !def.choices && def.min < 0 && def.max > 0
     const start = bipolar ? a0 + sweep * (0 - def.min) / (def.max - def.min) : a0
-    c.beginPath()
-    if (bipolar) {
-      const va = a0 + sweep * v
+    const va = a0 + sweep * v
+    // A round-capped zero-length stroke can leave a blue dot at zero.
+    if (Math.abs(va - start) > 1e-6) {
+      c.beginPath()
       c.arc(cx, cy, r, Math.min(start, va), Math.max(start, va))
-    } else {
-      c.arc(cx, cy, r, a0, a0 + sweep * v)
+      c.strokeStyle = '#53a8ff'
+      c.stroke()
     }
-    c.strokeStyle = '#53a8ff'
-    c.stroke()
 
     // modulation arcs
     const routes = this.engine.routesForDest(this.paramIndex)
