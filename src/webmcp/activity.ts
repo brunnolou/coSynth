@@ -1,5 +1,9 @@
 import type { SynthEngine } from '../audio/engine'
 import type { AudioMetricsComparison } from '../shared/audio-analysis'
+import { PARAMS } from '../shared/params'
+import { changeKey, samePatchValue, type PatchChange, type PatchMutation } from '../shared/patch-change'
+
+export type PendingChange = PatchChange & { key: string; revision: number }
 
 export interface AgentAction {
   id: number
@@ -15,7 +19,11 @@ export interface AgentActivitySnapshot {
   audioToolsLocked: boolean
   lastAction: AgentAction | null
   changedParameters: string[]
+  pendingChanges: PendingChange[]
+  showChanges: boolean
   comparison: AudioMetricsComparison | null
+  checkpointAvailable: boolean
+  checkpointCreatedAt: number | null
   performanceActive: boolean
 }
 
@@ -50,22 +58,88 @@ function objectValue(value: unknown): Record<string, unknown> | null {
 export class AgentActivityStore {
   private readonly listeners = new Set<Listener>()
   private readonly performanceActions = new Set<number>()
+  private readonly pending = new Map<string, PendingChange>()
+  private revision = 0
+  private canReview = () => true
+  private readonly unsubscribe: () => void
   private actionId = 0
   private state: AgentActivitySnapshot = {
     readyTools: 0,
     audioToolsLocked: true,
     lastAction: null,
     changedParameters: [],
+    pendingChanges: [],
+    showChanges: true,
     comparison: null,
+    checkpointAvailable: false,
+    checkpointCreatedAt: null,
     performanceActive: false
   }
 
-  constructor(_engine: SynthEngine) {}
+  constructor(private readonly engine: SynthEngine) {
+    this.unsubscribe = engine.onPatchChange(mutation => this.recordMutation(mutation))
+  }
+
+  dispose(): void {
+    this.unsubscribe()
+    this.listeners.clear()
+  }
+
+  private recordMutation(mutation: PatchMutation): void {
+    if (mutation.origin === 'restore') return
+    if (mutation.reset) {
+      this.clearIteration()
+    } else {
+      for (const change of mutation.changes) {
+        const key = changeKey(change)
+        if (mutation.origin === 'human') {
+          this.pending.delete(key)
+          continue
+        }
+        const previous = this.pending.get(key)
+        const before = previous ? previous.before : change.before
+        if (samePatchValue(before, change.after)) this.pending.delete(key)
+        else {
+          if (this.state.checkpointCreatedAt === null) {
+            this.state.checkpointCreatedAt = Date.now()
+            this.state.comparison = null
+          }
+          this.pending.set(key, structuredClone({ ...change, before, key, revision: ++this.revision }) as PendingChange)
+        }
+      }
+    }
+    this.syncPending()
+    this.emit()
+  }
+
+  private syncPending(): void {
+    this.state.pendingChanges = [...this.pending.values()]
+    this.state.changedParameters = this.state.pendingChanges.flatMap(change =>
+      change.kind === 'param' ? [PARAMS[change.index].id] : [])
+    this.state.checkpointAvailable = this.pending.size > 0
+    if (!this.pending.size) this.state.checkpointCreatedAt = null
+  }
+
+  private clearIteration(): void {
+    this.pending.clear()
+    this.state.comparison = null
+    this.syncPending()
+  }
+
+  setShowChanges(show: boolean): void {
+    this.state.showChanges = show
+    this.emit()
+  }
+
+  setReviewGuard(canReview: () => boolean): void {
+    this.canReview = canReview
+  }
 
   snapshot(): AgentActivitySnapshot {
     return {
       ...this.state,
       changedParameters: [...this.state.changedParameters],
+      pendingChanges: structuredClone(this.state.pendingChanges),
       comparison: this.state.comparison ? {
         similarity: this.state.comparison.similarity,
         details: { ...this.state.comparison.details }
@@ -85,9 +159,34 @@ export class AgentActivityStore {
     this.emit()
   }
 
+  acceptCheckpoint(): boolean {
+    if (!this.pending.size || this.state.performanceActive || !this.canReview()) return false
+    this.clearIteration()
+    this.state.lastAction = this.humanAction('Kept agent changes')
+    this.emit()
+    return true
+  }
+
+  restoreCheckpoint(): boolean {
+    if (!this.pending.size || this.state.performanceActive || !this.canReview()) return false
+    this.engine.batchSoundChange('Reject AI changes', () => {
+      for (const change of this.pending.values()) {
+        switch (change.kind) {
+          case 'param': this.engine.setParam(change.index, change.before, 'restore'); break
+          case 'route': this.engine.setModSlot(change.index, change.before, 'restore'); break
+          case 'lfo': this.engine.setLfoShape(change.index, change.before, 'restore'); break
+          case 'fx': this.engine.setFxOrder(change.before, 'restore'); break
+        }
+      }
+    })
+    this.clearIteration()
+    this.state.lastAction = this.humanAction('Rejected agent changes; kept manual edits')
+    this.emit()
+    return true
+  }
+
   startAction(tool: string): number {
     const id = ++this.actionId
-    if (['update_parameters', 'set_modulation', 'load_preset'].includes(tool)) this.state.changedParameters = []
     this.state.lastAction = {
       id,
       tool,
@@ -104,23 +203,12 @@ export class AgentActivityStore {
     return id
   }
 
-  finishAction(id: number, tool: string, input: unknown, output: unknown): void {
-    const inputObject = objectValue(input)
+  finishAction(id: number, tool: string, _input: unknown, output: unknown): void {
     const outputObject = objectValue(output)
     const expectedError = objectValue(outputObject?.error)
     if (outputObject?.ok === false && expectedError) {
       this.complete(id, tool, 'failed', String(expectedError.message ?? 'Tool failed'))
       return
-    }
-
-    if (tool === 'update_parameters' && Array.isArray(outputObject?.applied)) {
-      const ids = outputObject.applied.flatMap(item => {
-        const value = objectValue(item)
-        return typeof value?.id === 'string' ? [value.id] : []
-      })
-      this.addChangedParameters(ids)
-    } else if (tool === 'set_modulation' && typeof inputObject?.destination === 'string') {
-      this.addChangedParameters([inputObject.destination])
     }
 
     if (tool === 'compare_audio') {
@@ -170,8 +258,15 @@ export class AgentActivityStore {
     return 'Completed'
   }
 
-  private addChangedParameters(ids: string[]): void {
-    this.state.changedParameters = [...new Set([...this.state.changedParameters, ...ids])]
+  private humanAction(label: string): AgentAction {
+    return {
+      id: ++this.actionId,
+      tool: 'human_checkpoint',
+      label,
+      status: 'completed',
+      summary: 'Completed',
+      timestamp: Date.now()
+    }
   }
 
   private emit(): void {

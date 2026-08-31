@@ -1,0 +1,55 @@
+@property --ai-glow-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+/* Glowing's cyan / purple / tomato palette, confined to the marker. */
+.ai-changed {
+  --ai-glow-x: calc(8px + cos(var(--ai-glow-angle)) * 1.5px);
+  --ai-glow-y: calc(8px + sin(var(--ai-glow-angle)) * 1.5px);
+  --ai-glow-x2: calc(8px + cos(var(--ai-glow-angle) + 120deg) * 1.5px);
+  --ai-glow-y2: calc(8px + sin(var(--ai-glow-angle) + 120deg) * 1.5px);
+  --ai-glow-x3: calc(8px + cos(var(--ai-glow-angle) + 240deg) * 1.5px);
+  --ai-glow-y3: calc(8px + sin(var(--ai-glow-angle) + 240deg) * 1.5px);
+  background-image:
+    radial-gradient(circle at 7px 6px, #ffffffb3, transparent 2px),
+    radial-gradient(circle at var(--ai-glow-x) var(--ai-glow-y), cyan 0 1px, #00ffff80 2.5px, transparent 4.5px),
+    radial-gradient(circle at var(--ai-glow-x2) var(--ai-glow-y2), tomato 0 1px, #ff634780 2.5px, transparent 4.5px),
+    radial-gradient(circle at var(--ai-glow-x3) var(--ai-glow-y3), #b84dff 0 1px, #80008080 3px, transparent 5px),
+    radial-gradient(circle at 8px 8px, #00ffff40 2px, #b84dff30 4px, transparent 8px);
+  animation: ai-change-dot 2s linear infinite;
+}
+.ai-changed:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@keyframes ai-change-dot {
+  to { --ai-glow-angle: 360deg; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ai-changed { animation: none; }
+}
+.ai-change-descriptions {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.ai-change-tooltip {
+  position: fixed;
+  z-index: 100;
+  max-width: min(360px, calc(100vw - 16px));
+  max-height: min(240px, calc(100vh - 16px));
+  overflow: hidden;
+  padding: 8px;
+  border: 1px solid #dbe9ff80;
+  border-radius: 5px;
+  background: #171b23;
+  color: #e8eaf0;
+  font-size: 11px;
+  white-space: pre-line;
+  pointer-events: none;
+}
+.agent-show-changes { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }

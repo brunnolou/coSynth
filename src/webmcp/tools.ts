@@ -1,4 +1,5 @@
 import type { SynthEngine } from '../audio/engine'
+import { agentActivityFor } from './activity'
 import {
   PARAMS, defaultNorm, formatValue, normToValue, paramIndex, valueToNorm,
   type ParamDef
@@ -221,6 +222,7 @@ export function createWebMcpTools(
 ): WebMCP.ModelContextTool[] {
   const session = sessionFor(engine)
   const performance = dependencies.performance ?? session.performance
+  agentActivityFor(engine)
   const decodeAudio = dependencies.decodeAudio ?? decodeBase64Audio
   const analyzeAudioAsync = dependencies.analyzeAudioAsync ?? analyzeAudioAbortably
 
@@ -478,7 +480,7 @@ export function createWebMcpTools(
           const raw = canonicalRaw(def, update.value)
           return { id, index: paramIndex(id), def, raw, normalized: valueToNorm(def, raw) }
         })
-        for (const update of validated) engine.setParam(update.index, update.normalized)
+        for (const update of validated) engine.setParam(update.index, update.normalized, 'ai')
         return {
           applied: validated.map(update => ({
             id: update.id,
@@ -511,7 +513,7 @@ export function createWebMcpTools(
         const count = () => engine.modSlots.filter(Boolean).length
         if (action === 'clear') {
           assertObject(input, 'input', ['action'], ['action'])
-          engine.modSlots.forEach((route, slot) => { if (route) engine.setModSlot(slot, null) })
+          engine.modSlots.forEach((route, slot) => { if (route) engine.setModSlot(slot, null, 'ai') })
           return { cleared: true, count: count() }
         }
         if (action === 'remove') {
@@ -519,7 +521,7 @@ export function createWebMcpTools(
           const slot = finite(value.slot, 'slot')
           if (!Number.isInteger(slot) || slot < 0 || slot >= MAX_MOD_SLOTS) throw new Error('slot must be an integer in range 0..31')
           if (!engine.modSlots[slot]) throw new Error(`Modulation slot ${slot} is empty`)
-          engine.setModSlot(slot, null)
+          engine.setModSlot(slot, null, 'ai')
           return { removed: slot, count: count() }
         }
         if (action === 'update') {
@@ -533,7 +535,7 @@ export function createWebMcpTools(
           if (depth < -1 || depth > 1) throw new Error('depth must be in range -1..1')
           if (value.enabled !== undefined && typeof value.enabled !== 'boolean') throw new Error('enabled must be boolean')
           const route = { ...current, depth, enabled: value.enabled === undefined ? current.enabled : value.enabled }
-          engine.setModSlot(slot, route)
+          engine.setModSlot(slot, route, 'ai')
           return { route: routeValue(slot, route), count: count() }
         }
         assertObject(input, 'input', ['action', 'source', 'destination', 'depth', 'enabled'], ['action', 'source', 'destination', 'depth'])
@@ -559,7 +561,7 @@ export function createWebMcpTools(
           depth,
           enabled: value.enabled === undefined ? (existing?.enabled ?? true) : value.enabled
         }
-        engine.setModSlot(slot, route)
+        engine.setModSlot(slot, route, 'ai')
         return { route: routeValue(slot, route), count: count() }
       }
     },
@@ -767,7 +769,7 @@ export function createWebMcpTools(
         const preset = loadPreset(name)
         if (!preset) throw new Error(`Preset not found: ${name}`)
         const validated = validatePresetData(preset)
-        engine.loadPreset(validated)
+        engine.loadPreset(validated, 'ai')
         return { name, loaded: true }
       }
     }

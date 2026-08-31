@@ -137,6 +137,12 @@ Use `Cmd/Ctrl+Z` to undo, `Cmd/Ctrl+Shift+Z` to redo, or `Ctrl+Y` on Windows/Lin
 
 Sound snapshots preserve modulation slot identities, LFO shapes, FX order, imported wavetables, and imported noise samples. They do not restore playing notes, oscillator phase, effect tails, or UI navigation. Shared imported assets retained only by old versions have a 128 MiB cap; oldest states are evicted when the count or byte limit is exceeded. The current sound is never evicted. History is memory-only and clears on reload or lifecycle disposal; ordinary bfcache navigation preserves it. Preset files/storage are unchanged and storage writes are not undoable.
 
+### Pending AI changes
+
+Glowing dots identify net AI changes. **Show changes** hides the dots without discarding pending changes. Open the change-count button to review before/after values and the latest comparison. Keep accepts the iteration; Reject restores only AI-owned parameters, modulation slots, LFO shapes, and FX order, preserving manual edits. Reject adds one undoable sound-history entry. Keep does not change the sound or add a history entry.
+
+A manual edit takes ownership of that parameter or structural unit. Loading a preset manually or navigating sound history starts a new baseline and clears pending AI markers. Undo/Redo restores sound, not old AI attribution. Review is unavailable during playback, recording, history navigation, or an active editing gesture. Tracking and visibility preferences remain session-local.
+
 Example AI workflow:
 
 ```js

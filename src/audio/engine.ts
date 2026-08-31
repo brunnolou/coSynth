@@ -11,6 +11,7 @@ import {
   defaultLfoShape, type LfoPoint, type ModSlotState, type ToWorklet, type FromWorklet
 } from '../shared/messages'
 import { generateWavetable, buildMips, wavToWavetable, decodeWav, type Wavetable } from '../shared/wavetable-gen'
+import { samePatchValue, type MutationOrigin, type PatchChange, type PatchMutation } from '../shared/patch-change'
 
 export interface PresetData {
   name: string
@@ -113,6 +114,7 @@ export class SynthEngine {
   private node: AudioWorkletNode | null = null
   private readonly paramListeners: (Set<ParamListener> | undefined)[] = new Array(NUM_PARAMS)
   private readonly matrixListeners = new Set<() => void>()
+  private readonly patchListeners = new Set<(mutation: PatchMutation) => void>()
   private readonly tableListeners = new Set<(osc: number) => void>()
   private readonly fxOrderListeners = new Set<() => void>()
   private readonly soundListeners = new Set<(change: SoundChange) => void>()
@@ -182,6 +184,8 @@ export class SynthEngine {
       this.fxOrder = [...state.fxOrder]
       state.customTables.forEach((table, i) => { this.customTables[i] = table })
       this.noiseSample = state.noiseSample
+      // History navigation selects a new baseline, not a pending AI iteration.
+      this.notifyPatch('human', [], true)
       this.allNotesOff()
       this.syncAll()
       for (let i = 0; i < NUM_PARAMS; i++) this.paramListeners[i]?.forEach(fn => fn(this.values[i]))
@@ -229,20 +233,36 @@ export class SynthEngine {
 
   // ------------------------------------------------------------ parameters
 
-  setParam(index: number, value: number, options?: { coalesceKey?: string }): void {
+  onPatchChange(listener: (mutation: PatchMutation) => void): () => void {
+    this.patchListeners.add(listener)
+    return () => this.patchListeners.delete(listener)
+  }
+
+  private notifyPatch(origin: MutationOrigin, changes: PatchChange[], reset = false): void {
+    const actual = changes.filter(change => !samePatchValue(change.before, change.after))
+    if (!actual.length && !reset) return
+    const mutation = structuredClone({ origin, changes: actual, reset })
+    this.patchListeners.forEach(listener => listener(mutation))
+  }
+
+  setParam(index: number, value: number, options: { coalesceKey?: string; origin?: MutationOrigin } | MutationOrigin = 'human'): void {
     if (!Number.isInteger(index) || index < 0 || index >= NUM_PARAMS || !Number.isFinite(value)) return
+    const origin = typeof options === 'string' ? options : options.origin ?? 'human'
     value = Math.fround(Math.max(0, Math.min(1, value)))
     if (this.values[index] === value) return
+    const before = this.values[index]
     this.values[index] = value
+    this.notifyPatch(origin, [{ kind: 'param', index, before, after: value }])
     this.post({ type: 'param', index, value })
     this.paramListeners[index]?.forEach(fn => fn(value))
     const osc = OSC_WT_IDX.indexOf(index)
     if (osc >= 0) this.sendWavetable(osc)
-    this.notifySound({ label: `Change ${PARAMS[index].id}`, changed: [PARAMS[index].id], ...options })
+    this.notifySound({ label: `Change ${PARAMS[index].id}`, changed: [PARAMS[index].id],
+      ...(typeof options === 'object' ? { coalesceKey: options.coalesceKey } : {}) })
   }
 
-  setParamById(id: string, value: number): void {
-    this.setParam(paramIndex(id), value)
+  setParamById(id: string, value: number, origin: MutationOrigin = 'human'): void {
+    this.setParam(paramIndex(id), value, origin)
   }
 
   getParam(index: number): number {
@@ -331,9 +351,11 @@ export class SynthEngine {
     this.matrixListeners.forEach(fn => fn())
   }
 
-  setModSlot(slot: number, state: ModSlotState | null): void {
-    if (JSON.stringify(this.modSlots[slot]) === JSON.stringify(state)) return
+  setModSlot(slot: number, state: ModSlotState | null, origin: MutationOrigin = 'human'): void {
+    const before = this.modSlots[slot]
+    if (samePatchValue(before, state)) return
     this.modSlots[slot] = state ? { ...state } : null
+    this.notifyPatch(origin, [{ kind: 'route', index: slot, before, after: this.modSlots[slot] }])
     this.post({ type: 'mod', slot, state })
     this.notifyMatrix()
     this.notifySound({ label: 'Edit modulation route', changed: [`mod.${slot}`] })
@@ -359,18 +381,22 @@ export class SynthEngine {
 
   // ------------------------------------------------------------ LFO shapes
 
-  setLfoShape(lfo: number, points: LfoPoint[]): void {
-    if (JSON.stringify(this.lfoShapes[lfo]) === JSON.stringify(points)) return
+  setLfoShape(lfo: number, points: LfoPoint[], origin: MutationOrigin = 'human'): void {
+    const before = this.lfoShapes[lfo]
+    if (samePatchValue(before, points)) return
     this.lfoShapes[lfo] = points.map(point => ({ ...point }))
+    this.notifyPatch(origin, [{ kind: 'lfo', index: lfo, before, after: this.lfoShapes[lfo] }])
     this.post({ type: 'lfoShape', lfo, points })
     this.notifySound({ label: `Edit LFO ${lfo + 1} shape`, changed: [`lfo${lfo + 1}.shape`] })
   }
 
   // ------------------------------------------------------------ FX order
 
-  setFxOrder(order: number[]): void {
-    if (JSON.stringify(this.fxOrder) === JSON.stringify(order)) return
+  setFxOrder(order: number[], origin: MutationOrigin = 'human'): void {
+    const before = this.fxOrder
+    if (samePatchValue(before, order)) return
     this.fxOrder = order.slice()
+    this.notifyPatch(origin, [{ kind: 'fx', index: 0, before, after: this.fxOrder }])
     this.post({ type: 'fxOrder', order: this.fxOrder })
     this.fxOrderListeners.forEach(fn => fn())
     this.notifySound({ label: 'Reorder effects', changed: ['fx.order'] })
@@ -551,11 +577,15 @@ export class SynthEngine {
     }
   }
 
-  loadPreset(preset: Partial<PresetData>): void {
-    this.batchSoundChange(`Load preset${preset.name ? ` ${preset.name}` : ''}`, () => this.applyPreset(preset))
+  loadPreset(preset: Partial<PresetData>, origin: MutationOrigin = 'human'): void {
+    this.batchSoundChange(`Load preset${preset.name ? ` ${preset.name}` : ''}`, () => this.applyPreset(preset, origin))
   }
 
-  private applyPreset(preset: Partial<PresetData>): void {
+  private applyPreset(preset: Partial<PresetData>, origin: MutationOrigin): void {
+    const beforeParams = this.values.slice()
+    const beforeRoutes = structuredClone(this.modSlots)
+    const beforeShapes = structuredClone(this.lfoShapes)
+    const beforeOrder = this.fxOrder.slice()
     // reset to defaults first so presets don't need every param
     const defs = defaultValues()
     this.values.set(defs)
@@ -591,6 +621,13 @@ export class SynthEngine {
       ? preset.fxOrder.map(id => FX_IDS.indexOf(id as (typeof FX_IDS)[number])).filter(i => i >= 0)
       : DEFAULT_FX_ORDER.slice()
     if (this.fxOrder.length !== FX_IDS.length) this.fxOrder = DEFAULT_FX_ORDER.slice()
+
+    this.notifyPatch(origin, [
+      ...Array.from(this.values, (after, index): PatchChange => ({ kind: 'param', index, before: beforeParams[index], after })),
+      ...this.modSlots.map((after, index): PatchChange => ({ kind: 'route', index, before: beforeRoutes[index], after })),
+      ...this.lfoShapes.map((after, index): PatchChange => ({ kind: 'lfo', index, before: beforeShapes[index], after })),
+      { kind: 'fx', index: 0, before: beforeOrder, after: this.fxOrder }
+    ], origin === 'human')
 
     this.allNotesOff()
     if (this.node) this.syncAll()

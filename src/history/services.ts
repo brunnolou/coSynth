@@ -1,6 +1,7 @@
 import { soundStateAssets, type SoundSnapshot, type SynthEngine } from '../audio/engine'
 import { PARAMS, formatValue } from '../shared/params'
 import type { UiGuideController } from '../ui/guide'
+import { agentActivityFor } from '../webmcp/activity'
 import { HistoryStore } from './store'
 import { PerformanceManager, performNotes, assertNotesAvailable } from './performance'
 import { ReplayStore } from './replays'
@@ -33,9 +34,14 @@ export function createHistoryServices(engine: SynthEngine, guide: UiGuideControl
     play: async (notes, signal) => { assertNotesAvailable(engine, notes); await performNotes(engine, notes, signal) },
     showGuide: steps => { guide.show({ steps }) }
   })
+  const activity = agentActivityFor(engine)
+  activity.setReviewGuard(() => {
+    const state = history.snapshot()
+    return !performance.active && !state.navigating && !state.gestureActive
+  })
   return {
     history, replays, performance,
-    dispose() { history.dispose(); replays.dispose() }
+    dispose() { activity.setReviewGuard(() => false); history.dispose(); replays.dispose() }
   }
 }
 export type AppHistoryServices = ReturnType<typeof createHistoryServices>
