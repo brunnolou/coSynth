@@ -71,6 +71,7 @@ export class AgentHighlights {
       for (const id of changeTargets(change)) targets.set(id, [...(targets.get(id) ?? []), change])
     }
     const active = new Set<HTMLElement>()
+    let pulseIndex = 0
     for (const target of this.root.querySelectorAll<HTMLElement>(selector)) {
       const changes = targets.get(target.dataset.aiTarget ?? target.dataset.guideId ?? '')
       if (!changes?.length) continue
@@ -96,11 +97,13 @@ export class AgentHighlights {
       target.classList.add('ai-changed')
       // Initial mount, tab reconstruction and Show changes never replay old pulses.
       if (animate && isNewRevision && changes.some(change => change.revision > this.seenRevision) && this.isVisible(target)) {
-        clearTimeout(binding.timer)
-        target.classList.remove('ai-change-pulse')
+        this.clearPulse(target, binding)
+        // Start one immediately; scatter the other elements over a 500ms window.
+        const delay = pulseIndex++ === 0 ? 0 : 25 + Math.round(Math.random() * 475)
+        if (delay) target.style.setProperty('--ai-change-delay', `${delay}ms`)
         void target.offsetWidth
         target.classList.add('ai-change-pulse')
-        binding.timer = setTimeout(() => target.classList.remove('ai-change-pulse'), 600)
+        binding.timer = setTimeout(() => this.clearPulse(target, binding!), 1600 + delay)
       }
     }
     for (const [target, binding] of this.bindings) {
@@ -129,9 +132,15 @@ export class AgentHighlights {
     return true
   }
 
-  private removeBinding(target: HTMLElement, binding: Binding): void {
+  private clearPulse(target: HTMLElement, binding: Binding): void {
     clearTimeout(binding.timer)
-    target.classList.remove('ai-changed', 'ai-change-pulse')
+    target.classList.remove('ai-change-pulse')
+    target.style.removeProperty('--ai-change-delay')
+  }
+
+  private removeBinding(target: HTMLElement, binding: Binding): void {
+    this.clearPulse(target, binding)
+    target.classList.remove('ai-changed')
     const ids = (target.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(id => id && id !== binding.description.id)
     if (ids.length) target.setAttribute('aria-describedby', ids.join(' '))
     else target.removeAttribute('aria-describedby')

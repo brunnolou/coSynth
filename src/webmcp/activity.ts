@@ -5,6 +5,13 @@ import { changeKey, samePatchValue, type PatchChange, type PatchMutation } from 
 
 export type PendingChange = PatchChange & { key: string; revision: number }
 
+/** Session-only attribution saved alongside each sound-history version. */
+export interface AgentAttribution {
+  pendingChanges: PendingChange[]
+  checkpointCreatedAt: number | null
+  reviewEpoch: number
+}
+
 export interface AgentAction {
   id: number
   tool: string
@@ -60,6 +67,7 @@ export class AgentActivityStore {
   private readonly performanceActions = new Set<number>()
   private readonly pending = new Map<string, PendingChange>()
   private revision = 0
+  private reviewEpoch = 0
   private canReview = () => true
   private readonly unsubscribe: () => void
   private actionId = 0
@@ -135,6 +143,29 @@ export class AgentActivityStore {
     this.canReview = canReview
   }
 
+  captureAttribution(): AgentAttribution {
+    return {
+      pendingChanges: structuredClone([...this.pending.values()]),
+      checkpointCreatedAt: this.state.checkpointCreatedAt,
+      reviewEpoch: this.reviewEpoch
+    }
+  }
+
+  restoreAttribution(attribution: AgentAttribution): void {
+    this.clearIteration()
+    // Keep acknowledges the iteration across all retained sound versions.
+    // Restored revisions stay unchanged so Undo never replays the arrival glow.
+    if (attribution.reviewEpoch === this.reviewEpoch) {
+      for (const change of structuredClone(attribution.pendingChanges)) {
+        this.pending.set(change.key, change)
+        this.revision = Math.max(this.revision, change.revision)
+      }
+      this.state.checkpointCreatedAt = attribution.checkpointCreatedAt
+    }
+    this.syncPending()
+    this.emit()
+  }
+
   snapshot(): AgentActivitySnapshot {
     return {
       ...this.state,
@@ -161,6 +192,7 @@ export class AgentActivityStore {
 
   acceptCheckpoint(): boolean {
     if (!this.pending.size || this.state.performanceActive || !this.canReview()) return false
+    this.reviewEpoch++
     this.clearIteration()
     this.state.lastAction = this.humanAction('Kept agent changes')
     this.emit()
@@ -178,8 +210,9 @@ export class AgentActivityStore {
           case 'fx': this.engine.setFxOrder(change.before, 'restore'); break
         }
       }
+      // History captures the final attribution when the batch commits.
+      this.clearIteration()
     })
-    this.clearIteration()
     this.state.lastAction = this.humanAction('Rejected agent changes; kept manual edits')
     this.emit()
     return true

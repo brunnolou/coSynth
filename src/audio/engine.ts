@@ -184,7 +184,7 @@ export class SynthEngine {
       this.fxOrder = [...state.fxOrder]
       state.customTables.forEach((table, i) => { this.customTables[i] = table })
       this.noiseSample = state.noiseSample
-      // History navigation selects a new baseline, not a pending AI iteration.
+      // Clear the live iteration; history services restore its saved attribution.
       this.notifyPatch('human', [], true)
       this.allNotesOff()
       this.syncAll()
