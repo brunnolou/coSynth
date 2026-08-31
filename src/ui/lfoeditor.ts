@@ -7,7 +7,9 @@
 
 import type { SynthEngine } from '../audio/engine'
 import { evalLfoShape, type LfoPoint } from '../shared/messages'
+import { PARAMS, paramIndex, normToValue, SYNC_DIVISIONS, divisionToBeats } from '../shared/params'
 import { el } from './common'
+import { drawChartTiming, formatChartDuration } from './chart-label'
 
 const HIT = 10
 
@@ -48,6 +50,21 @@ export class LfoEditor {
 
   private get points(): LfoPoint[] {
     return this.engine.lfoShapes[this.lfo]
+  }
+
+  private timingLabel(): string {
+    const value = (id: string) => {
+      const index = paramIndex(id)
+      return normToValue(PARAMS[index], this.engine.getParam(index))
+    }
+    const prefix = `lfo${this.lfo + 1}`
+    if (value(`${prefix}.sync`) >= 0.5) {
+      const division = Math.round(value(`${prefix}.division`))
+      const period = divisionToBeats(division) * 60 / value('master.bpm')
+      return `${SYNC_DIVISIONS[division]} · ${formatChartDuration(period)}`
+    }
+    const rate = value(`${prefix}.rate`)
+    return `${Number(rate.toFixed(2))} Hz · ${formatChartDuration(1 / rate)}`
   }
 
   private resize(): void {
@@ -232,5 +249,6 @@ export class LfoEditor {
     c.lineTo(w, this.toY(live))
     c.strokeStyle = '#4cd97b40'
     c.stroke()
+    drawChartTiming(c, this.timingLabel(), w)
   }
 }

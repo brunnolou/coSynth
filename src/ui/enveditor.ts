@@ -4,6 +4,7 @@
 import { paramIndex, normToValue, PARAMS } from '../shared/params'
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
+import { drawChartTiming, formatChartDuration } from './chart-label'
 
 function shape(t: number, c: number): number {
   return Math.pow(t, Math.pow(2, c * 3))
@@ -19,6 +20,7 @@ export class EnvDisplay {
   constructor(private readonly engine: SynthEngine, private env: number) {
     this.root = el('div', 'env-display')
     this.canvas = el('canvas')
+    this.canvas.title = 'Displayed envelope duration. The sustain segment is illustrative; its actual length follows the held note.'
     this.root.appendChild(this.canvas)
     this.cx = this.canvas.getContext('2d')!
     new ResizeObserver(() => this.resize()).observe(this.root)
@@ -123,5 +125,6 @@ export class EnvDisplay {
       c.lineWidth = 1
       c.stroke()
     }
+    drawChartTiming(c, formatChartDuration(total), w)
   }
 }
