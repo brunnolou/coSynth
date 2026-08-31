@@ -19,11 +19,20 @@ export interface AgentAction {
   status: 'running' | 'completed' | 'failed' | 'cancelled'
   summary: string
   timestamp: number
+  finishedAt?: number
 }
+
+export interface ToolRegistrationError { tool: string; message: string }
+export type ToolAvailability = 'checking' | 'unavailable' | 'ready' | 'error'
 
 export interface AgentActivitySnapshot {
   readyTools: number
   audioToolsLocked: boolean
+  toolAvailability: ToolAvailability
+  registrationErrors: ToolRegistrationError[]
+  actions: AgentAction[]
+  activeToolCalls: number
+  lastError: AgentAction | null
   lastAction: AgentAction | null
   changedParameters: string[]
   pendingChanges: PendingChange[]
@@ -64,6 +73,8 @@ function objectValue(value: unknown): Record<string, unknown> | null {
 
 export class AgentActivityStore {
   private readonly listeners = new Set<Listener>()
+  private readonly actions = new Map<number, AgentAction>()
+  private readonly activeCalls = new Set<number>()
   private readonly performanceActions = new Set<number>()
   private readonly pending = new Map<string, PendingChange>()
   private revision = 0
@@ -74,6 +85,11 @@ export class AgentActivityStore {
   private state: AgentActivitySnapshot = {
     readyTools: 0,
     audioToolsLocked: true,
+    toolAvailability: 'checking',
+    registrationErrors: [],
+    actions: [],
+    activeToolCalls: 0,
+    lastError: null,
     lastAction: null,
     changedParameters: [],
     pendingChanges: [],
@@ -169,6 +185,11 @@ export class AgentActivityStore {
   snapshot(): AgentActivitySnapshot {
     return {
       ...this.state,
+      actions: [...this.actions.values()].map(action => ({ ...action })),
+      activeToolCalls: this.activeCalls.size,
+      registrationErrors: this.state.registrationErrors.map(error => ({ ...error })),
+      lastAction: this.state.lastAction ? { ...this.state.lastAction } : null,
+      lastError: this.state.lastError ? { ...this.state.lastError } : null,
       changedParameters: [...this.state.changedParameters],
       pendingChanges: structuredClone(this.state.pendingChanges),
       comparison: this.state.comparison ? {
@@ -184,9 +205,22 @@ export class AgentActivityStore {
     return () => this.listeners.delete(listener)
   }
 
-  setToolReadiness(readyTools: number, audioToolsLocked: boolean): void {
+  setToolReadiness(readyTools: number, audioToolsLocked: boolean, options: {
+    available?: boolean; registering?: boolean; errors?: readonly ToolRegistrationError[]
+  } = {}): void {
     this.state.readyTools = readyTools
     this.state.audioToolsLocked = audioToolsLocked
+    this.state.registrationErrors = (options.errors ?? []).map(error => ({ ...error }))
+    this.state.toolAvailability = options.available === false ? 'unavailable'
+      : this.state.registrationErrors.length ? 'error'
+      : readyTools > 0 ? 'ready'
+      : options.registering ? 'checking' : 'unavailable'
+    this.emit()
+  }
+
+  reportHumanError(error: unknown): void {
+    this.state.lastAction = { ...this.humanAction('History action failed'), status: 'failed',
+      summary: error instanceof Error ? error.message : String(error) }
     this.emit()
   }
 
@@ -228,6 +262,10 @@ export class AgentActivityStore {
       summary: 'In progress',
       timestamp: Date.now()
     }
+    this.actions.set(id, this.state.lastAction)
+    this.activeCalls.add(id)
+    // Keep a bounded invocation log; active ownership is tracked separately.
+    if (this.actions.size > 100) this.actions.delete(this.actions.keys().next().value!)
     if (tool === 'play_notes' || tool === 'render_audio') {
       this.performanceActions.add(id)
       this.state.performanceActive = true
@@ -261,20 +299,24 @@ export class AgentActivityStore {
   }
 
   private complete(id: number, tool: string, status: AgentAction['status'], summary: string): void {
+    if (!this.activeCalls.delete(id)) return
     if (tool === 'play_notes' || tool === 'render_audio') {
       this.performanceActions.delete(id)
       this.state.performanceActive = this.performanceActions.size > 0
     }
-    if (!this.state.lastAction || this.state.lastAction.id <= id) {
-      this.state.lastAction = {
-        id,
-        tool,
-        label: TOOL_LABELS[tool] ?? tool,
-        status,
-        summary,
-        timestamp: Date.now()
-      }
+    const action: AgentAction = {
+      id,
+      tool,
+      label: TOOL_LABELS[tool] ?? tool,
+      status,
+      summary,
+      timestamp: this.actions.get(id)?.timestamp ?? Date.now(),
+      finishedAt: Date.now()
     }
+    if (this.actions.has(id)) this.actions.set(id, action)
+    if (status === 'failed') this.state.lastError = action
+    else if (status === 'completed') this.state.lastError = null
+    if (!this.state.lastAction || this.state.lastAction.id <= id) this.state.lastAction = action
     this.emit()
   }
 

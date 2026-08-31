@@ -235,38 +235,16 @@ main {
   min-width: 0;
   margin: 0 4px 4px;
 }
-.agent-activity-panel {
+.panel.agent-activity-panel {
   flex: 0 0 auto;
   min-width: 0;
-  margin: 0 4px 4px;
-  padding: 6px 8px;
+  margin: 4px 4px 0;
+  padding: 4px;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
-.agent-activity-summary {
-  min-width: 0;
-  flex: 1 1 auto;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.agent-tool-status {
-  color: var(--accent);
-  white-space: nowrap;
-  font-size: 10px;
-}
-.agent-last-action {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-dim);
-  font-size: 10px;
-}
-.agent-last-action[data-status='running'] { color: var(--accent); }
-.agent-last-action[data-status='failed'] { color: #ff6b6b; }
-.agent-activity-actions { display: flex; gap: 4px; }
+.agent-activity-actions { display: flex; gap: 4px; flex: 0 0 auto; }
 .agent-btn {
   background: var(--panel-2);
   border: 1px solid var(--line);
@@ -387,12 +365,6 @@ main {
 .agent-delta.positive { color: #6fda91; }
 .agent-delta.negative { color: #ff8d98; }
 .agent-warning { color: #ffb85c; }
-
-@media (max-width: 760px) {
-  .agent-activity-summary { gap: 6px; }
-  .agent-tool-status { white-space: normal; }
-  .agent-last-action { display: none; }
-}
 
 .panel {
   background: var(--panel);
@@ -837,9 +809,6 @@ input[type='range'] { accent-color: var(--accent); }
 ::-webkit-scrollbar-track { background: transparent; }
 
 /* Shared human/AI history. Keep controls stable while entries update. */
-.agent-activity-panel .agent-activity-actions { flex-wrap: wrap; }
-.agent-btn-icon { display: inline-flex; align-items: center; gap: 4px; }
-.agent-btn-icon svg { flex-shrink: 0; }
 .agent-btn[hidden] { display: none; }
 .history-error { color: #ff8d98; font-size: 11px; overflow-wrap: anywhere; }
 .history-error:empty { display: none; }
@@ -867,7 +836,6 @@ input[type='range'] { accent-color: var(--accent); }
 .history-retention { margin: 0; }
 [data-guide-id='dialog.history'] .modal-footer { flex-direction: column; align-items: stretch; gap: 4px; }
 @media (max-width: 520px) {
-  .agent-activity-panel { flex-wrap: wrap; }
   .history-row-head { align-items: flex-start; }
   .history-row-head .agent-btn { max-width: 112px; white-space: normal; }
 }

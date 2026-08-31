@@ -19,7 +19,7 @@ describe('ReplayStore', () => {
     const snapshot = store.snapshot()
     snapshot[0].notes![0].midi = 20
     await store.replay(id)
-    expect(executors.play).toHaveBeenCalledWith(notes, expect.any(AbortSignal))
+    expect(executors.play).toHaveBeenCalledWith(notes, expect.any(AbortSignal), 'human')
     expect(store.snapshot()).toHaveLength(1)
     expect(store.snapshot()[0]).toMatchObject({ id, status: 'completed', soundEntryId: 'sound-2' })
     expect(store.latestPerformanceId()).toBe(id)

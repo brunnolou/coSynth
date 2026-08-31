@@ -16,10 +16,7 @@ const app = document.getElementById('app')!
 const guide = new UiGuideController(app)
 const services = createHistoryServices(engine, guide)
 const disposeApp = buildApp(engine, app, services)
-const disposeInteractions = bindHistoryInteractions(app, services.history, error => {
-  const action = agentActivity.startAction('navigate_history')
-  agentActivity.failAction(action, 'navigate_history', error)
-})
+const disposeInteractions = bindHistoryInteractions(app, services.history, error => agentActivity.reportHumanError(error))
 
 // Browsers require a user gesture before audio can start.
 const overlay = document.createElement('div')
@@ -39,7 +36,11 @@ guideTarget(overlay.querySelector<HTMLButtonElement>('#start-btn')!, 'button.aud
 let starting = false
 let webMcp: ReturnType<typeof registerWebMcpTools> | null = null
 let audioWebMcp: ReturnType<typeof registerWebMcpTools> | null = null
-const updateReadiness = () => agentActivity.setToolReadiness((webMcp?.registeredCount ?? 0) + (audioWebMcp?.registeredCount ?? 0), !audioWebMcp)
+const updateReadiness = () => agentActivity.setToolReadiness(
+  (webMcp?.registeredCount ?? 0) + (audioWebMcp?.registeredCount ?? 0), !engine.running,
+  { available: webMcp?.available ?? false, registering: !!(webMcp?.pending || audioWebMcp?.pending),
+    errors: [...(webMcp?.errors ?? []), ...(audioWebMcp?.errors ?? [])] }
+)
 const start = async () => {
   if (starting) return
   starting = true
@@ -47,7 +48,8 @@ const start = async () => {
     await engine.start()
     if (!audioWebMcp) {
       audioWebMcp = registerWebMcpTools(engine, undefined, { audioTools: 'only', services })
-      if (document.modelContext) void audioWebMcp.ready.then(updateReadiness)
+      updateReadiness()
+      void audioWebMcp.ready.then(updateReadiness)
     }
     overlay.remove()
   } catch (err) {
@@ -74,7 +76,8 @@ window.addEventListener('keydown', startFromKey)
 // Progressive enhancement: WebMCP registration must never block synth startup.
 try {
   webMcp = registerWebMcpTools(engine, undefined, { audioTools: 'exclude', guide, services })
-  if (document.modelContext) void webMcp.ready.then(updateReadiness)
+  updateReadiness()
+  void webMcp.ready.then(updateReadiness)
   bindWebMcpLifecycle({
     ready: webMcp.ready,
     dispose() {
@@ -89,5 +92,7 @@ try {
     }
   }, window, import.meta.hot)
 } catch (error) {
+  agentActivity.setToolReadiness(0, !engine.running, { available: !!document.modelContext,
+    errors: [{ tool: 'WebMCP', message: error instanceof Error ? error.message : String(error) }] })
   console.warn('WebMCP is unavailable:', error)
 }

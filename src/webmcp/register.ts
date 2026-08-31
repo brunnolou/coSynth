@@ -1,5 +1,5 @@
 import type { SynthEngine } from '../audio/engine'
-import { agentActivityFor, type AgentActivityStore } from './activity'
+import { agentActivityFor, type AgentActivityStore, type ToolRegistrationError } from './activity'
 import { createWebMcpTools } from './tools'
 import { createGuideTools, type GuideService } from './guide-tools'
 import { createHistoryTools } from './history-tools'
@@ -9,6 +9,9 @@ import { validateGuide } from '../ui/guide'
 export interface WebMcpRegistration {
   ready: Promise<void>
   readonly registeredCount: number
+  readonly available: boolean
+  readonly pending: boolean
+  readonly errors: readonly ToolRegistrationError[]
   dispose(): void
 }
 
@@ -62,12 +65,19 @@ export function registerWebMcpTools(
 ): WebMcpRegistration {
   const controller = new AbortController()
   if (!modelContext) {
-    return { ready: Promise.resolve(), registeredCount: 0, dispose: () => controller.abort() }
+    return { ready: Promise.resolve(), registeredCount: 0, available: false, pending: false, errors: [], dispose: () => controller.abort() }
   }
 
   const audioTools = options.audioTools ?? 'include'
   const activity = agentActivityFor(engine)
   let registeredCount = 0
+  let pending = true
+  const errors: ToolRegistrationError[] = []
+  const failed = (tool: string, error: unknown) => {
+    if (controller.signal.aborted) return
+    errors.push({ tool, message: error instanceof Error ? error.message : String(error) })
+    console.warn(`WebMCP tool registration failed (${tool}):`, error)
+  }
   const services = options.services
   const tools = [...createWebMcpTools(engine, controller.signal, services ? {
     performance: services.performance, replays: services.replays,
@@ -81,16 +91,19 @@ export function registerWebMcpTools(
     try {
       return Promise.resolve(modelContext.registerTool(tool, { signal: controller.signal }))
         .then(() => { if (!controller.signal.aborted) registeredCount++ })
-        .catch(error => console.warn(`WebMCP tool registration failed (${tool.name}):`, error))
+        .catch(error => failed(tool.name, error))
     } catch (error) {
-      console.warn(`WebMCP tool registration failed (${tool.name}):`, error)
+      failed(tool.name, error)
       return Promise.resolve()
     }
   })
 
   return {
-    ready: Promise.all(registrations).then(() => undefined),
+    ready: Promise.all(registrations).then(() => { pending = false }),
     get registeredCount() { return registeredCount },
+    available: true,
+    get pending() { return pending },
+    get errors() { return errors.map(error => ({ ...error })) },
     dispose: () => controller.abort()
   }
 }

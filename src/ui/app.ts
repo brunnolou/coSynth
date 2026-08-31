@@ -314,7 +314,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   main.append(oscCol, centerCol, sideCol)
   const agentActivity = new AgentActivityPanel(engine, services)
   const keyboard = new Keyboard(engine)
-  container.append(header, main, agentActivity.root, performancePanel, keyboard.root, midiDialog.root)
+  container.append(header, agentActivity.root, main, performancePanel, keyboard.root, midiDialog.root)
   const highlights = new AgentHighlights(container, agentActivityFor(engine))
 
   initMidi(engine, status => {

@@ -1,19 +1,17 @@
 import type { SynthEngine } from '../audio/engine'
 import type { HistoryServices, ReplayEntry, SoundEntrySummary } from '../history/types'
-import { agentActivityFor, type AgentActivitySnapshot } from '../webmcp/activity'
+import { agentActivityFor, type AgentActivitySnapshot, type AgentActivityStore } from '../webmcp/activity'
 import { el } from './common'
 import { ModalDialog } from './dialog'
 import { guideTarget } from './guide-target'
-import { Undo2, Redo2, History as HistoryIcon, Play, Square, createElement } from 'lucide'
+import { Undo2, Redo2, History as HistoryIcon, Play, Square } from 'lucide'
 import { changeSummary } from './agent-change-summary'
+import { iconButton, setButtonIcon } from './icon-button'
+import { AgentStatus, actionSentence, readinessSentence } from './agent-status'
 
-function button(label: string, icon?: typeof Play): HTMLButtonElement {
+function button(label: string): HTMLButtonElement {
   const node = el('button', 'agent-btn', label)
   node.type = 'button'
-  if (icon) {
-    node.classList.add('agent-btn-icon')
-    node.prepend(createElement(icon, { width: 14, height: 14, 'aria-hidden': 'true', focusable: 'false' }))
-  }
   return node
 }
 
@@ -22,17 +20,20 @@ interface HistoryRow { root: HTMLElement; label: HTMLElement; meta: HTMLElement;
 /** One view for human and AI edits, with a separate list of replayable actions. */
 export class AgentActivityPanel {
   readonly root = el('section', 'panel agent-activity-panel')
-  private readonly undo = button('Undo', Undo2)
-  private readonly redo = button('Redo', Redo2)
-  private readonly play = button('Play again', Play)
-  private readonly toolStatus = el('span', 'agent-tool-status', 'Checking agent tools…')
-  private readonly lastAction = el('span', 'agent-last-action', 'No agent activity yet')
-  private readonly error = el('span', 'history-error')
+  private readonly undo = iconButton('Undo', Undo2)
+  private readonly redo = iconButton('Redo', Redo2)
+  private readonly play = iconButton('Play again', Play)
+  private readonly indicator: AgentStatus
+  private readonly activity: AgentActivityStore
   private readonly dialogError = el('span', 'history-error')
   private readonly dialog = new ModalDialog('History', 'history')
-  private readonly review = button('AI changes')
-  private readonly showChanges = el('input')
-  private readonly reviewDialog = new ModalDialog('Pending AI changes', 'agent-changes')
+  private readonly reviewDialog = new ModalDialog('AI activity', 'agent-changes')
+  private readonly readiness = el('p', 'agent-empty')
+  private readonly activityError = el('p', 'history-error')
+  private readonly toolLog = el('details', 'agent-tool-log')
+  private readonly toolLogSummary = el('summary', '', 'Tool calls (0)')
+  private readonly toolLogList = el('ol', 'agent-tool-log-list')
+  private logSignature = ''
   private readonly changeCount = el('h3', 'agent-section-title')
   private readonly changeList = el('div', 'agent-param-list')
   private readonly comparison = el('div', 'agent-modal-section')
@@ -56,9 +57,11 @@ export class AgentActivityPanel {
   private disposed = false
 
   constructor(engine: SynthEngine, private readonly services: HistoryServices) {
-    const activity = agentActivityFor(engine)
+    const activity = this.activity = agentActivityFor(engine)
     this.state = activity.snapshot()
-    const open = button('History', HistoryIcon)
+    const open = iconButton('History', HistoryIcon)
+    this.indicator = new AgentStatus(engine, this.state,
+      () => activity.setShowChanges(!this.state.showChanges), () => this.reviewDialog.open())
     guideTarget(this.root, 'panel.agent', 'History and agent activity', 'panel')
     for (const [node, id, label] of [
       [this.undo, 'undo', 'Undo sound edit'], [this.redo, 'redo', 'Redo sound edit'],
@@ -73,35 +76,30 @@ export class AgentActivityPanel {
       if (services.performance.active) this.run(() => services.performance.stop())
       else {
         const id = services.replays.latestPerformanceId()
-        if (id) this.run(() => services.replays.replay(id))
+        // This is an explicit human action. Do not let replay provenance inherit
+        // from the original AI-created performance.
+        if (id) this.run(() => services.replays.replay(id, undefined, 'human'))
       }
     })
-    const summary = el('div', 'agent-activity-summary')
-    summary.append(this.toolStatus, this.lastAction)
     const actions = el('div', 'agent-activity-actions')
+    actions.setAttribute('role', 'group')
+    actions.setAttribute('aria-label', 'History and playback')
     actions.append(this.undo, this.redo, open, this.play)
-    const showLabel = el('label', 'agent-show-changes')
-    this.showChanges.type = 'checkbox'
-    this.showChanges.checked = this.state.showChanges
-    this.showChanges.addEventListener('change', () => activity.setShowChanges(this.showChanges.checked))
-    showLabel.append(this.showChanges, document.createTextNode('Show changes'))
-    guideTarget(this.review, 'button.agent.checkpoint', 'Review pending AI changes', 'button')
-    this.review.addEventListener('click', () => this.reviewDialog.open())
     this.keep.addEventListener('click', () => {
       if (activity.acceptCheckpoint()) this.reviewDialog.close()
     })
     this.reject.addEventListener('click', () => {
       if (activity.restoreCheckpoint()) this.reviewDialog.close()
     })
-    this.reviewDialog.body.append(
+    this.toolLog.append(this.toolLogSummary, el('p', 'agent-empty', 'Latest 100 tool calls, kept in this tab until reload.'), this.toolLogList)
+    this.reviewDialog.body.append(this.readiness, this.activityError,
       el('p', '', 'Reject undoes only pending AI changes and adds one sound-history entry. Your manual edits are kept. Editing a route, LFO shape, or FX order makes that whole unit yours.'),
-      this.changeCount, this.changeList, this.comparison
+      this.changeCount, this.changeList, this.comparison, this.toolLog
     )
     this.reviewDialog.footer.append(this.keep, this.reject)
-    actions.append(showLabel, this.review)
-    this.error.setAttribute('role', 'alert')
+    this.activityError.setAttribute('role', 'alert')
     this.dialogError.setAttribute('role', 'alert')
-    this.root.append(actions, summary, this.error, this.dialog.root, this.reviewDialog.root)
+    this.root.append(actions, this.indicator.root, this.dialog.root, this.reviewDialog.root)
 
     const tabs = el('div', 'history-tabs')
     tabs.setAttribute('role', 'tablist')
@@ -143,6 +141,7 @@ export class AgentActivityPanel {
     for (const unsubscribe of this.disposeListeners) unsubscribe()
     this.dialog.close()
     this.reviewDialog.close()
+    this.indicator.dispose()
   }
 
   private selectTab(tab: 'sound' | 'replays'): void {
@@ -159,14 +158,16 @@ export class AgentActivityPanel {
   }
 
   private run(action: () => Promise<unknown>): void {
-    this.error.textContent = ''
     this.dialogError.textContent = ''
     // Do not lock Stop behind a playback promise that resolves only when audio ends.
     this.pending++
     this.render()
     void Promise.resolve().then(action).catch(error => {
       if (error instanceof Error && error.name === 'AbortError') return
-      if (!this.disposed) this.error.textContent = this.dialogError.textContent = error instanceof Error ? error.message : String(error)
+      if (!this.disposed) {
+        this.dialogError.textContent = error instanceof Error ? error.message : String(error)
+        this.activity.reportHumanError(error)
+      }
     }).finally(() => {
       this.pending--
       if (!this.disposed) this.render()
@@ -182,17 +183,11 @@ export class AgentActivityPanel {
     this.undo.disabled = !view.canUndo || busy
     this.redo.disabled = !view.canRedo || busy
     const playLabel = performance.active ? 'Stop' : 'Play again'
-    if (this.play.textContent !== playLabel) {
-      this.play.replaceChildren(createElement(performance.active ? Square : Play,
-        { width: 14, height: 14, 'aria-hidden': 'true', focusable: 'false' }), document.createTextNode(playLabel))
-    }
+    if (this.play.getAttribute('aria-label') !== playLabel) setButtonIcon(this.play, playLabel, performance.active ? Square : Play)
     const hasPerformance = !!replays.latestPerformanceId()
     this.play.hidden = !performance.active && !hasPerformance
     this.play.disabled = !performance.active && (this.pending > 0 || !hasPerformance || busy)
-    this.toolStatus.textContent = this.state.readyTools === 0 ? 'Agent tools unavailable'
-      : `${this.state.readyTools} tools ready${this.state.audioToolsLocked ? ' · Start audio to unlock 2' : ''}`
-    this.lastAction.textContent = this.state.lastAction ? `${this.state.lastAction.label} · ${this.state.lastAction.summary}` : 'No agent activity yet'
-    this.lastAction.dataset.status = this.state.lastAction?.status ?? 'idle'
+    this.indicator.update(this.state, performance.aiPlaying)
     this.retention.textContent = `In memory only · Up to 120 entries per tab · Older assets: ${(view.retainedAssetBytes / 1048576).toFixed(1)} / 128 MiB · Reload clears history.`
     const ids = new Set(view.entries.map(entry => entry.id))
     for (const [id, row] of this.soundRows) if (!ids.has(id)) { row.root.remove(); this.soundRows.delete(id) }
@@ -215,7 +210,7 @@ export class AgentActivityPanel {
       if (!row) {
         row = this.createRow(() => {
           this.dialog.close()
-          this.run(() => this.services.replays.replay(entry.id))
+          this.run(() => this.services.replays.replay(entry.id, undefined, 'human'))
         }, entry.kind === 'guide' ? 'Open walkthrough' : 'Play again')
         this.replayRows.set(entry.id, row)
       }
@@ -227,9 +222,21 @@ export class AgentActivityPanel {
 
   private renderReview(busy: boolean): void {
     const count = this.state.pendingChanges.length
-    this.review.textContent = count ? `${count} change${count === 1 ? '' : 's'}` : 'AI changes'
-    this.review.disabled = !count && !this.state.comparison
-    this.showChanges.checked = this.state.showChanges
+    this.readiness.textContent = readinessSentence(this.state)
+    this.activityError.textContent = [this.state.lastError?.summary,
+      this.state.lastAction?.tool === 'human_checkpoint' && this.state.lastAction.status === 'failed' ? this.state.lastAction.summary : null,
+      ...this.state.registrationErrors.map(error => `${error.tool}: ${error.message}`)].filter(Boolean).join('\n')
+    const logSignature = JSON.stringify(this.state.actions)
+    if (logSignature !== this.logSignature) {
+      this.logSignature = logSignature
+      this.toolLogSummary.textContent = `Tool calls (${this.state.actions.length})`
+      this.toolLogList.replaceChildren(...[...this.state.actions].reverse().map(action => {
+        const row = el('li', 'agent-tool-call', actionSentence(action))
+        row.dataset.actionId = String(action.id)
+        row.dataset.status = action.status
+        return row
+      }))
+    }
     this.keep.disabled = this.reject.disabled = !count || busy
     const signature = JSON.stringify([this.state.pendingChanges, this.state.comparison])
     if (signature === this.reviewSignature) return
@@ -239,6 +246,7 @@ export class AgentActivityPanel {
       ? this.state.pendingChanges.map(change => el('div', 'agent-field', changeSummary(change)))
       : [el('span', 'agent-empty', 'No pending AI changes.')]))
     this.comparison.replaceChildren(el('h3', 'agent-section-title', 'Latest comparison'))
+    this.comparison.hidden = !this.state.comparison
     if (!this.state.comparison) this.comparison.append(el('p', 'agent-empty', 'No comparison result yet.'))
     else {
       this.comparison.append(el('p', '', `${Math.round(this.state.comparison.similarity * 100)}% similarity`))

@@ -5,6 +5,53 @@ afterEach(() => vi.useRealTimers())
 const notes = [{ midi: 60, velocity: 0.8, start: 0, duration: 1 }]
 
 describe('PerformanceManager', () => {
+  it('reports playback separately from the longer render/analysis operation', async () => {
+    const manager = new PerformanceManager()
+    const states: boolean[] = []
+    manager.subscribe(() => states.push(manager.playing))
+    let finishNotes!: () => void
+    let finishAnalysis!: () => void
+    const notesDone = new Promise<void>(resolve => { finishNotes = resolve })
+    const analysisDone = new Promise<void>(resolve => { finishAnalysis = resolve })
+    const operation = manager.run(async () => {
+      await manager.trackPlayback(() => notesDone)
+      await analysisDone
+    })
+    await Promise.resolve()
+    expect(manager.playing).toBe(true)
+    finishNotes()
+    await notesDone
+    await Promise.resolve()
+    expect(manager.playing).toBe(false)
+    expect(manager.aiPlaying).toBe(false)
+    expect(manager.active).toBe(true)
+    finishAnalysis()
+    await operation
+    expect(states).toEqual([false, true, false, false])
+    await expect(manager.trackPlayback(async () => { throw new Error('Stopped') })).rejects.toThrow('Stopped')
+    expect(manager.playing).toBe(false)
+  })
+
+  it('tracks AI playback separately from manual playback', async () => {
+    const manager = new PerformanceManager()
+    let finishAi!: () => void
+    let finishHuman!: () => void
+    const ai = new Promise<void>(resolve => { finishAi = resolve })
+    const human = new Promise<void>(resolve => { finishHuman = resolve })
+    const aiTask = manager.trackPlayback(() => ai, 'ai')
+    const humanTask = manager.trackPlayback(() => human)
+    expect(manager.playing).toBe(true)
+    expect(manager.aiPlaying).toBe(true)
+    finishAi()
+    await aiTask
+    expect(manager.playing).toBe(true)
+    expect(manager.aiPlaying).toBe(false)
+    finishHuman()
+    await humanTask
+    expect(manager.playing).toBe(false)
+    expect(manager.aiPlaying).toBe(false)
+  })
+
   it('shares one lock and waits for cancellation cleanup before releasing it', async () => {
     const manager = new PerformanceManager()
     const state = vi.fn()

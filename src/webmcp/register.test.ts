@@ -15,6 +15,9 @@ describe('registerWebMcpTools', () => {
     await expect(registration.ready).resolves.toBeUndefined()
     expect(() => registration.dispose()).not.toThrow()
     expect(registration.registeredCount).toBe(0)
+    expect(registration.available).toBe(false)
+    expect(registration.pending).toBe(false)
+    expect(registration.errors).toEqual([])
   })
 
   it('registers each of the eleven tools exactly once with a shared lifecycle signal', async () => {
@@ -83,6 +86,12 @@ describe('registerWebMcpTools', () => {
     const registration = registerWebMcpTools(engine, modelContext)
     await expect(registration.ready).resolves.toBeUndefined()
     expect(registration.registeredCount).toBe(9)
+    expect(registration.available).toBe(true)
+    expect(registration.pending).toBe(false)
+    expect(registration.errors).toEqual(expect.arrayContaining([
+      { tool: 'get_parameter_schema', message: 'sync failure' },
+      { tool: 'set_modulation', message: 'async failure' }
+    ]))
     expect(attempted).toHaveLength(11)
     expect(warn).toHaveBeenCalledTimes(2)
     warn.mockRestore()

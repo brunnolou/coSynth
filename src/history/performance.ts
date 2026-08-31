@@ -1,4 +1,4 @@
-import type { PerformanceNote, PerformanceService } from './types'
+import type { PerformanceNote, PerformanceService, PlaybackOrigin } from './types'
 
 export function performanceAbortError(): Error {
   const error = new Error('Execution aborted')
@@ -10,8 +10,23 @@ export function performanceAbortError(): Error {
 export class PerformanceManager implements PerformanceService {
   private operation: { controller: AbortController; done: Promise<unknown> } | null = null
   private readonly listeners = new Set<() => void>()
+  private playingCount = 0
+  private aiPlayingCount = 0
 
   get active(): boolean { return this.operation !== null }
+  get playing(): boolean { return this.playingCount > 0 }
+  get aiPlaying(): boolean { return this.aiPlayingCount > 0 }
+  async trackPlayback<T>(task: () => Promise<T>, origin: PlaybackOrigin = 'human'): Promise<T> {
+    this.playingCount++
+    if (origin === 'ai') this.aiPlayingCount++
+    this.emit()
+    try { return await task() }
+    finally {
+      this.playingCount--
+      if (origin === 'ai') this.aiPlayingCount--
+      this.emit()
+    }
+  }
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener)
     return () => this.listeners.delete(listener)
