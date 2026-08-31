@@ -16,6 +16,7 @@ class MemoryStorage implements Storage {
 }
 
 class FakeEngine {
+  onPatchChange = vi.fn(() => () => {})
   values = defaultValues()
   modSlots: (ModSlotState | null)[] = new Array(MAX_MOD_SLOTS).fill(null)
   lfoShapes = Array.from({ length: 8 }, () => defaultLfoShape())

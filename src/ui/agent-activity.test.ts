@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { AgentActivityPanel } from './agent-activity'
-import type { SynthEngine } from '../audio/engine'
+import { SynthEngine } from '../audio/engine'
 import type { HistoryServices, ReplayEntry, SoundHistoryView } from '../history/types'
 
 let panel: AgentActivityPanel
@@ -29,7 +29,7 @@ beforeEach(() => {
     replays: { snapshot: () => replays, subscribe, latestPerformanceId: () => [...replays].reverse().find(entry => entry.kind === 'performance')?.id, replay: vi.fn().mockResolvedValue(undefined) },
     performance: { get active() { return performing }, subscribe, stop: vi.fn().mockResolvedValue(undefined) }
   }
-  panel = new AgentActivityPanel({} as SynthEngine, services)
+  panel = new AgentActivityPanel(new SynthEngine(), services)
   document.body.append(panel.root)
 })
 afterEach(() => { panel.dispose(); document.body.replaceChildren(); listeners.clear(); vi.restoreAllMocks() })

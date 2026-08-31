@@ -137,6 +137,12 @@ Use `Cmd/Ctrl+Z` to undo, `Cmd/Ctrl+Shift+Z` to redo, or `Ctrl+Y` on Windows/Lin
 
 Sound snapshots preserve modulation slot identities, LFO shapes, FX order, imported wavetables, and imported noise samples. They do not restore playing notes, oscillator phase, effect tails, or UI navigation. Shared imported assets retained only by old versions have a 128 MiB cap; oldest states are evicted when the count or byte limit is exceeded. The current sound is never evicted. History is memory-only and clears on reload or lifecycle disposal; ordinary bfcache navigation preserves it. Preset files/storage are unchanged and storage writes are not undoable.
 
+### Pending AI changes
+
+Dots identify net AI changes. A new visible change appears in the center for one second, then moves and shrinks over 600 ms into a single static circle at the top left, using `cubic-bezier(0, .85, .6, 1)` easing. Each dot stays hidden until its individual animation starts; batch start times are scattered across a 500 ms window. Reduced motion shows the static marker immediately. **Show changes** hides the dots without discarding pending changes. Open the change-count button to review before/after values and the latest comparison. Keep accepts the iteration; Reject restores only AI-owned parameters, modulation slots, LFO shapes, and FX order, preserving manual edits. Reject adds one undoable sound-history entry. Keep does not change the sound or add a history entry.
+
+A manual edit takes ownership of that parameter or structural unit and removes its dot. Undo restores the previous sound and its AI attribution; Redo restores the manual edit and removes the dot again. Restored markers do not replay the arrival animation. Loading a preset manually clears the current iteration, and undoing that load restores the previous attribution. Keep acknowledges the pending iteration across retained history, so navigation will not revive accepted markers. Review is unavailable during playback, recording, history navigation, or an active editing gesture. Tracking and visibility preferences remain session-local.
+
 Example AI workflow:
 
 ```js

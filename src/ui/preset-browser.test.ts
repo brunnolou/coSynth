@@ -60,10 +60,13 @@ describe('compact preset browser', () => {
     expect(engine.loadPreset).toHaveBeenCalledTimes(4)
   })
 
-  it('keeps direct selection working', () => {
+  it('focuses Next after direct selection without advancing twice', () => {
+    select().focus()
     select().value = 'factory:Reese Bass'
     select().dispatchEvent(new Event('change'))
     expect(engine.loadPreset).toHaveBeenLastCalledWith(expect.objectContaining({ name: 'Reese Bass' }))
+    expect(engine.loadPreset).toHaveBeenCalledOnce()
+    expect(document.activeElement).toBe(button('Next preset'))
     button('Next preset').click()
     expect(select().value).toBe('factory:Acid Squelch')
   })

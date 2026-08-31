@@ -21,6 +21,8 @@ import { OscWavePreview } from './osc-wave-preview'
 import { ModalDialog } from './dialog'
 import { guideTarget } from './guide-target'
 import type { HistoryServices } from '../history/types'
+import { AgentHighlights } from './agent-highlights'
+import { agentActivityFor } from '../webmcp/activity'
 
 export function buildApp(engine: SynthEngine, container: HTMLElement, services: HistoryServices): () => void {
   engine.primeTables()
@@ -234,6 +236,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   const lfoSelector = el('div', 'sub-tabs')
   const lfoEditor = new LfoEditor(engine, 0)
   guideTarget(lfoEditor.root, 'visualizer.lfo', 'Selected LFO shape', 'visualizer')
+  lfoEditor.root.dataset.aiTarget = 'lfo.0'
   const lfoKnobArea = el('div')
   let currentLfo = 1
   const renderLfoKnobs = () => {
@@ -256,6 +259,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
       currentLfo = l
       lfoBtns.forEach((x, i) => x.classList.toggle('on', i === l - 1))
       lfoEditor.setLfo(l - 1)
+      lfoEditor.root.dataset.aiTarget = `lfo.${l - 1}`
       renderLfoKnobs()
     })
     lfoBtns.push(b)
@@ -311,6 +315,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   const agentActivity = new AgentActivityPanel(engine, services)
   const keyboard = new Keyboard(engine)
   container.append(header, main, agentActivity.root, performancePanel, keyboard.root, midiDialog.root)
+  const highlights = new AgentHighlights(container, agentActivityFor(engine))
 
   initMidi(engine, status => {
     midiLabel.textContent = status.text
@@ -343,6 +348,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   return () => {
     cancelKnobDrag(container.ownerDocument)
     cancelAnimationFrame(frame)
+    highlights.dispose()
     agentActivity.dispose()
     keyboard.dispose()
     matrix.dispose()

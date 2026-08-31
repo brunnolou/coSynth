@@ -1,0 +1,97 @@
+@property --ai-glow-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@property --ai-dot-x {
+  syntax: '<length-percentage>';
+  inherits: false;
+  initial-value: 6px;
+}
+@property --ai-dot-y {
+  syntax: '<length-percentage>';
+  inherits: false;
+  initial-value: 6px;
+}
+@property --ai-dot-radius {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 3px;
+}
+@property --ai-dot-spread {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 0px;
+}
+
+/* Element-bound backgrounds also work on native selects and inputs.
+   The colored lobes meet at one center to become a single static circle. */
+.ai-changed {
+  --ai-glow-x: calc(var(--ai-dot-x) + cos(var(--ai-glow-angle)) * var(--ai-dot-spread));
+  --ai-glow-y: calc(var(--ai-dot-y) + sin(var(--ai-glow-angle)) * var(--ai-dot-spread));
+  --ai-glow-x2: calc(var(--ai-dot-x) + cos(var(--ai-glow-angle) + 120deg) * var(--ai-dot-spread));
+  --ai-glow-y2: calc(var(--ai-dot-y) + sin(var(--ai-glow-angle) + 120deg) * var(--ai-dot-spread));
+  --ai-glow-x3: calc(var(--ai-dot-x) + cos(var(--ai-glow-angle) + 240deg) * var(--ai-dot-spread));
+  --ai-glow-y3: calc(var(--ai-dot-y) + sin(var(--ai-glow-angle) + 240deg) * var(--ai-dot-spread));
+  background-image:
+    radial-gradient(circle at var(--ai-dot-x) var(--ai-dot-y), #ffffffb3 0, #ffffff40 calc(var(--ai-dot-radius) * .25), transparent calc(var(--ai-dot-radius) * .65)),
+    radial-gradient(circle at var(--ai-glow-x) var(--ai-glow-y), cyan 0, #00ffff80 calc(var(--ai-dot-radius) * .5), transparent var(--ai-dot-radius)),
+    radial-gradient(circle at var(--ai-glow-x2) var(--ai-glow-y2), tomato 0, #ff634780 calc(var(--ai-dot-radius) * .5), transparent var(--ai-dot-radius)),
+    radial-gradient(circle at var(--ai-glow-x3) var(--ai-glow-y3), #b84dff 0, #80008080 calc(var(--ai-dot-radius) * .6), transparent var(--ai-dot-radius)),
+    radial-gradient(circle at var(--ai-dot-x) var(--ai-dot-y), #00ffff40 0, #b84dff30 var(--ai-dot-radius), transparent calc(var(--ai-dot-radius) * 1.6));
+}
+.ai-changed.ai-change-pulse {
+  /* Hide only the marker while waiting for this element's delay. */
+  background-size: 0 0;
+  background-repeat: no-repeat;
+  animation: ai-change-dot 1600ms linear var(--ai-change-delay, 0ms) forwards;
+}
+.ai-changed:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@keyframes ai-change-dot {
+  0%, 100% { background-size: 100% 100%; }
+  0%, 62.5% {
+    --ai-dot-x: 50%;
+    --ai-dot-y: 50%;
+    --ai-dot-radius: 7px;
+    --ai-dot-spread: 3px;
+  }
+  0% { --ai-glow-angle: 0deg; }
+  62.5% { --ai-glow-angle: 360deg; animation-timing-function: cubic-bezier(0, .85, .6, 1); }
+  100% {
+    --ai-dot-x: 6px;
+    --ai-dot-y: 6px;
+    --ai-dot-radius: 3px;
+    --ai-dot-spread: 0px;
+    --ai-glow-angle: 360deg;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ai-changed.ai-change-pulse { animation: none; background-size: auto; }
+}
+.ai-change-descriptions {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.ai-change-tooltip {
+  position: fixed;
+  z-index: 100;
+  max-width: min(360px, calc(100vw - 16px));
+  max-height: min(240px, calc(100vh - 16px));
+  overflow: hidden;
+  padding: 8px;
+  border: 1px solid #dbe9ff80;
+  border-radius: 5px;
+  background: #171b23;
+  color: #e8eaf0;
+  font-size: 11px;
+  white-space: pre-line;
+  pointer-events: none;
+}
+.agent-show-changes { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }

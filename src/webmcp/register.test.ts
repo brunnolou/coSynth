@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { registerWebMcpTools } from './register'
 import { agentActivityFor } from './activity'
-import type { SynthEngine } from '../audio/engine'
+import { SynthEngine } from '../audio/engine'
 
-const engine = {} as SynthEngine
+const engine = new SynthEngine()
 
 function context(registerTool: (tool: WebMCP.ModelContextTool, options?: WebMCP.ModelContextRegisterToolOptions) => Promise<void> | void) {
   return { registerTool } as unknown as WebMCP.ModelContext
@@ -90,7 +90,7 @@ describe('registerWebMcpTools', () => {
 
   it('registers injected teaching tools before audio without patch checkpoints', async () => {
     const calls: WebMCP.ModelContextTool[] = []
-    const engine = {} as SynthEngine
+    const engine = new SynthEngine()
     const guide = { show: vi.fn(() => ({ shown: true, stepCount: 1, warnings: [] })), listTargets: vi.fn(() => ({ items: [], total: 0, offset: 0, limit: 5 })) }
     const registration = registerWebMcpTools(engine, context(tool => { calls.push(tool) }), { audioTools: 'exclude', guide })
     await registration.ready

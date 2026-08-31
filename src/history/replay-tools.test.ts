@@ -9,6 +9,7 @@ function setup() {
   const performance = new PerformanceManager()
   const heldNotes = new Set<number>()
   const engine = {
+    onPatchChange: vi.fn(() => () => {}),
     running: true, heldNotes,
     ctx: { sampleRate: 8000 },
     scopeL: new Float32Array([0, 0.2, -0.2, 0]), scopeR: new Float32Array([0, 0.2, -0.2, 0]),

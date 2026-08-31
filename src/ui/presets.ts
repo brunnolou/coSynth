@@ -575,7 +575,6 @@ export class PresetBrowser {
     this.select = el('select', 'param-select preset-select') as HTMLSelectElement
     this.select.setAttribute('aria-label', 'Preset')
     guideTarget(this.select, 'select.preset', 'Preset browser', 'select')
-    this.select.addEventListener('change', () => this.load(this.select.value))
 
     const iconButton = (label: string, icon: typeof Cog) => {
       const button = el('button', 'hdr-btn preset-icon-btn')
@@ -587,6 +586,10 @@ export class PresetBrowser {
     }
     const previous = iconButton('Previous preset', ChevronLeft)
     const next = iconButton('Next preset', ChevronRight)
+    this.select.addEventListener('change', () => {
+      this.load(this.select.value)
+      next.focus()
+    })
     previous.addEventListener('click', () => this.step(-1))
     next.addEventListener('click', () => this.step(1))
 
@@ -598,6 +601,7 @@ export class PresetBrowser {
     trigger.setAttribute('aria-label', 'Preset actions')
     trigger.setAttribute('aria-expanded', 'false')
     trigger.append(createElement(Cog, { width: 16, height: 16, 'aria-hidden': 'true' }))
+    guideTarget(trigger, 'button.preset.actions', 'Preset actions', 'button')
     const menu = el('div', 'preset-actions-menu')
     const closeActions = (restoreFocus = false) => {
       actions.open = false

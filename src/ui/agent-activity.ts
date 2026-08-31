@@ -5,6 +5,7 @@ import { el } from './common'
 import { ModalDialog } from './dialog'
 import { guideTarget } from './guide-target'
 import { Undo2, Redo2, History as HistoryIcon, Play, Square, createElement } from 'lucide'
+import { changeSummary } from './agent-change-summary'
 
 function button(label: string, icon?: typeof Play): HTMLButtonElement {
   const node = el('button', 'agent-btn', label)
@@ -29,6 +30,15 @@ export class AgentActivityPanel {
   private readonly error = el('span', 'history-error')
   private readonly dialogError = el('span', 'history-error')
   private readonly dialog = new ModalDialog('History', 'history')
+  private readonly review = button('AI changes')
+  private readonly showChanges = el('input')
+  private readonly reviewDialog = new ModalDialog('Pending AI changes', 'agent-changes')
+  private readonly changeCount = el('h3', 'agent-section-title')
+  private readonly changeList = el('div', 'agent-param-list')
+  private readonly comparison = el('div', 'agent-modal-section')
+  private readonly keep = button('Keep changes')
+  private readonly reject = button('Reject changes')
+  private reviewSignature = ''
   private readonly soundTab = button('Sound history')
   private readonly replayTab = button('Replays')
   private readonly soundList = el('div', 'history-list')
@@ -70,9 +80,28 @@ export class AgentActivityPanel {
     summary.append(this.toolStatus, this.lastAction)
     const actions = el('div', 'agent-activity-actions')
     actions.append(this.undo, this.redo, open, this.play)
+    const showLabel = el('label', 'agent-show-changes')
+    this.showChanges.type = 'checkbox'
+    this.showChanges.checked = this.state.showChanges
+    this.showChanges.addEventListener('change', () => activity.setShowChanges(this.showChanges.checked))
+    showLabel.append(this.showChanges, document.createTextNode('Show changes'))
+    guideTarget(this.review, 'button.agent.checkpoint', 'Review pending AI changes', 'button')
+    this.review.addEventListener('click', () => this.reviewDialog.open())
+    this.keep.addEventListener('click', () => {
+      if (activity.acceptCheckpoint()) this.reviewDialog.close()
+    })
+    this.reject.addEventListener('click', () => {
+      if (activity.restoreCheckpoint()) this.reviewDialog.close()
+    })
+    this.reviewDialog.body.append(
+      el('p', '', 'Reject undoes only pending AI changes and adds one sound-history entry. Your manual edits are kept. Editing a route, LFO shape, or FX order makes that whole unit yours.'),
+      this.changeCount, this.changeList, this.comparison
+    )
+    this.reviewDialog.footer.append(this.keep, this.reject)
+    actions.append(showLabel, this.review)
     this.error.setAttribute('role', 'alert')
     this.dialogError.setAttribute('role', 'alert')
-    this.root.append(actions, summary, this.error, this.dialog.root)
+    this.root.append(actions, summary, this.error, this.dialog.root, this.reviewDialog.root)
 
     const tabs = el('div', 'history-tabs')
     tabs.setAttribute('role', 'tablist')
@@ -113,6 +142,7 @@ export class AgentActivityPanel {
     this.disposed = true
     for (const unsubscribe of this.disposeListeners) unsubscribe()
     this.dialog.close()
+    this.reviewDialog.close()
   }
 
   private selectTab(tab: 'sound' | 'replays'): void {
@@ -148,6 +178,7 @@ export class AgentActivityPanel {
     const { history, replays, performance } = this.services
     const view = history.snapshot()
     const busy = view.navigating
+    this.renderReview(busy || view.gestureActive || performance.active || this.state.performanceActive)
     this.undo.disabled = !view.canUndo || busy
     this.redo.disabled = !view.canRedo || busy
     const playLabel = performance.active ? 'Stop' : 'Play again'
@@ -192,6 +223,29 @@ export class AgentActivityPanel {
     }
     this.placeRows(this.replayList, entries.map(entry => this.replayRows.get(entry.id)!.root))
     this.replayList.dataset.empty = entries.length ? '' : 'No saved performances or walkthroughs yet.'
+  }
+
+  private renderReview(busy: boolean): void {
+    const count = this.state.pendingChanges.length
+    this.review.textContent = count ? `${count} change${count === 1 ? '' : 's'}` : 'AI changes'
+    this.review.disabled = !count && !this.state.comparison
+    this.showChanges.checked = this.state.showChanges
+    this.keep.disabled = this.reject.disabled = !count || busy
+    const signature = JSON.stringify([this.state.pendingChanges, this.state.comparison])
+    if (signature === this.reviewSignature) return
+    this.reviewSignature = signature
+    this.changeCount.textContent = `Pending changes (${count})`
+    this.changeList.replaceChildren(...(count
+      ? this.state.pendingChanges.map(change => el('div', 'agent-field', changeSummary(change)))
+      : [el('span', 'agent-empty', 'No pending AI changes.')]))
+    this.comparison.replaceChildren(el('h3', 'agent-section-title', 'Latest comparison'))
+    if (!this.state.comparison) this.comparison.append(el('p', 'agent-empty', 'No comparison result yet.'))
+    else {
+      this.comparison.append(el('p', '', `${Math.round(this.state.comparison.similarity * 100)}% similarity`))
+      for (const [metric, value] of Object.entries(this.state.comparison.details)) {
+        this.comparison.append(el('div', 'history-comparison', `${metric}: ${value.candidate.toFixed(2)} (${value.delta >= 0 ? '+' : ''}${value.delta.toFixed(2)})`))
+      }
+    }
   }
 
   private createRow(onClick: () => void, actionLabel: string): HistoryRow {

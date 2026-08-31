@@ -1,6 +1,7 @@
 import { soundStateAssets, type SoundSnapshot, type SynthEngine } from '../audio/engine'
 import { PARAMS, formatValue } from '../shared/params'
 import type { UiGuideController } from '../ui/guide'
+import { agentActivityFor, type AgentAttribution } from '../webmcp/activity'
 import { HistoryStore } from './store'
 import { PerformanceManager, performNotes, assertNotesAvailable } from './performance'
 import { ReplayStore } from './replays'
@@ -20,9 +21,13 @@ function describeSoundChanges(before: SoundSnapshot, after: SoundSnapshot, chang
 
 export function createHistoryServices(engine: SynthEngine, guide: UiGuideController) {
   const performance = new PerformanceManager()
-  const history = new HistoryStore({
-    capture: () => engine.captureSoundState(),
-    restore: state => engine.restoreSoundState(state),
+  const activity = agentActivityFor(engine)
+  const history = new HistoryStore<SoundSnapshot & { attribution: AgentAttribution }>({
+    capture: () => ({ ...engine.captureSoundState(), attribution: activity.captureAttribution() }),
+    restore: state => {
+      engine.restoreSoundState(state)
+      activity.restoreAttribution(state.attribution)
+    },
     equal: equalSoundStates,
     assets: soundStateAssets,
     describe: describeSoundChanges,
@@ -33,9 +38,13 @@ export function createHistoryServices(engine: SynthEngine, guide: UiGuideControl
     play: async (notes, signal) => { assertNotesAvailable(engine, notes); await performNotes(engine, notes, signal) },
     showGuide: steps => { guide.show({ steps }) }
   })
+  activity.setReviewGuard(() => {
+    const state = history.snapshot()
+    return !performance.active && !state.navigating && !state.gestureActive
+  })
   return {
     history, replays, performance,
-    dispose() { history.dispose(); replays.dispose() }
+    dispose() { activity.setReviewGuard(() => false); history.dispose(); replays.dispose() }
   }
 }
 export type AppHistoryServices = ReturnType<typeof createHistoryServices>

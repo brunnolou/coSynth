@@ -85,6 +85,7 @@ try {
       disposeApp()
       services.dispose()
       guide.dispose()
+      agentActivity.dispose()
     }
   }, window, import.meta.hot)
 } catch (error) {
