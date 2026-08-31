@@ -4,10 +4,15 @@ import { agentActivityFor, type AgentActivitySnapshot } from '../webmcp/activity
 import { el } from './common'
 import { ModalDialog } from './dialog'
 import { guideTarget } from './guide-target'
+import { Undo2, Redo2, History as HistoryIcon, Play, Square, createElement } from 'lucide'
 
-function button(label: string): HTMLButtonElement {
+function button(label: string, icon?: typeof Play): HTMLButtonElement {
   const node = el('button', 'agent-btn', label)
   node.type = 'button'
+  if (icon) {
+    node.classList.add('agent-btn-icon')
+    node.prepend(createElement(icon, { width: 14, height: 14, 'aria-hidden': 'true', focusable: 'false' }))
+  }
   return node
 }
 
@@ -16,9 +21,9 @@ interface HistoryRow { root: HTMLElement; label: HTMLElement; meta: HTMLElement;
 /** One view for human and AI edits, with a separate list of replayable actions. */
 export class AgentActivityPanel {
   readonly root = el('section', 'panel agent-activity-panel')
-  private readonly undo = button('Undo')
-  private readonly redo = button('Redo')
-  private readonly play = button('Play again')
+  private readonly undo = button('Undo', Undo2)
+  private readonly redo = button('Redo', Redo2)
+  private readonly play = button('Play again', Play)
   private readonly toolStatus = el('span', 'agent-tool-status', 'Checking agent tools…')
   private readonly lastAction = el('span', 'agent-last-action', 'No agent activity yet')
   private readonly error = el('span', 'history-error')
@@ -43,7 +48,7 @@ export class AgentActivityPanel {
   constructor(engine: SynthEngine, private readonly services: HistoryServices) {
     const activity = agentActivityFor(engine)
     this.state = activity.snapshot()
-    const open = button('History')
+    const open = button('History', HistoryIcon)
     guideTarget(this.root, 'panel.agent', 'History and agent activity', 'panel')
     for (const [node, id, label] of [
       [this.undo, 'undo', 'Undo sound edit'], [this.redo, 'redo', 'Redo sound edit'],
@@ -145,8 +150,14 @@ export class AgentActivityPanel {
     const busy = view.navigating
     this.undo.disabled = !view.canUndo || busy
     this.redo.disabled = !view.canRedo || busy
-    this.play.textContent = performance.active ? 'Stop' : 'Play again'
-    this.play.disabled = !performance.active && (this.pending > 0 || !replays.latestPerformanceId() || busy)
+    const playLabel = performance.active ? 'Stop' : 'Play again'
+    if (this.play.textContent !== playLabel) {
+      this.play.replaceChildren(createElement(performance.active ? Square : Play,
+        { width: 14, height: 14, 'aria-hidden': 'true', focusable: 'false' }), document.createTextNode(playLabel))
+    }
+    const hasPerformance = !!replays.latestPerformanceId()
+    this.play.hidden = !performance.active && !hasPerformance
+    this.play.disabled = !performance.active && (this.pending > 0 || !hasPerformance || busy)
     this.toolStatus.textContent = this.state.readyTools === 0 ? 'Agent tools unavailable'
       : `${this.state.readyTools} tools ready${this.state.audioToolsLocked ? ' · Start audio to unlock 2' : ''}`
     this.lastAction.textContent = this.state.lastAction ? `${this.state.lastAction.label} · ${this.state.lastAction.summary}` : 'No agent activity yet'

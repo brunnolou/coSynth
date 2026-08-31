@@ -4,6 +4,7 @@ import { FILTER_TYPE_LABELS, paramIndex } from '../shared/params'
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
 import { Knob, sourceBadge, animatedKnobs } from './knob'
+import { cancelKnobDrag } from './knob-drag'
 import { bindEnabledState, paramSelect, paramToggle, knobRow } from './controls'
 import { EnvDisplay } from './enveditor'
 import { LfoEditor } from './lfoeditor'
@@ -340,6 +341,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   }
   frame = requestAnimationFrame(tick)
   return () => {
+    cancelKnobDrag(container.ownerDocument)
     cancelAnimationFrame(frame)
     agentActivity.dispose()
     keyboard.dispose()

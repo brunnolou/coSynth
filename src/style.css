@@ -838,6 +838,9 @@ input[type='range'] { accent-color: var(--accent); }
 
 /* Shared human/AI history. Keep controls stable while entries update. */
 .agent-activity-panel .agent-activity-actions { flex-wrap: wrap; }
+.agent-btn-icon { display: inline-flex; align-items: center; gap: 4px; }
+.agent-btn-icon svg { flex-shrink: 0; }
+.agent-btn[hidden] { display: none; }
 .history-error { color: #ff8d98; font-size: 11px; overflow-wrap: anywhere; }
 .history-error:empty { display: none; }
 .history-tabs { display: flex; gap: 4px; margin-bottom: 12px; }
