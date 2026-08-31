@@ -27,7 +27,7 @@
 
 /* Element-bound backgrounds also work on native selects and inputs.
    The colored lobes meet at one center to become a single static circle. */
-.ai-changed {
+.ai-changed, .agent-status-orb {
   --ai-glow-x: calc(var(--ai-dot-x) + cos(var(--ai-glow-angle)) * var(--ai-dot-spread));
   --ai-glow-y: calc(var(--ai-dot-y) + sin(var(--ai-glow-angle)) * var(--ai-dot-spread));
   --ai-glow-x2: calc(var(--ai-dot-x) + cos(var(--ai-glow-angle) + 120deg) * var(--ai-dot-spread));
@@ -94,4 +94,3 @@
   white-space: pre-line;
   pointer-events: none;
 }
-.agent-show-changes { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }

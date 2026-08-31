@@ -128,7 +128,7 @@ result may contain user-supplied metadata. Discovery responses are paginated to 
 
 ### Shared history and replay
 
-The compact strip provides **Undo**, **Redo**, **History**, and **Play again/Stop**, alongside tool readiness and the latest action. History has two tabs:
+The toolbar stays below the main navbar while the synth panels scroll. Undo, Redo, History, and Play again/Stop use icon-only buttons with accessible labels and tooltips. Macros and the keyboard stay at the bottom. History has two tabs:
 
 - **Sound history** retains 120 sound states shared by human and AI edits. Each drag or AI mutation call is one step; wheel and MIDI macro changes group after 300 ms inactivity. Restoring an earlier sound preserves later alternatives. Edit from there to create a new path, then expand **Earlier alternatives** to return to abandoned versions.
 - **Replays** retains 120 AI performances and walkthroughs independently of sound history. **Play again** auditions the same notes through the current sound. Closing a guide does not remove it; reopening starts at step one. Undo never consumes or clears replay entries.
@@ -139,9 +139,17 @@ Sound snapshots preserve modulation slot identities, LFO shapes, FX order, impor
 
 ### Pending AI changes
 
-Dots identify net AI changes. A new visible change appears in the center for one second, then moves and shrinks over 600 ms into a single static circle at the top left, using `cubic-bezier(0, .85, .6, 1)` easing. Each dot stays hidden until its individual animation starts; batch start times are scattered across a 500 ms window. Reduced motion shows the static marker immediately. **Show changes** hides the dots without discarding pending changes. Open the change-count button to review before/after values and the latest comparison. Keep accepts the iteration; Reject restores only AI-owned parameters, modulation slots, LFO shapes, and FX order, preserving manual edits. Reject adds one undoable sound-history entry. Keep does not change the sound or add a history entry.
+Dots identify net AI changes. A new visible change appears in the center for one second, then moves and shrinks over 600 ms into a single static circle at the top left, using `cubic-bezier(0, .85, .6, 1)` easing. Each dot stays hidden until its individual animation starts; batch start times are scattered across a 500 ms window. Reduced motion shows the static marker immediately. The Bot button toggles these markers without discarding pending changes or disabling AI tools. Click the adjacent status orb to review before/after values, the latest comparison, and tool activity. Keep accepts the iteration; Reject restores only AI-owned parameters, modulation slots, LFO shapes, and FX order, preserving manual edits. Reject adds one undoable sound-history entry. Keep does not change the sound or add a history entry.
 
-A manual edit takes ownership of that parameter or structural unit and removes its dot. Undo restores the previous sound and its AI attribution; Redo restores the manual edit and removes the dot again. Restored markers do not replay the arrival animation. Loading a preset manually clears the current iteration, and undoing that load restores the previous attribution. Keep acknowledges the pending iteration across retained history, so navigation will not revive accepted markers. Review is unavailable during playback, recording, history navigation, or an active editing gesture. Tracking and visibility preferences remain session-local.
+A manual edit takes ownership of that parameter or structural unit and removes its dot. Undo restores the previous sound and its AI attribution; Redo restores the manual edit and removes the dot again. Restored markers do not replay the arrival animation. Loading a preset manually clears the current iteration, and undoing that load restores the previous attribution. Keep acknowledges the pending iteration across retained history, so navigation will not revive accepted markers. The review dialog remains available during playback, recording, history navigation, or an active editing gesture, but Keep/Reject are disabled until those operations finish. Tracking and visibility preferences remain session-local.
+
+### AI status and tool activity
+
+The single-line feed starts with the registered tool count. Each new invocation slides in from below and replaces the visible sentence; completion updates the same entry. Bursts show the newest call without queuing an animation backlog. The activity dialog retains the latest 100 invocations by ID, including overlapping calls, failures, and cancellation. Human edits, Keep/Reject, and shortcut errors do not create tool-call entries.
+
+During tool activity the Bot rocks left and right and the centered orb animates for at least two seconds per burst. It stays active while any call is running, then shrinks over 600 ms with the same easing as control markers. During AI note playback and performance replays, the Bot instead bobs once per global BPM beat. Manual keyboard/MIDI notes do not trigger it, and render analysis after the notes end does not keep it bobbing. Reduced-motion preferences disable these animations.
+
+The idle orb is a small blended-color dot when edits await review and neutral otherwise. A failed call turns it red until the next successful call; cancellation does not clear a previous failure. BotOff and a dark dot mean WebMCP is unavailable. The help popover explains the ChatGPT Desktop workflow. Registration errors remain distinct from missing browser support, including partial registration failures. Tool readiness describes available browser tools, not an authenticated or connected agent.
 
 Example AI workflow:
 

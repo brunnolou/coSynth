@@ -582,7 +582,7 @@ export function createWebMcpTools(
           throwIfAborted(operationSignal)
           const replayId = dependencies.replays?.startPerformance(sequence.notes, sequence.duration, 'AI note sequence', dependencies.currentSoundEntryId?.())
           try {
-            await performNotes(engine, sequence.notes, operationSignal)
+            await performance.trackPlayback(() => performNotes(engine, sequence.notes, operationSignal), 'ai')
             if (replayId) dependencies.replays!.finishPerformance(replayId, 'completed')
             return { noteCount: sequence.notes.length, duration: sequence.duration, completed: true }
           } catch (error) {
@@ -625,7 +625,7 @@ export function createWebMcpTools(
           let notesTask: Promise<void> | undefined
           try {
             recordingTask = engine.recordOutput(duration, controller.signal)
-            notesTask = performNotes(engine, sequence.notes, controller.signal)
+            notesTask = performance.trackPlayback(() => performNotes(engine, sequence.notes, controller.signal), 'ai')
             const [recording] = await Promise.all([recordingTask, notesTask])
             throwIfAborted(operationSignal)
             const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal)

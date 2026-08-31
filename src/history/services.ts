@@ -35,7 +35,10 @@ export function createHistoryServices(engine: SynthEngine, guide: UiGuideControl
   }, () => performance.stop())
   const replays = new ReplayStore(performance, {
     canPlay: () => engine.running,
-    play: async (notes, signal) => { assertNotesAvailable(engine, notes); await performNotes(engine, notes, signal) },
+    play: async (notes, signal, origin) => {
+      assertNotesAvailable(engine, notes)
+      await performance.trackPlayback(() => performNotes(engine, notes, signal), origin)
+    },
     showGuide: steps => { guide.show({ steps }) }
   })
   activity.setReviewGuard(() => {

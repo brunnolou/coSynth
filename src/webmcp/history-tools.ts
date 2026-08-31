@@ -80,7 +80,7 @@ export function createHistoryTools(services: HistoryServices, lifecycle: AbortSi
       const abort = () => controller.abort()
       lifecycle.addEventListener('abort', abort, { once: true })
       options?.signal?.addEventListener('abort', abort, { once: true })
-      try { await services.replays.replay(entryId, controller.signal); return { replayed: entryId } }
+      try { await services.replays.replay(entryId, controller.signal, 'ai'); return { replayed: entryId } }
       finally { lifecycle.removeEventListener('abort', abort); options?.signal?.removeEventListener('abort', abort) }
     }
   }, {

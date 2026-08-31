@@ -48,10 +48,13 @@ export interface ReplayService {
   snapshot(): ReplayEntry[]
   subscribe(listener: () => void): () => void
   latestPerformanceId(): string | undefined
-  replay(id: string, signal?: AbortSignal): Promise<void>
+  replay(id: string, signal?: AbortSignal, origin?: PlaybackOrigin): Promise<void>
 }
+export type PlaybackOrigin = 'ai' | 'human'
 export interface PerformanceService {
   readonly active: boolean
+  readonly playing: boolean
+  readonly aiPlaying: boolean
   subscribe(listener: () => void): () => void
   stop(): Promise<void>
 }

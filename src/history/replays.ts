@@ -1,9 +1,9 @@
 import { validateGuide, type GuideStep } from '../ui/guide'
 import { PerformanceManager, performanceAbortError, validatePerformanceNotes } from './performance'
-import type { PerformanceNote, ReplayEntry, ReplayService } from './types'
+import type { PerformanceNote, ReplayEntry, ReplayService, PlaybackOrigin } from './types'
 
 export interface ReplayExecutors {
-  play(notes: PerformanceNote[], signal: AbortSignal): Promise<void>
+  play(notes: PerformanceNote[], signal: AbortSignal, origin: PlaybackOrigin): Promise<void>
   showGuide(steps: GuideStep[]): void
   canPlay(): boolean
 }
@@ -59,7 +59,7 @@ export class ReplayStore implements ReplayService {
     return undefined
   }
 
-  async replay(id: string, signal?: AbortSignal): Promise<void> {
+  async replay(id: string, signal?: AbortSignal, origin: PlaybackOrigin = 'human'): Promise<void> {
     this.assertLive()
     if (signal?.aborted) throw performanceAbortError()
     const entry = this.entries.find(candidate => candidate.id === id)
@@ -69,7 +69,7 @@ export class ReplayStore implements ReplayService {
       return
     }
     if (!this.executors.canPlay()) throw new Error('Start audio with a user gesture before replaying notes')
-    await this.performance.run(operationSignal => this.executors.play(structuredClone(entry.notes!), operationSignal), signal)
+    await this.performance.run(operationSignal => this.executors.play(structuredClone(entry.notes!), operationSignal, origin), signal)
   }
 
   async dispose(): Promise<void> {

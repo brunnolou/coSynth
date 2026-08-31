@@ -9,6 +9,62 @@ function setup() {
 }
 
 describe('AgentActivityStore', () => {
+  it('retains overlapping calls by invocation ID and latches errors until a successful completion', () => {
+    const { store } = setup()
+    const first = store.startAction('render_audio')
+    const second = store.startAction('get_synth_state')
+    store.finishAction(second, 'get_synth_state', {}, {})
+    expect(store.snapshot().activeToolCalls).toBe(1)
+    store.failAction(first, 'render_audio', new Error('Recording failed'))
+    expect(store.snapshot().actions.map(action => action.status)).toEqual(['failed', 'completed'])
+    expect(store.snapshot().lastAction?.id).toBe(second)
+    expect(store.snapshot().lastError?.id).toBe(first)
+    expect(store.snapshot().activeToolCalls).toBe(0)
+    const third = store.startAction('play_notes')
+    store.failAction(third, 'play_notes', Object.assign(new Error('Stopped'), { name: 'AbortError' }))
+    expect(store.snapshot().lastError?.id).toBe(first)
+    const fourth = store.startAction('get_synth_state')
+    expect(store.snapshot().lastError?.id).toBe(first)
+    store.finishAction(fourth, 'get_synth_state', {}, {})
+    expect(store.snapshot().lastError).toBeNull()
+    expect(store.snapshot().actions).toHaveLength(4)
+  })
+
+  it('bounds the log without dropping active-call tracking and returns isolated snapshots', () => {
+    const { engine, store } = setup()
+    const first = store.startAction('render_audio')
+    for (let i = 0; i < 110; i++) {
+      const id = store.startAction('get_synth_state')
+      store.finishAction(id, 'get_synth_state', {}, {})
+    }
+    expect(store.snapshot().actions).toHaveLength(100)
+    expect(store.snapshot().activeToolCalls).toBe(1)
+    store.finishAction(first, 'render_audio', {}, { duration: 1 })
+    expect(store.snapshot().activeToolCalls).toBe(0)
+    expect(store.snapshot().actions).toHaveLength(100)
+    const snapshot = store.snapshot()
+    snapshot.actions[0].summary = 'mutated'
+    expect(store.snapshot().actions[0].summary).not.toBe('mutated')
+    engine.setParamById('osc1.level', 0.1, 'ai')
+    store.acceptCheckpoint()
+    store.reportHumanError(new Error('Shortcut failed'))
+    expect(store.snapshot().actions).toHaveLength(100)
+    expect(store.snapshot().activeToolCalls).toBe(0)
+  })
+
+  it('distinguishes missing support, startup, and partial registration failures', () => {
+    const { store } = setup()
+    expect(store.snapshot().toolAvailability).toBe('checking')
+    store.setToolReadiness(0, true, { available: false })
+    expect(store.snapshot().toolAvailability).toBe('unavailable')
+    store.setToolReadiness(0, true, { available: true, registering: true })
+    expect(store.snapshot().toolAvailability).toBe('checking')
+    store.setToolReadiness(14, true, { available: true, errors: [{ tool: 'save_preset', message: 'Denied' }] })
+    expect(store.snapshot()).toMatchObject({ toolAvailability: 'error', readyTools: 14 })
+    store.setToolReadiness(17, false, { available: true })
+    expect(store.snapshot()).toMatchObject({ toolAvailability: 'ready', registrationErrors: [], audioToolsLocked: false })
+  })
+
   it('publishes tool readiness and action results', () => {
     const { engine, store } = setup()
     const listener = vi.fn()
