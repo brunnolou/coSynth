@@ -202,7 +202,10 @@ export class LfoEditor {
     c.lineTo(w, h)
     c.lineTo(0, h)
     c.closePath()
-    c.fillStyle = '#4cd97b18'
+    const gradient = c.createLinearGradient(0, 0, 0, h)
+    gradient.addColorStop(0, '#4cd97b38')
+    gradient.addColorStop(1, '#4cd97b05')
+    c.fillStyle = gradient
     c.fill()
 
     // points + segment handles
