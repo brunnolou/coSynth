@@ -371,6 +371,7 @@ main {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 8px;
+  transition: opacity 160ms ease, color 160ms ease, border-color 160ms ease, background-color 160ms ease;
 }
 .is-disabled {
   opacity: 0.48;
@@ -607,6 +608,7 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   padding: 8px;
   font-size: 10px;
   cursor: pointer;
+  transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
 }
 .sub-tab.on {
   color: var(--text);
@@ -739,6 +741,7 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 6px 8px;
+  transition: opacity 160ms ease, color 160ms ease, border-color 160ms ease, background-color 160ms ease;
 }
 .fx-head { display: flex; align-items: center; gap: 8px; }
 .fx-name { font-size: 10px; font-weight: 700; letter-spacing: 1.5px; color: var(--text-dim); }
