@@ -1,17 +1,106 @@
 // Modulation matrix table: every active route as a row with source/destination
-// selects, a bipolar depth slider, enable toggle, and delete.
+// selects, a bipolar depth knob, enable toggle, and delete.
 
 import { PARAMS } from '../shared/params'
 import { MOD_SOURCES, MAX_MOD_SLOTS } from '../shared/messages'
 import type { SynthEngine } from '../audio/engine'
 import { el, sourceColor } from './common'
 import { guideTarget } from './guide-target'
+import { startKnobDrag } from './knob-drag'
 
 const MODDABLE = PARAMS.map((d, i) => ({ d, i })).filter(({ d }) => d.moddable)
 
 function destLabel(i: number): string {
   const d = PARAMS[i]
   return `${d.group} · ${d.name}`
+}
+
+function depthKnob(engine: SynthEngine, slot: number): { root: HTMLElement; update: () => void } {
+  const root = el('div', 'knob matrix-depth-knob')
+  const canvas = el('canvas', 'knob-main-canvas')
+  const size = 34
+  const dpr = window.devicePixelRatio || 1
+  canvas.width = size * dpr
+  canvas.height = size * dpr
+  canvas.style.width = `${size}px`
+  canvas.style.height = `${size}px`
+  canvas.tabIndex = 0
+  canvas.setAttribute('role', 'slider')
+  canvas.setAttribute('aria-label', `Slot ${slot} depth`)
+  canvas.setAttribute('aria-valuemin', '-100')
+  canvas.setAttribute('aria-valuemax', '100')
+  canvas.title = 'Drag up/right to increase, down/left to decrease. Double-click to reset.'
+  const context = canvas.getContext('2d')
+  context?.scale(dpr, dpr)
+
+  const currentDepth = () => engine.modSlots[slot]?.depth ?? 0
+  const setDepth = (depth: number) => {
+    const current = engine.modSlots[slot]
+    if (!current) return
+    const stepped = Math.round(Math.max(-1, Math.min(1, depth)) * 100) / 100
+    engine.setModSlot(slot, { ...current, depth: stepped })
+  }
+  const update = () => {
+    const depth = currentDepth()
+    const normalized = (depth + 1) / 2
+    const center = size / 2
+    const radius = size / 2 - 7
+    const startAngle = 0.75 * Math.PI
+    const sweep = 1.5 * Math.PI
+    const centerAngle = startAngle + sweep / 2
+    const valueAngle = startAngle + sweep * normalized
+    if (context) {
+      context.clearRect(0, 0, size, size)
+      context.beginPath()
+      context.arc(center, center, radius, startAngle, startAngle + sweep)
+      context.strokeStyle = '#2a2d36'
+      context.lineWidth = 3.5
+      context.lineCap = 'round'
+      context.stroke()
+      if (Math.abs(valueAngle - centerAngle) > 1e-6) {
+        context.beginPath()
+        context.arc(center, center, radius, Math.min(centerAngle, valueAngle), Math.max(centerAngle, valueAngle))
+        context.strokeStyle = '#53a8ff'
+        context.stroke()
+      }
+      context.beginPath()
+      context.moveTo(center + Math.cos(valueAngle) * (radius - 5), center + Math.sin(valueAngle) * (radius - 5))
+      context.lineTo(center + Math.cos(valueAngle) * (radius - 1), center + Math.sin(valueAngle) * (radius - 1))
+      context.strokeStyle = '#e8eaf0'
+      context.lineWidth = 2
+      context.stroke()
+    }
+    const percent = Math.round(depth * 100)
+    canvas.title = `${percent}% depth. Drag up/right to increase, down/left to decrease. Double-click to reset.`
+    canvas.setAttribute('aria-valuenow', String(percent))
+    canvas.setAttribute('aria-valuetext', `${percent}%`)
+  }
+
+  canvas.addEventListener('pointerdown', event => {
+    startKnobDrag(canvas, event, (currentDepth() + 1) / 2, value => setDepth(value * 2 - 1), () => {})
+  })
+  canvas.addEventListener('dblclick', () => setDepth(0))
+  canvas.addEventListener('wheel', event => {
+    event.preventDefault()
+    const step = event.shiftKey ? 0.1 : event.metaKey ? 0.001 : 0.01
+    setDepth(currentDepth() + (event.deltaY < 0 ? step : -step))
+  }, { passive: false })
+  canvas.addEventListener('keydown', event => {
+    let next: number | null = null
+    const step = event.shiftKey ? 0.1 : 0.01
+    if (event.key === 'ArrowUp' || event.key === 'ArrowRight') next = currentDepth() + step
+    else if (event.key === 'ArrowDown' || event.key === 'ArrowLeft') next = currentDepth() - step
+    else if (event.key === 'PageUp') next = currentDepth() + 0.1
+    else if (event.key === 'PageDown') next = currentDepth() - 0.1
+    else if (event.key === 'Home') next = -1
+    else if (event.key === 'End') next = 1
+    if (next === null) return
+    event.preventDefault()
+    setDepth(next)
+  })
+  root.append(canvas)
+  update()
+  return { root, update }
 }
 
 export class ModMatrix {
@@ -24,6 +113,7 @@ export class ModMatrix {
     this.root = el('div', 'matrix')
     const head = el('div', 'matrix-head')
     head.append(
+      el('span', undefined, ''),
       el('span', undefined, 'SOURCE'),
       el('span', undefined, 'DEPTH'),
       el('span', undefined, 'DESTINATION'),
@@ -68,18 +158,7 @@ export class ModMatrix {
         if (current) this.engine.setModSlot(slot, { ...current, source: Number(src.value) })
       })
 
-      const depthWrap = el('div', 'matrix-depth')
-      const depth = el('input') as HTMLInputElement
-      depth.type = 'range'
-      depth.min = '-100'
-      depth.max = '100'
-      depth.value = String(Math.round(state.depth * 100))
-      const depthLabel = el('span', 'matrix-depth-label', `${Math.round(state.depth * 100)}%`)
-      depth.addEventListener('input', () => {
-        depthLabel.textContent = `${depth.value}%`
-        this.engine.setModSlot(slot, { ...this.engine.modSlots[slot]!, depth: Number(depth.value) / 100 })
-      })
-      depthWrap.append(depth, depthLabel)
+      const depth = depthKnob(this.engine, slot)
 
       const dest = el('select', 'param-select') as HTMLSelectElement
       for (const { i } of MODDABLE) {
@@ -93,8 +172,7 @@ export class ModMatrix {
         if (current) this.engine.setModSlot(slot, { ...current, dest: Number(dest.value) })
       })
 
-      const controls = el('div', 'matrix-controls')
-      const enable = el('button', `toggle${state.enabled ? ' on' : ''}`, '●')
+      const enable = el('button', `toggle matrix-route-toggle${state.enabled ? ' on' : ''}`, '●')
       enable.title = 'Enable/bypass'
       enable.addEventListener('click', () => {
         const current = this.engine.modSlots[slot]
@@ -104,23 +182,23 @@ export class ModMatrix {
       guideTarget(row, `matrix.slot${slot}`, `Modulation slot ${slot}`, 'row')
       guideTarget(src, `matrix.slot${slot}.source`, `Slot ${slot} source`, 'select')
       guideTarget(dest, `matrix.slot${slot}.destination`, `Slot ${slot} destination`, 'select')
-      guideTarget(depth, `matrix.slot${slot}.depth`, `Slot ${slot} depth`, 'slider')
+      guideTarget(depth.root, `matrix.slot${slot}.depth`, `Slot ${slot} depth`, 'knob')
       guideTarget(enable, `matrix.slot${slot}.enabled`, `Slot ${slot} enable`, 'button')
       guideTarget(del, `matrix.slot${slot}.remove`, `Remove slot ${slot}`, 'button')
       del.addEventListener('click', () => this.engine.setModSlot(slot, null))
-      controls.append(enable, del)
 
-      row.append(src, depthWrap, dest, controls)
+      row.append(enable, src, depth.root, dest, del)
       this.rowUpdates.set(slot, { root: row, update: () => {
         const current = this.engine.modSlots[slot]
         if (!current) return
         src.value = String(current.source)
         src.style.borderLeft = `3px solid ${sourceColor(current.source)}`
         dest.value = String(current.dest)
-        depth.value = String(Math.round(current.depth * 100))
-        depthLabel.textContent = `${Math.round(current.depth * 100)}%`
+        depth.update()
         enable.classList.toggle('on', current.enabled)
+        row.classList.toggle('is-inactive', !current.enabled)
       } })
+      row.classList.toggle('is-inactive', !state.enabled)
       this.rows.insertBefore(row, this.rows.children[index] ?? null)
       index++
     }

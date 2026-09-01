@@ -191,7 +191,7 @@ describe('keyboard shortcut isolation', () => {
 })
 
 describe('matrix controls', () => {
-  it('keeps the slider node and focus during live updates and uses current slot values', () => {
+  it('keeps the matrix depth knob and focus during live updates and uses current slot values', () => {
     let listener = () => {}
     const slots = [{ source: 6, dest: 0, depth: .2, enabled: true }]
     const engine = {
@@ -201,17 +201,20 @@ describe('matrix controls', () => {
     }
     const matrix = new ModMatrix(engine as unknown as SynthEngine)
     document.body.append(matrix.root)
-    const slider = matrix.root.querySelector('input')!
-    slider.focus()
-    slider.value = '45'
-    slider.dispatchEvent(new Event('input'))
-    expect(matrix.root.querySelector('input')).toBe(slider)
-    expect(document.activeElement).toBe(slider)
+    const row = matrix.root.querySelector('.matrix-row')!
+    const knob = matrix.root.querySelector<HTMLCanvasElement>('.matrix-depth-knob canvas')!
     const toggle = matrix.root.querySelector('.toggle') as HTMLButtonElement
+    expect(row.firstElementChild).toBe(toggle)
+    knob.focus()
+    knob.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }))
+    expect(matrix.root.querySelector('.matrix-depth-knob canvas')).toBe(knob)
+    expect(document.activeElement).toBe(knob)
     toggle.click()
-    expect(slots[0]).toMatchObject({ depth: .45, enabled: false })
+    expect(slots[0]).toMatchObject({ depth: 1, enabled: false })
+    expect(row.classList.contains('is-inactive')).toBe(true)
     toggle.click()
     expect(slots[0].enabled).toBe(true)
+    expect(row.classList.contains('is-inactive')).toBe(false)
     matrix.dispose()
     matrix.root.remove()
   })

@@ -268,20 +268,19 @@ describe('shared AI highlights', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('a human slider input clears ownership of the entire route and Reject keeps it', async () => {
+  it('a human depth knob edit clears ownership of the entire route and Reject keeps it', async () => {
     const panel = target('panel.matrix', 'section')
     panel.append(new ModMatrix(engine).root)
     engine.setModSlot(4, { source: 1, dest: paramIndex('filter1.cutoff'), depth: 0.3, enabled: true }, 'ai')
     engine.setParamById('osc1.morph', 0.8, 'ai')
     await flush()
-    const slider = panel.querySelector<HTMLInputElement>('input[type="range"]')!
-    slider.value = '45'
-    slider.dispatchEvent(new Event('input', { bubbles: true }))
+    const knob = panel.querySelector<HTMLCanvasElement>('.matrix-depth-knob canvas')!
+    knob.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }))
     await flush()
     expect(panel.querySelectorAll('.ai-changed')).toHaveLength(0)
     expect(store.snapshot().pendingChanges).toHaveLength(1)
     store.restoreCheckpoint()
-    expect(engine.modSlots[4]?.depth).toBe(0.45)
+    expect(engine.modSlots[4]?.depth).toBe(1)
     expect(engine.getParam(paramIndex('osc1.morph'))).toBe(0)
   })
 })

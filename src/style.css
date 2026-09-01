@@ -683,15 +683,17 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
 .matrix { display: flex; flex-direction: column; gap: 4px; }
 .matrix-head, .matrix-row {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr 50px;
+  grid-template-columns: 24px 150px 50px 1fr 24px;
   gap: 8px;
   align-items: center;
 }
 .matrix-head span { font-size: 9px; color: var(--text-dim); letter-spacing: 1px; }
-.matrix-depth { display: flex; align-items: center; gap: 6px; }
-.matrix-depth input { flex: 1 1 auto; }
-.matrix-depth-label { font-size: 10px; color: var(--text-dim); width: 38px; text-align: right; }
-.matrix-controls { display: flex; gap: 4px; }
+.matrix-route-toggle { justify-self: start; }
+.matrix-row > :not(.matrix-route-toggle) { transition: opacity 160ms ease; }
+.matrix-row.is-inactive > :not(.matrix-route-toggle) { opacity: 0.4; }
+.matrix-depth-knob { justify-self: start; width: 42px; }
+.matrix-depth-knob .knob-main-canvas { position: static; transform: none; opacity: .7; }
+.matrix-depth-knob:hover .knob-main-canvas { opacity: 1; }
 .matrix-add {
   align-self: flex-start;
   background: var(--panel-2);

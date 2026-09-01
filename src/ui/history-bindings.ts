@@ -79,7 +79,9 @@ export function bindHistoryInteractions(app: HTMLElement, history: SoundHistoryS
     if (!scoped(e.target)) return
     if (e.metaKey || e.ctrlKey || e.altKey || !['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(e.key)) return
     const node = control(e.target)
-    if (node?.matches('input[type="range"]')) history.coalesce(node.getAttribute('data-guide-id') ?? label(node), label(node))
+    if (node?.matches('input[type="range"]') || node?.classList.contains('knob')) {
+      history.coalesce(node.getAttribute('data-guide-id') ?? label(node), label(node))
+    }
   }, true)
   listen(win, 'keydown', event => {
     const e = event as KeyboardEvent
