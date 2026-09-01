@@ -24,7 +24,7 @@ overlay.id = 'start-overlay'
 overlay.innerHTML = `
   <div class="start-box">
     <h1 class="brand-logo">coSynth</h1>
-    <p>Wavetable synthesizer · Web Audio</p>
+    <p>Wavetable synthesizer · Web Audio · WebMCP</p>
     <button id="start-btn">CLICK TO START AUDIO</button>
   </div>`
 document.body.appendChild(overlay)
