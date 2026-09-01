@@ -5,7 +5,7 @@ export const WELCOME_TOUR_STORAGE_KEY = 'cosynth.walkthrough.seen.v1'
 export const WELCOME_TOUR_STEPS: readonly GuideStep[] = [
   {
     title: 'Create sounds with AI',
-    markdown: 'For the full AI experience, open coSynth in ChatGPT Desktop\'s in-app browser. WebMCP lets ChatGPT work directly with the synth.'
+    markdown: 'For the full AI experience, open coSynth in **ChatGPT Desktop\'s in-app browser**. WebMCP lets ChatGPT work directly with the synth.'
   },
   {
     target: { id: 'panel.agent.ai' },
@@ -13,11 +13,11 @@ export const WELCOME_TOUR_STEPS: readonly GuideStep[] = [
     markdown: [
       'Ask the AI to:',
       '',
-      '- Create or reshape a sound.',
-      '- Adjust oscillators, filters, modulation, effects, and presets.',
-      '- Play, analyze, compare, and refine the result.',
-      '- Show every change, then keep, reject, undo, or redo it.',
-      '- Point to controls and teach you step by step.'
+      '- **Create** or **reshape** a sound.',
+      '- **Adjust** oscillators, filters, modulation, effects, and presets.',
+      '- **Play**, **analyze**, **compare**, and **refine** the result.',
+      '- **Show** every change, then **keep**, **reject**, **undo**, or **redo** it.',
+      '- **Point** to controls and **teach** you step by step.'
     ].join('\n')
   },
   {
@@ -36,9 +36,13 @@ export const WELCOME_TOUR_STEPS: readonly GuideStep[] = [
     markdown: [
       'Keep talking to the AI while you listen and tweak the controls yourself. Try:',
       '',
-      '- "Make an \'80s synth bass."',
-      '- "Make it brighter and punchier."',
-      '- "Show me how the filter shapes the sound."'
+      '- Make an 80s synth bass.',
+      '- Make a warm deep-house chord.',
+      '- Make it brighter and punchier.',
+      '- Add a slow filter sweep.',
+      '- Play a syncopated bass melody.',
+      '- Show me how the filter shapes the sound.',
+      '- Where can I find the echo?'
     ].join('\n')
   }
 ]
