@@ -133,7 +133,7 @@ export class Knob {
       c.beginPath()
       c.arc(cx, cy, r, Math.min(start, va), Math.max(start, va))
       c.strokeStyle = ACCENT_COLOR
-      c.lineWidth = 3
+      c.lineWidth = 2
       c.stroke()
     }
 

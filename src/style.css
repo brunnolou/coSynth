@@ -430,15 +430,12 @@ main {
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  opacity: 0.7;
 }
 .knob-main-canvas {
   cursor: ns-resize;
   touch-action: none;
 }
 .knob-mod-canvas { pointer-events: none; }
-.panel:not(.is-disabled) .knob:hover .knob-canvases > canvas,
-header .knob:hover .knob-canvases > canvas { opacity: 1; }
 .knob-label {
   font-size: 9px;
   color: var(--text-dim);
@@ -728,8 +725,7 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
 .matrix-row > :not(.matrix-route-toggle) { transition: opacity 160ms ease; }
 .matrix-row.is-inactive > :not(.matrix-route-toggle) { opacity: 0.4; }
 .matrix-depth-knob { justify-self: start; width: 42px; }
-.matrix-depth-knob .knob-main-canvas { position: static; transform: none; opacity: .7; }
-.matrix-depth-knob:hover .knob-main-canvas { opacity: 1; }
+.matrix-depth-knob .knob-main-canvas { position: static; transform: none; }
 .matrix-add {
   align-self: flex-start;
   background: var(--panel-2);
