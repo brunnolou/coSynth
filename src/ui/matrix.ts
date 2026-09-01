@@ -61,6 +61,7 @@ function depthKnob(engine: SynthEngine, slot: number): { root: HTMLElement; upda
         context.beginPath()
         context.arc(center, center, radius, Math.min(centerAngle, valueAngle), Math.max(centerAngle, valueAngle))
         context.strokeStyle = ACCENT_COLOR
+        context.lineWidth = 3
         context.stroke()
       }
       context.beginPath()
