@@ -255,7 +255,8 @@ main {
   gap: 8px;
 }
 .agent-activity-actions { display: flex; gap: 4px; flex: 0 0 auto; }
-.agent-walkthrough { margin-left: auto; }
+.agent-history-open { margin-left: 8px; }
+.agent-guide-actions { margin-left: auto; display: flex; gap: 4px; flex: 0 0 auto; }
 .agent-btn {
   background: var(--panel-2);
   border: 1px solid var(--line);
@@ -826,7 +827,7 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   z-index: 2000;
 }
 .start-box { text-align: center; }
-.start-box h1 { margin-bottom: 4px; font-size: 38px; line-height: 1; }
+.start-box h1 { margin-bottom: 4px; font-size: 76px; line-height: 1; }
 .start-box p { color: var(--text-dim); margin-top: 0; }
 .start-error { color: #ff5555; max-width: 420px; }
 #start-btn {

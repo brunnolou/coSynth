@@ -180,6 +180,17 @@ describe('UiGuideController with Driver.js', () => {
     expect(document.body.classList.contains('guide-overlay-static')).toBe(false)
   })
 
+  it('keeps AI guides open on outside clicks while allowing the welcome tour to close', async () => {
+    guide.show({ steps: [{ markdown: 'AI walkthrough' }] })
+    await tick()
+    document.querySelector<SVGElement>('.driver-overlay path')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    expect(guide.isActive()).toBe(true)
+    guide.show({ steps: [{ markdown: 'Welcome walkthrough' }] }, { closeOnOverlay: true })
+    await tick()
+    document.querySelector<SVGElement>('.driver-overlay path')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    expect(guide.isActive()).toBe(false)
+  })
+
   it('does not bypass blocking startup screens or leave a guide trapped in a closed dialog', async () => {
     target('app.control')
     const screen = document.createElement('div')

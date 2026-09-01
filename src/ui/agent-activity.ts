@@ -4,7 +4,7 @@ import { agentActivityFor, type AgentActivitySnapshot, type AgentActivityStore }
 import { el } from './common'
 import { ModalDialog } from './dialog'
 import { guideTarget } from './guide-target'
-import { Undo2, Redo2, History as HistoryIcon, CircleHelp, Play, Square } from 'lucide'
+import { Undo2, Redo2, History as HistoryIcon, CircleHelp, Play, Spotlight, Square } from 'lucide'
 import { changeSummary } from './agent-change-summary'
 import { iconButton, setButtonIcon } from './icon-button'
 import { AgentStatus, actionSentence, readinessSentence } from './agent-status'
@@ -23,6 +23,7 @@ export class AgentActivityPanel {
   private readonly undo = iconButton('Undo', Undo2)
   private readonly redo = iconButton('Redo', Redo2)
   private readonly play = iconButton('Play again', Play)
+  private readonly replayGuide = iconButton('Restart AI walkthrough', Spotlight)
   private readonly indicator: AgentStatus
   private readonly activity: AgentActivityStore
   private readonly dialogError = el('span', 'history-error')
@@ -60,6 +61,7 @@ export class AgentActivityPanel {
     const activity = this.activity = agentActivityFor(engine)
     this.state = activity.snapshot()
     const open = iconButton('History', HistoryIcon)
+    open.classList.add('agent-history-open')
     const walkthrough = iconButton('Walkthrough', CircleHelp)
     walkthrough.classList.add('agent-walkthrough')
     this.indicator = new AgentStatus(engine, this.state,
@@ -68,6 +70,7 @@ export class AgentActivityPanel {
     for (const [node, id, label] of [
       [this.undo, 'undo', 'Undo sound edit'], [this.redo, 'redo', 'Redo sound edit'],
       [open, 'open', 'Open history'], [this.play, 'play', 'Replay or stop performance'],
+      [this.replayGuide, 'spotlight', 'Restart latest AI walkthrough'],
       [walkthrough, 'walkthrough', 'Open walkthrough']
     ] as const) guideTarget(node, `button.history.${id}`, label, 'button')
     this.undo.title = 'Undo (⌘/Ctrl+Z)'
@@ -75,6 +78,10 @@ export class AgentActivityPanel {
     this.undo.addEventListener('click', () => this.navigate('undo'))
     this.redo.addEventListener('click', () => this.navigate('redo'))
     open.addEventListener('click', () => this.dialog.open())
+    this.replayGuide.addEventListener('click', () => {
+      const id = [...services.replays.snapshot()].reverse().find(entry => entry.kind === 'guide')?.id
+      if (id) this.run(() => services.replays.replay(id, undefined, 'human'))
+    })
     walkthrough.addEventListener('click', openWalkthrough)
     this.play.addEventListener('click', () => {
       if (services.performance.active) this.run(() => services.performance.stop())
@@ -89,6 +96,8 @@ export class AgentActivityPanel {
     actions.setAttribute('role', 'group')
     actions.setAttribute('aria-label', 'History, playback, and help')
     actions.append(this.undo, this.redo, open, this.play)
+    const guideActions = el('div', 'agent-guide-actions')
+    guideActions.append(this.replayGuide, walkthrough)
     this.keep.addEventListener('click', () => {
       if (activity.acceptCheckpoint()) this.reviewDialog.close()
     })
@@ -103,7 +112,7 @@ export class AgentActivityPanel {
     this.reviewDialog.footer.append(this.keep, this.reject)
     this.activityError.setAttribute('role', 'alert')
     this.dialogError.setAttribute('role', 'alert')
-    this.root.append(actions, this.indicator.root, walkthrough, this.dialog.root, this.reviewDialog.root)
+    this.root.append(actions, this.indicator.root, guideActions, this.dialog.root, this.reviewDialog.root)
 
     const tabs = el('div', 'history-tabs')
     tabs.setAttribute('role', 'tablist')
@@ -207,6 +216,7 @@ export class AgentActivityPanel {
     this.placeRows(this.alternativeList, view.entries.filter(entry => !entry.activePath).map(entry => this.soundRows.get(entry.id)!.root))
     this.alternatives.hidden = !view.entries.some(entry => !entry.activePath)
     const entries = replays.snapshot()
+    this.replayGuide.hidden = !entries.some(entry => entry.kind === 'guide')
     const replayIds = new Set(entries.map(entry => entry.id))
     for (const [id, row] of this.replayRows) if (!replayIds.has(id)) { row.root.remove(); this.replayRows.delete(id) }
     for (const entry of entries) {

@@ -4,7 +4,7 @@ import { micromark } from 'micromark'
 export type GuideTarget = { id: string; selector?: never } | { selector: string; id?: never }
 export interface GuideStep { target?: GuideTarget; title?: string; markdown?: string }
 type Resolution = { element?: HTMLElement; warning?: string }
-interface GuidePresentation { staticOverlay?: boolean }
+interface GuidePresentation { staticOverlay?: boolean; closeOnOverlay?: boolean }
 const GUIDE_UI = '.driver-popover, .driver-overlay, #driver-dummy-element'
 
 function object(input: unknown, fields: string[], context: string): Record<string, unknown> {
@@ -214,6 +214,7 @@ export class UiGuideController {
     })
     instance = this.createDriver({
       steps: driverSteps, popoverClass: 'guide-popover', disableActiveInteraction: false,
+      overlayClickBehavior: presentation.closeOnOverlay ? 'close' : () => {},
       showProgress: steps.length > 1,
       animate: !window.matchMedia('(prefers-reduced-motion: reduce)').matches,
       onDestroyed: () => {

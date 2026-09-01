@@ -59,7 +59,7 @@ export class WelcomeTour {
   constructor(private readonly guide: GuideHost, private readonly storage: Storage | null = browserStorage()) {}
 
   start(): boolean {
-    return this.guide.show({ steps: WELCOME_TOUR_STEPS }, { staticOverlay: true }).shown === true
+    return this.guide.show({ steps: WELCOME_TOUR_STEPS }, { staticOverlay: true, closeOnOverlay: true }).shown === true
   }
 
   startOnce(): boolean {

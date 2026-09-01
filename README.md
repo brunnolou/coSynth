@@ -193,9 +193,13 @@ node scripts/webmcp-smoke.mjs
 SHOT=/tmp/cosynth-smoke.png node scripts/smoke.mjs
 ```
 
+## Credits
+
+coSynth is built on [`noisyloop/soundgineer`](https://github.com/noisyloop/soundgineer), created by [noisyloop](https://github.com/noisyloop). The original project is available under the [MIT License](https://github.com/noisyloop/soundgineer/blob/main/LICENSE), with copyright © 2026 noisyloop. Its DSP engine and UI provided the foundation for this project.
+
 ## Hackathon work
 
-The synthesizer base is [`noisyloop/soundgineer`](https://github.com/noisyloop/soundgineer), used under its MIT license. coSynth preserves and credits that upstream DSP/UI foundation. The work added here is the WebMCP progressive-enhancement adapter and semantic tool API, strict agent-facing validation and stable parameter semantics, abortable real-time output recording, reusable FFT-based audio analysis and Base64 reference comparison, shared validated preset persistence, and WebMCP unit/browser smoke coverage.
+The work added for coSynth includes the WebMCP progressive-enhancement adapter and semantic tool API, strict agent-facing validation and stable parameter semantics, abortable real-time output recording, reusable FFT-based audio analysis and Base64 reference comparison, shared validated preset persistence, and WebMCP unit/browser smoke coverage.
 
 ## Repository layout
 
