@@ -7,7 +7,7 @@
 import { PARAMS, formatValue, defaultNorm } from '../shared/params'
 import { MOD_SOURCES } from '../shared/messages'
 import type { SynthEngine } from '../audio/engine'
-import { el, sourceColor, clamp01, showPopup, closePopup } from './common'
+import { ACCENT_COLOR, colorWithAlpha, el, sourceColor, clamp01, showPopup, closePopup } from './common'
 import { guideTarget } from './guide-target'
 import { startKnobDrag } from './knob-drag'
 import { knobWheelValue, snapKnobValue } from './knob-value'
@@ -128,11 +128,11 @@ export class Knob {
     const bipolar = !def.choices && def.min < 0 && def.max > 0
     const start = bipolar ? a0 + sweep * (0 - def.min) / (def.max - def.min) : a0
     const va = a0 + sweep * v
-    // A round-capped zero-length stroke can leave a blue dot at zero.
+    // A round-capped zero-length stroke can leave an accent dot at zero.
     if (Math.abs(va - start) > 1e-6) {
       c.beginPath()
       c.arc(cx, cy, r, Math.min(start, va), Math.max(start, va))
-      c.strokeStyle = '#53a8ff'
+      c.strokeStyle = ACCENT_COLOR
       c.stroke()
     }
 
@@ -148,7 +148,7 @@ export class Knob {
         // static depth range arc
         mc.beginPath()
         mc.arc(mcx, mcy, ring, Math.min(va, va + depthA), Math.max(va, va + depthA))
-        mc.strokeStyle = col + '55'
+        mc.strokeStyle = colorWithAlpha(col, 0.33)
         mc.lineWidth = 2
         mc.lineCap = 'round'
         mc.stroke()

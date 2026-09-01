@@ -4,7 +4,7 @@
 import { PARAMS } from '../shared/params'
 import { MOD_SOURCES, MAX_MOD_SLOTS } from '../shared/messages'
 import type { SynthEngine } from '../audio/engine'
-import { el, sourceColor } from './common'
+import { ACCENT_COLOR, el, sourceColor } from './common'
 import { guideTarget } from './guide-target'
 import { startKnobDrag } from './knob-drag'
 
@@ -60,7 +60,7 @@ function depthKnob(engine: SynthEngine, slot: number): { root: HTMLElement; upda
       if (Math.abs(valueAngle - centerAngle) > 1e-6) {
         context.beginPath()
         context.arc(center, center, radius, Math.min(centerAngle, valueAngle), Math.max(centerAngle, valueAngle))
-        context.strokeStyle = '#53a8ff'
+        context.strokeStyle = ACCENT_COLOR
         context.stroke()
       }
       context.beginPath()

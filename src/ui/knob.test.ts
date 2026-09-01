@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SynthEngine } from '../audio/engine'
 import { defaultNorm, normToValue, PARAMS, paramIndex } from '../shared/params'
 import { Knob } from './knob'
+import { ACCENT_COLOR } from './common'
 
 const context = {
   clearRect: vi.fn(), beginPath: vi.fn(), arc: vi.fn(), stroke: vi.fn(), fill: vi.fn(),
@@ -78,9 +79,9 @@ describe('Knob', () => {
     const strokes: string[] = []
     context.stroke.mockImplementation(() => { strokes.push(context.strokeStyle) })
     zeroKnob.draw()
-    expect(strokes).not.toContain('#53a8ff')
+    expect(strokes).not.toContain(ACCENT_COLOR)
     engine.setParam(index, .8)
-    expect(strokes).toContain('#53a8ff')
+    expect(strokes).toContain(ACCENT_COLOR)
   })
 
 })

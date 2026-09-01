@@ -9,6 +9,8 @@ import { guideTarget } from './guide-target'
 
 const POINTS = 128
 const FLOOR_Y = -1.15
+const ACCENT_RGB = [0, 0.89, 1] as const
+const ACCENT_DIM_RGB = [0.03, 0.5, 0.72] as const
 const FLOOR_VERTS = new Float32Array([
   0, FLOOR_Y, 0,
   1, FLOOR_Y, 0,
@@ -199,7 +201,7 @@ export class WavetableView {
     // Four rails establish a floor beneath the wavetable stack.
     gl.bindVertexArray(this.floorVao)
     gl.uniform1f(this.uZ, -1)
-    gl.uniform4f(this.uColor, 0.22, 0.32, 0.46, 0.72)
+    gl.uniform4f(this.uColor, 0.12, 0.4, 0.56, 0.72)
     gl.drawArrays(gl.LINES, 0, 8)
 
     // frame strips
@@ -208,8 +210,8 @@ export class WavetableView {
     const highlight = Math.round(morph * (this.numFrames - 1))
     for (let f = 0; f < this.numFrames; f++) {
       const d = Math.abs(f - highlight) / Math.max(this.numFrames - 1, 1)
-      if (f === highlight) gl.uniform4f(this.uColor, 0.55, 0.83, 1.0, 0.9)
-      else gl.uniform4f(this.uColor, 0.25, 0.42, 0.65, 0.75 - d * 0.45)
+      if (f === highlight) gl.uniform4f(this.uColor, ...ACCENT_RGB, 0.9)
+      else gl.uniform4f(this.uColor, ...ACCENT_DIM_RGB, 0.75 - d * 0.45)
       gl.drawArrays(gl.LINE_STRIP, f * POINTS, POINTS)
     }
 

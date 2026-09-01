@@ -2,7 +2,7 @@
 
 import { fft } from '../shared/fft'
 import type { SynthEngine } from '../audio/engine'
-import { el } from './common'
+import { ACCENT_COLOR, ACCENT_COLOR_DIM, el } from './common'
 
 export class Scope {
   readonly root: HTMLElement
@@ -70,7 +70,7 @@ export class Scope {
         if (i === 0) c.moveTo(x, y)
         else c.lineTo(x, y)
       }
-      c.strokeStyle = '#53a8ff'
+      c.strokeStyle = ACCENT_COLOR
       c.lineWidth = 1.5
       c.stroke()
       const R = this.engine.scopeR
@@ -81,7 +81,7 @@ export class Scope {
         if (i === 0) c.moveTo(x, y)
         else c.lineTo(x, y)
       }
-      c.strokeStyle = '#53a8ff55'
+      c.strokeStyle = ACCENT_COLOR_DIM
       c.lineWidth = 1
       c.stroke()
       return
@@ -117,7 +117,7 @@ export class Scope {
       this.smooth[b] = sm
       const bw = w / bars
       const bh = sm * (h - 4)
-      c.fillStyle = `hsl(${210 - sm * 60}, 80%, ${35 + sm * 25}%)`
+      c.fillStyle = `hsl(${207.85 - sm * 60}, 80%, ${35 + sm * 25}%)`
       c.fillRect(b * bw + 0.5, h - bh, bw - 1, bh)
     }
   }

@@ -2,6 +2,14 @@
 
 import { MOD_SOURCES } from '../shared/messages'
 
+export const ACCENT_COLOR = 'oklch(0.82 0.19 207.85)'
+export const ACCENT_COLOR_DIM = 'oklch(0.82 0.19 207.85 / 0.33)'
+
+export function colorWithAlpha(color: string, alpha: number): string {
+  if (color === ACCENT_COLOR) return `oklch(0.82 0.19 207.85 / ${alpha})`
+  return `${color}${Math.round(Math.max(0, Math.min(1, alpha)) * 255).toString(16).padStart(2, '0')}`
+}
+
 export function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   className?: string,
@@ -19,7 +27,7 @@ export function sourceColor(source: number): string {
   if (id.startsWith('env')) return '#ff9a3c'
   if (id.startsWith('lfo')) return '#4cd97b'
   if (id.startsWith('macro')) return '#c77dff'
-  return '#53a8ff'
+  return ACCENT_COLOR
 }
 
 export function clamp01(v: number): number {

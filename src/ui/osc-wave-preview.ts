@@ -2,7 +2,7 @@ import type { SynthEngine } from '../audio/engine'
 import { PARAMS, normToValue, paramIndex } from '../shared/params'
 import type { Wavetable } from '../shared/wavetable-gen'
 import { nextSnapPoint, SNAP_EPSILON, wavetableSnapPoints } from '../shared/wavetable-snap'
-import { el } from './common'
+import { ACCENT_COLOR, el } from './common'
 import './osc-wave-preview.css'
 
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, value))
@@ -146,7 +146,7 @@ export class OscWavePreview {
       if (i === 0) c.moveTo(x, y)
       else c.lineTo(x, y)
     }
-    c.strokeStyle = '#53a8ff'
+    c.strokeStyle = ACCENT_COLOR
     c.lineWidth = 1.4
     c.lineJoin = 'round'
     c.stroke()
