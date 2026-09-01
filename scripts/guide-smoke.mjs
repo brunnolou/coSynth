@@ -30,16 +30,56 @@ try {
   const previous = () => page.locator('.driver-popover-prev-btn').click()
 
   await page.waitForFunction(() => window.__guideTestTools.size === 15)
-  assert.equal(await page.locator('.agent-tool-status').textContent(), '15 tools ready · Start audio to unlock 2')
+  assert.equal(await page.locator('.agent-feed-line').textContent(), '15 tools ready · Start audio to unlock 2')
   await show([{ markdown: 'Introduction' }, { target: { id: 'button.audio.start' }, markdown: 'Start audio yourself when ready.' }])
   await page.keyboard.press('ArrowRight')
   await highlighted('button.audio.start')
   assert.equal(await page.locator('#start-overlay').count(), 1, 'Guide navigation must not start audio')
   await page.keyboard.press('Escape')
   await page.locator('.driver-popover').waitFor({ state: 'detached' })
+  const replaysBeforeWelcome = await call('get_history', { view: 'replays', limit: 20 })
   await page.locator('#start-btn').click()
   await page.locator('#start-overlay').waitFor({ state: 'detached' })
   await page.waitForFunction(() => window.__guideTestTools.size === 17)
+
+  // The built-in tour starts once after audio and stays separate from AI replay history.
+  await page.locator('.driver-popover-title', { hasText: 'Create sounds with AI' }).waitFor()
+  const welcomeStyles = await page.locator('.driver-popover').evaluate(popover => ({
+    titleSize: getComputedStyle(popover.querySelector('.driver-popover-title')).fontSize,
+    descriptionSize: getComputedStyle(popover.querySelector('.driver-popover-description')).fontSize,
+    titleSelection: getComputedStyle(popover.querySelector('.driver-popover-title')).userSelect,
+    descriptionSelection: getComputedStyle(popover.querySelector('.driver-popover-description')).userSelect,
+    overlayAnimations: document.querySelector('.driver-overlay').getAnimations().length
+  }))
+  assert.deepEqual(welcomeStyles, {
+    titleSize: '16px', descriptionSize: '14px', titleSelection: 'text', descriptionSelection: 'text', overlayAnimations: 0
+  })
+  assert.match(await page.locator('.driver-popover-description').textContent(), /ChatGPT Desktop/)
+  assert.match(await page.locator('.driver-popover-description').textContent(), /WebMCP/)
+  await next(); await highlighted('panel.agent.ai')
+  assert.equal(await page.locator('.driver-popover-description li').count(), 5)
+  await next(); await highlighted('panel.keyboard')
+  assert.match(await page.locator('.driver-popover-description').textContent(), /A W S E D F T G Y H U J K/)
+  assert.match(await page.locator('.driver-popover-description').textContent(), /Z \/ X/)
+  await next(); await highlighted('panel.synth')
+  assert.match(await page.locator('.driver-popover-description').textContent(), /80s synth bass/)
+  await next()
+  await page.locator('.driver-popover').waitFor({ state: 'detached' })
+  assert.equal(await page.evaluate(() => localStorage.getItem('cosynth.walkthrough.seen.v1')), '1')
+  const replaysAfterWelcome = await call('get_history', { view: 'replays', limit: 20 })
+  assert.equal(replaysAfterWelcome.total, replaysBeforeWelcome.total, 'Built-in tour must stay out of Replays')
+
+  const walkthrough = page.locator('[data-guide-id="button.history.walkthrough"]')
+  assert.equal(await walkthrough.getAttribute('aria-label'), 'Walkthrough')
+  const activityBounds = await page.locator('.agent-activity-panel').boundingBox()
+  const walkthroughBounds = await walkthrough.boundingBox()
+  assert.ok(Math.abs(activityBounds.x + activityBounds.width - walkthroughBounds.x - walkthroughBounds.width) <= 8,
+    'Walkthrough Help must align to the right edge of the activity bar')
+  await walkthrough.click()
+  await page.locator('.driver-popover-title', { hasText: 'Create sounds with AI' }).waitFor()
+  await page.locator('.driver-popover-close-btn').click()
+  await page.locator('.driver-popover').waitFor({ state: 'detached' })
+  assert.equal(await page.locator('body').evaluate(body => body.classList.contains('guide-overlay-static')), false)
   const initial = await snapshot()
 
   const echo = await call('get_ui_targets', { search: 'echo' })
@@ -145,6 +185,17 @@ try {
   assert.ok(boundsSmall.x >= 0 && boundsSmall.x + boundsSmall.width <= 391)
   assert.ok(boundsSmall.y >= 0 && boundsSmall.y + boundsSmall.height <= 844)
   await page.locator('.driver-overlay').click({ position: { x: 3, y: 3 } })
+  await page.locator('.driver-popover').waitFor({ state: 'detached' })
+
+  // Every built-in step remains readable when the synth switches to its narrow layout.
+  await walkthrough.click()
+  for (const title of ['Create sounds with AI', 'Your sound-design partner', 'Play it', 'Ask for anything']) {
+    await page.locator('.driver-popover-title', { hasText: title }).waitFor()
+    const popover = await page.locator('.driver-popover').boundingBox()
+    assert.ok(popover.x >= 0 && popover.x + popover.width <= 391, `${title} must fit horizontally`)
+    assert.ok(popover.y >= 0 && popover.y + popover.height <= 844, `${title} must fit vertically`)
+    await next()
+  }
   await page.locator('.driver-popover').waitFor({ state: 'detached' })
   assert.deepEqual(errors, [])
   console.log('Guide smoke passed: 17 tools; discovery, interactive tours, safe Markdown, dynamic targets, dialogs, mobile, and unchanged sound history verified.')

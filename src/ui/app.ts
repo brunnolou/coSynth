@@ -24,7 +24,7 @@ import type { HistoryServices } from '../history/types'
 import { AgentHighlights } from './agent-highlights'
 import { agentActivityFor } from '../webmcp/activity'
 
-export function buildApp(engine: SynthEngine, container: HTMLElement, services: HistoryServices): () => void {
+export function buildApp(engine: SynthEngine, container: HTMLElement, services: HistoryServices, openWalkthrough: () => void): () => void {
   engine.primeTables()
 
   // ------------------------------------------------------------ header
@@ -319,8 +319,9 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
 
   // ------------------------------------------------------------ layout
   const main = el('main')
+  guideTarget(main, 'panel.synth', 'Synth controls', 'panel')
   main.append(oscCol, centerCol, sideCol)
-  const agentActivity = new AgentActivityPanel(engine, services)
+  const agentActivity = new AgentActivityPanel(engine, services, openWalkthrough)
   const keyboard = new Keyboard(engine)
   container.append(header, agentActivity.root, main, performancePanel, keyboard.root, midiDialog.root)
   const highlights = new AgentHighlights(container, agentActivityFor(engine))

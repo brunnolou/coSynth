@@ -4,7 +4,7 @@ import { agentActivityFor, type AgentActivitySnapshot, type AgentActivityStore }
 import { el } from './common'
 import { ModalDialog } from './dialog'
 import { guideTarget } from './guide-target'
-import { Undo2, Redo2, History as HistoryIcon, Play, Square } from 'lucide'
+import { Undo2, Redo2, History as HistoryIcon, CircleHelp, Play, Square } from 'lucide'
 import { changeSummary } from './agent-change-summary'
 import { iconButton, setButtonIcon } from './icon-button'
 import { AgentStatus, actionSentence, readinessSentence } from './agent-status'
@@ -56,22 +56,26 @@ export class AgentActivityPanel {
   private pending = 0
   private disposed = false
 
-  constructor(engine: SynthEngine, private readonly services: HistoryServices) {
+  constructor(engine: SynthEngine, private readonly services: HistoryServices, openWalkthrough: () => void = () => {}) {
     const activity = this.activity = agentActivityFor(engine)
     this.state = activity.snapshot()
     const open = iconButton('History', HistoryIcon)
+    const walkthrough = iconButton('Walkthrough', CircleHelp)
+    walkthrough.classList.add('agent-walkthrough')
     this.indicator = new AgentStatus(engine, this.state,
       () => activity.setShowChanges(!this.state.showChanges), () => this.reviewDialog.open())
     guideTarget(this.root, 'panel.agent', 'History and agent activity', 'panel')
     for (const [node, id, label] of [
       [this.undo, 'undo', 'Undo sound edit'], [this.redo, 'redo', 'Redo sound edit'],
-      [open, 'open', 'Open history'], [this.play, 'play', 'Replay or stop performance']
+      [open, 'open', 'Open history'], [this.play, 'play', 'Replay or stop performance'],
+      [walkthrough, 'walkthrough', 'Open walkthrough']
     ] as const) guideTarget(node, `button.history.${id}`, label, 'button')
     this.undo.title = 'Undo (⌘/Ctrl+Z)'
     this.redo.title = 'Redo (⌘/Ctrl+Shift+Z)'
     this.undo.addEventListener('click', () => this.navigate('undo'))
     this.redo.addEventListener('click', () => this.navigate('redo'))
     open.addEventListener('click', () => this.dialog.open())
+    walkthrough.addEventListener('click', openWalkthrough)
     this.play.addEventListener('click', () => {
       if (services.performance.active) this.run(() => services.performance.stop())
       else {
@@ -83,7 +87,7 @@ export class AgentActivityPanel {
     })
     const actions = el('div', 'agent-activity-actions')
     actions.setAttribute('role', 'group')
-    actions.setAttribute('aria-label', 'History and playback')
+    actions.setAttribute('aria-label', 'History, playback, and help')
     actions.append(this.undo, this.redo, open, this.play)
     this.keep.addEventListener('click', () => {
       if (activity.acceptCheckpoint()) this.reviewDialog.close()
@@ -99,7 +103,7 @@ export class AgentActivityPanel {
     this.reviewDialog.footer.append(this.keep, this.reject)
     this.activityError.setAttribute('role', 'alert')
     this.dialogError.setAttribute('role', 'alert')
-    this.root.append(actions, this.indicator.root, this.dialog.root, this.reviewDialog.root)
+    this.root.append(actions, this.indicator.root, walkthrough, this.dialog.root, this.reviewDialog.root)
 
     const tabs = el('div', 'history-tabs')
     tabs.setAttribute('role', 'tablist')

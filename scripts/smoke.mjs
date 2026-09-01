@@ -19,6 +19,15 @@ page.on('pageerror', e => errors.push(String(e)))
 await page.goto(url, { waitUntil: 'networkidle' })
 await page.click('#start-btn')
 await page.waitForFunction(() => !document.getElementById('start-overlay'), { timeout: 10000 })
+await page.waitForSelector('.driver-popover-title')
+if (await page.locator('.driver-popover-title').textContent() !== 'Create sounds with AI') {
+  console.error('First-run walkthrough did not open after audio started')
+  process.exit(1)
+}
+if (await page.locator('[data-guide-id="button.agent.show-changes"]').getAttribute('aria-label') !== 'AI tool availability') {
+  console.error('Walkthrough did not remain available without WebMCP')
+  process.exit(1)
+}
 
 const state = await page.evaluate(async () => {
   const eng = window.coSynth

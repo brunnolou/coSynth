@@ -9,13 +9,15 @@ import { UiGuideController } from './ui/guide'
 import { guideTarget } from './ui/guide-target'
 import { createHistoryServices } from './history/services'
 import { bindHistoryInteractions, isTextEditing } from './ui/history-bindings'
+import { WelcomeTour } from './ui/welcome-tour'
 
 const engine = new SynthEngine()
 const agentActivity = agentActivityFor(engine)
 const app = document.getElementById('app')!
 const guide = new UiGuideController(app)
+const welcomeTour = new WelcomeTour(guide)
 const services = createHistoryServices(engine, guide)
-const disposeApp = buildApp(engine, app, services)
+const disposeApp = buildApp(engine, app, services, () => welcomeTour.start())
 const disposeInteractions = bindHistoryInteractions(app, services.history, error => agentActivity.reportHumanError(error))
 
 // Browsers require a user gesture before audio can start.
@@ -51,6 +53,8 @@ const start = async () => {
       updateReadiness()
       void audioWebMcp.ready.then(updateReadiness)
     }
+    try { welcomeTour.startOnce() }
+    catch (error) { console.warn('Welcome walkthrough could not start:', error) }
     overlay.remove()
   } catch (err) {
     starting = false

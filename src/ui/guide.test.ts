@@ -172,6 +172,14 @@ describe('UiGuideController with Driver.js', () => {
     expect(() => guide.show({ steps: [] })).toThrow(/disposed/)
   })
 
+  it('can suppress the initial overlay fade and removes the presentation class on close', async () => {
+    guide.show({ steps: [{ markdown: 'Static overlay' }] }, { staticOverlay: true })
+    await tick()
+    expect(document.body.classList.contains('guide-overlay-static')).toBe(true)
+    document.querySelector<HTMLButtonElement>('.driver-popover-close-btn')!.click()
+    expect(document.body.classList.contains('guide-overlay-static')).toBe(false)
+  })
+
   it('does not bypass blocking startup screens or leave a guide trapped in a closed dialog', async () => {
     target('app.control')
     const screen = document.createElement('div')

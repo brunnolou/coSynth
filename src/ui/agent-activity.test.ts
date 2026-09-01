@@ -66,8 +66,8 @@ it('retains focused row buttons and expanded details when activity/history refre
   expect(details.open).toBe(true)
 })
 
-it('uses icon-only toolbar buttons with accessible labels and tooltips', () => {
-  for (const [id, label] of [['undo', 'Undo'], ['redo', 'Redo'], ['open', 'History'], ['play', 'Play again']]) {
+it('uses icon-only toolbar buttons with accessible labels and keeps Help at the right edge', () => {
+  for (const [id, label] of [['undo', 'Undo'], ['redo', 'Redo'], ['open', 'History'], ['play', 'Play again'], ['walkthrough', 'Walkthrough']]) {
     const button = panel.root.querySelector(`[data-guide-id="button.history.${id}"]`)!
     expect(button.textContent).toBe('')
     expect(button.getAttribute('aria-label')).toBe(label)
@@ -75,6 +75,9 @@ it('uses icon-only toolbar buttons with accessible labels and tooltips', () => {
     expect(button.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true')
     expect(button.querySelector('svg')?.getAttribute('focusable')).toBe('false')
   }
+  const walkthrough = panel.root.querySelector('[data-guide-id="button.history.walkthrough"]')!
+  expect(walkthrough.parentElement).toBe(panel.root)
+  expect(panel.root.querySelector('.agent-ai-strip')?.nextElementSibling).toBe(walkthrough)
 })
 
 it('hides Play again until a performance exists and keeps Stop available during playback', async () => {

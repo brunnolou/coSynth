@@ -4,6 +4,7 @@ import { micromark } from 'micromark'
 export type GuideTarget = { id: string; selector?: never } | { selector: string; id?: never }
 export interface GuideStep { target?: GuideTarget; title?: string; markdown?: string }
 type Resolution = { element?: HTMLElement; warning?: string }
+interface GuidePresentation { staticOverlay?: boolean }
 const GUIDE_UI = '.driver-popover, .driver-overlay, #driver-dummy-element'
 
 function object(input: unknown, fields: string[], context: string): Record<string, unknown> {
@@ -153,7 +154,7 @@ export class UiGuideController {
     return { items: page, total: items.length, offset, limit, ...(nextOffset < items.length ? { nextOffset } : {}) }
   }
 
-  show(input: unknown) {
+  show(input: unknown, presentation: GuidePresentation = {}) {
     if (this.disposed) throw new Error('The guide controller has been disposed')
     const steps = validateGuide(input)
     const warnings = steps.flatMap((step, index) => {
@@ -216,11 +217,13 @@ export class UiGuideController {
       showProgress: steps.length > 1,
       animate: !window.matchMedia('(prefers-reduced-motion: reduce)').matches,
       onDestroyed: () => {
+        document.body.classList.remove('guide-overlay-static')
         document.removeEventListener('close', onDialogClose, true)
         if (this.active === instance) this.active = null
         queueMicrotask(() => { if (!this.active && initialFocus?.isConnected) initialFocus.focus({ preventScroll: true }) })
       }
     })
+    document.body.classList.toggle('guide-overlay-static', !!presentation.staticOverlay)
     this.active = instance
     document.addEventListener('close', onDialogClose, true)
     try { instance.drive() }

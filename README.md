@@ -102,6 +102,8 @@ Seventeen semantic tools are available over the full audio-enabled lifecycle. Fi
 
 ### Teaching with guides
 
+After audio starts for the first time, coSynth opens a four-step introduction to its AI controls, playable keyboard, and synth workspace. Closing or finishing it records a versioned browser-local preference. The Help button in the activity toolbar restarts it from step one. This built-in tour never enters Replays or changes the sound.
+
 Use `get_ui_targets({ search: 'echo' })` to discover `fx.delay`, or search by parameter ID, panel, tab, or source. Common target IDs include `panel.osc1`, `tab.env1`, `param.env1.attack`, `source.env1`, and `param.filter1.cutoff`. Only currently mounted targets appear in discovery; changing the ENV/LFO tab updates the available knob IDs.
 
 ```json

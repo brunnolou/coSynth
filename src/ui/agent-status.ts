@@ -66,6 +66,7 @@ export class AgentStatus {
     this.status.setAttribute('aria-label', 'AI status and changes')
     this.orb.setAttribute('aria-hidden', 'true')
     this.status.append(this.orb)
+    guideTarget(this.group, 'panel.agent.ai', 'AI status and controls', 'panel')
     guideTarget(this.bot, 'button.agent.show-changes', 'Show AI change markers', 'button')
     guideTarget(this.status, 'button.agent.checkpoint', 'AI status and pending changes', 'button')
     this.bot.addEventListener('click', () => {
