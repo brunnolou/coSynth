@@ -574,21 +574,47 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  margin-top: 23px;
 }
-.mod-tab { display: flex; flex-direction: column; gap: 6px; }
+.mod-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: -32px;
+}
 
-.sub-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
-.sub-tab-wrap { display: flex; flex-direction: column; gap: 4px; align-items: center; }
+.sub-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 -9px;
+  justify-content: space-between;
+}
+.sub-tab-wrap {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+}
 .sub-tab {
-  background: var(--panel-2);
-  border: 1px solid var(--line);
+  width: 100%;
+  background: linear-gradient(0deg, var(--panel), var(--bg), var(--bg));
+  border: 1px solid var(--panel-2);
+  border-bottom: 0;
   color: var(--text-dim);
-  border-radius: 4px;
+  border-radius: 4px 4px 0 0;
   padding: 8px;
   font-size: 10px;
   cursor: pointer;
 }
-.sub-tab.on { color: var(--text); border-color: var(--accent); }
+.sub-tab.on {
+  color: var(--text);
+  border-color: var(--line);
+  background: linear-gradient(0deg, var(--panel), var(--panel-2));
+}
+.sub-tab-wrap .source-badge { transition: opacity 160ms ease; }
+.sub-tab-wrap:not(.on) .source-badge { opacity: 0.4; }
 
 .env-display, .lfo-editor {
   height: 130px;

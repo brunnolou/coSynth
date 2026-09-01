@@ -211,12 +211,16 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   }
   const envBtns: HTMLButtonElement[] = []
   for (let e = 1; e <= 6; e++) {
-    const wrap = el('div', 'sub-tab-wrap')
+    const wrap = el('div', e === 1 ? 'sub-tab-wrap on' : 'sub-tab-wrap')
     const b = el('button', e === 1 ? 'sub-tab on' : 'sub-tab', `ENV ${e}${e === 1 ? ' · AMP' : ''}`) as HTMLButtonElement
     guideTarget(b, `tab.env${e}`, e === 1 ? 'Env 1 amplitude envelope' : `Env ${e}`, 'tab')
     b.addEventListener('click', () => {
       currentEnv = e
-      envBtns.forEach((x, i) => x.classList.toggle('on', i === e - 1))
+      envBtns.forEach((x, i) => {
+        const active = i === e - 1
+        x.classList.toggle('on', active)
+        x.parentElement?.classList.toggle('on', active)
+      })
       envDisplay.setEnv(e)
       renderEnvKnobs()
     })
@@ -252,12 +256,16 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   }
   const lfoBtns: HTMLButtonElement[] = []
   for (let l = 1; l <= 8; l++) {
-    const wrap = el('div', 'sub-tab-wrap')
+    const wrap = el('div', l === 1 ? 'sub-tab-wrap on' : 'sub-tab-wrap')
     const b = el('button', l === 1 ? 'sub-tab on' : 'sub-tab', `LFO ${l}`) as HTMLButtonElement
     guideTarget(b, `tab.lfo${l}`, `LFO ${l}`, 'tab')
     b.addEventListener('click', () => {
       currentLfo = l
-      lfoBtns.forEach((x, i) => x.classList.toggle('on', i === l - 1))
+      lfoBtns.forEach((x, i) => {
+        const active = i === l - 1
+        x.classList.toggle('on', active)
+        x.parentElement?.classList.toggle('on', active)
+      })
       lfoEditor.setLfo(l - 1)
       lfoEditor.root.dataset.aiTarget = `lfo.${l - 1}`
       renderLfoKnobs()
