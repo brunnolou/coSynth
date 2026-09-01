@@ -24,7 +24,7 @@ try {
   const call = (name, input = {}) => page.evaluate(async ({ name, input }) => window.__guideTestTools.get(name).execute(input), { name, input })
   const show = steps => call('show_ui_guide', { steps })
   const clear = () => show([])
-  const snapshot = () => page.evaluate(() => window.soundgineer.toPreset('Guide regression'))
+  const snapshot = () => page.evaluate(() => window.coSynth.toPreset('Guide regression'))
   const highlighted = id => page.waitForFunction(id => document.querySelector('.driver-active-element')?.dataset.guideId === id, id)
   const next = () => page.locator('.driver-popover-next-btn').click()
   const previous = () => page.locator('.driver-popover-prev-btn').click()

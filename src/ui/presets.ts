@@ -706,7 +706,7 @@ export class PresetBrowser {
       const blob = new Blob([JSON.stringify(preset, null, 2)], { type: 'application/json' })
       const a = el('a') as HTMLAnchorElement
       a.href = URL.createObjectURL(blob)
-      a.download = 'patch.soundgineer.json'
+      a.download = 'patch.cosynth.json'
       a.click()
       URL.revokeObjectURL(a.href)
     })

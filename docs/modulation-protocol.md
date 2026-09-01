@@ -1,4 +1,4 @@
-# Soundgineer message & modulation-matrix protocol
+# coSynth message and modulation-matrix protocol
 
 All communication between the main thread (UI) and the DSP
 `AudioWorkletProcessor` goes through the worklet node's `MessagePort`.

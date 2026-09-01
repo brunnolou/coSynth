@@ -370,4 +370,4 @@ class SynthProcessor extends AudioWorkletProcessor {
   }
 }
 
-registerProcessor('soundgineer', SynthProcessor)
+registerProcessor('cosynth', SynthProcessor)

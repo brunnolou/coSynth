@@ -21,7 +21,7 @@ await page.click('#start-btn')
 await page.waitForFunction(() => !document.getElementById('start-overlay'), { timeout: 10000 })
 
 const state = await page.evaluate(async () => {
-  const eng = window.soundgineer
+  const eng = window.coSynth
   eng.noteOn(48, 0.9)
   eng.noteOn(60, 0.9)
   eng.noteOn(64, 0.9)

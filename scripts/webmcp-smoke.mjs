@@ -21,7 +21,7 @@ try {
   const normal = await trackedPage()
   await normal.page.goto(url, { waitUntil: 'networkidle' })
   const normalState = await normal.page.evaluate(() => ({
-    hasEngine: Boolean(window.soundgineer),
+    hasEngine: Boolean(window.coSynth),
     hasOverlay: Boolean(document.getElementById('start-overlay')),
     hasModelContext: Boolean(document.modelContext)
   }))
@@ -174,14 +174,14 @@ try {
       loadedRaw: loadedState.patch.parameters.items['master.volume'].raw,
       expectedError,
       activity: {
-        toolStatus: document.querySelector('.agent-tool-status')?.textContent,
+        toolStatus: document.querySelector('.agent-status-button')?.title,
         undoEnabled: !document.querySelector('[data-guide-id="button.history.undo"]')?.disabled,
         changedParameters: [...document.querySelectorAll('.agent-param, .history-change')].map(element => element.textContent),
         retainedComparison: history.items.some(entry => Number.isFinite(entry.comparison?.similarity)),
         soundCount: history.total,
         replayCount: replays.items.filter(entry => entry.kind === 'performance').length
       },
-      heldNotes: window.soundgineer.heldNotes.size
+      heldNotes: window.coSynth.heldNotes.size
     }
   })
 
@@ -204,7 +204,7 @@ try {
   if (result.expectedError?.ok !== false || !/unknown parameter/i.test(result.expectedError?.error?.message ?? '')) {
     throw new Error(`Structured error check failed: ${JSON.stringify(result.expectedError)}`)
   }
-  if (result.activity.toolStatus !== '17 tools ready' || !result.activity.undoEnabled ||
+  if (!result.activity.toolStatus?.startsWith('17 tools ready.') || !result.activity.undoEnabled ||
       !result.activity.retainedComparison || !result.activity.changedParameters.some(text => text === 'master.volume' || text.startsWith('master.volume:')) ||
       result.activity.soundCount < 5 || result.activity.replayCount !== 2) {
     throw new Error(`Agent activity check failed: ${JSON.stringify(result.activity)}`)

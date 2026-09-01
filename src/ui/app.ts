@@ -30,7 +30,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   // ------------------------------------------------------------ header
   const header = el('header')
   guideTarget(header, 'panel.header', 'Main toolbar', 'panel')
-  header.appendChild(el('div', 'logo', 'SOUNDGINEER'))
+  header.appendChild(el('div', 'logo brand-logo', 'coSynth'))
   header.appendChild(new PresetBrowser(engine).root)
   const hdrRight = el('div', 'hdr-right')
   hdrRight.appendChild(new Knob(engine, paramIndex('master.volume'), 40).root)
@@ -44,7 +44,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   midiDialog.body.append(
     el('p', '', "OpenAI MIDI support isn't working in the ChatGPT browser."),
     el('p', '', "Hardware permission can't be granted here, even after enabling browser flags, as of August 2026."),
-    el('p', 'midi-recommendation', 'Open Soundgineer in Chrome or another browser to test MIDI hardware.')
+    el('p', 'midi-recommendation', 'Open coSynth in Chrome or another browser to test MIDI hardware.')
   )
   const midiDialogClose = el('button', 'agent-btn primary', 'Close')
   midiDialogClose.type = 'button'
@@ -331,7 +331,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
     midiLabel.disabled = !blocked
     midiLabel.classList.toggle('is-error', blocked)
     midiLabel.title = blocked
-      ? 'MIDI access is blocked here in the ChatGPT desktop browser. To test MIDI, export your preset, open Soundgineer in Chrome, import the preset, and allow MIDI input when prompted. Click for details.'
+      ? 'MIDI access is blocked here in the ChatGPT desktop browser. To test MIDI, export your preset, open coSynth in Chrome, import the preset, and allow MIDI input when prompted. Click for details.'
       : ''
   })
 

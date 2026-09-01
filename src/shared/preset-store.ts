@@ -2,7 +2,8 @@ import type { PresetData } from '../audio/engine'
 import { PARAMS } from './params'
 import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, type LfoPoint } from './messages'
 
-export const PRESET_STORAGE_KEY = 'soundgineer.presets.v1'
+export const PRESET_STORAGE_KEY = 'cosynth.presets.v1'
+const LEGACY_PRESET_STORAGE_KEY = 'soundgineer.presets.v1'
 export const MAX_PRESETS = 100
 export const MAX_PRESET_STORAGE_BYTES = 5 * 1024 * 1024
 const MAX_NAME_LENGTH = 80
@@ -106,7 +107,7 @@ function byteLength(value: string): number {
 }
 
 function readPresets(storage: Storage): PresetData[] {
-  const serialized = storage.getItem(PRESET_STORAGE_KEY) ?? '[]'
+  const serialized = storage.getItem(PRESET_STORAGE_KEY) ?? storage.getItem(LEGACY_PRESET_STORAGE_KEY) ?? '[]'
   if (byteLength(serialized) > MAX_PRESET_STORAGE_BYTES) {
     throw new Error('Stored preset data exceeds the 5 MiB limit')
   }

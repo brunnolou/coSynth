@@ -2,7 +2,7 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Let an AI send a short audio file directly as Base64, analyze it with the exact same DSP metrics used for Soundgineer renders, and compare the reference against the latest system-generated sound.
+**Goal:** Let an AI send a short audio file directly as Base64, analyze it with the exact same DSP metrics used for coSynth renders, and compare the reference against the latest system-generated sound.
 
 **Architecture:** Add a strict Base64/audio decoder at the WebMCP boundary, retaining only decoded metadata and metrics in memory. Add a pure metric-comparison function and expose two additional composable tools: `analyze_reference_audio` and `compare_audio`. Keep `analyze_audio` as the system-sound analyzer and reuse the same `analyzeAudio()` function for reference and candidate.
 

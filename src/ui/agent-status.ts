@@ -109,7 +109,7 @@ export class AgentStatus {
       this.bot.title = 'AI tool availability'
     }
     this.helpText.textContent = off
-      ? 'AI tools aren’t available in this browser. Try opening Soundgineer in ChatGPT Desktop. You can still play and edit sounds here.'
+      ? 'AI tools aren’t available in this browser. Try opening coSynth in ChatGPT Desktop. You can still play and edit sounds here.'
       : state.toolAvailability === 'checking' ? 'Registering AI tools. You can still play and edit sounds while they load.'
       : `This browser exposes WebMCP, but tool registration failed. ${state.registrationErrors.map(error => `${error.tool}: ${error.message}`).join(' ')} Try reloading the page.`
     const count = state.pendingChanges.length

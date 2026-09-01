@@ -138,7 +138,7 @@ export class SynthEngine {
     if (this.ctx) return
     const ctx = new AudioContext({ latencyHint: 'interactive' })
     await ctx.audioWorklet.addModule(processorUrl)
-    const node = new AudioWorkletNode(ctx, 'soundgineer', {
+    const node = new AudioWorkletNode(ctx, 'cosynth', {
       numberOfInputs: 0,
       numberOfOutputs: 1,
       outputChannelCount: [2]

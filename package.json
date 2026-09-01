@@ -1,8 +1,8 @@
 {
-  "name": "soundgineer",
+  "name": "cosynth",
   "version": "0.1.0",
   "private": true,
-  "description": "Browser-based Vital-style wavetable synthesizer (Web Audio + AudioWorklet + WebGL2)",
+  "description": "coSynth, an AI-controllable browser wavetable synthesizer (Web Audio + AudioWorklet + WebGL2)",
   "type": "module",
   "scripts": {
     "dev": "vite",

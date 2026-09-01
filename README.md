@@ -1,4 +1,4 @@
-# Soundgineer
+# coSynth
 
 A browser-based, Vital-style **wavetable synthesizer** built on the Web Audio
 API. Vanilla TypeScript + Vite: all DSP runs
@@ -79,7 +79,7 @@ Factory patches included; save to localStorage, or export/import files.
 
 ## WebMCP agent tools
 
-Soundgineer progressively exposes the same live `SynthEngine` used by the UI through the current WebMCP API, `document.modelContext.registerTool(tool, { signal })`. Browsers without WebMCP continue to run the normal synth with no polyfill or runtime dependency.
+coSynth progressively exposes the same live `SynthEngine` used by the UI through the current WebMCP API, `document.modelContext.registerTool(tool, { signal })`. Browsers without WebMCP continue to run the normal synth with no polyfill or runtime dependency.
 
 Seventeen semantic tools are available over the full audio-enabled lifecycle. Fifteen discovery, editing, teaching, and history tools register at page load; `play_notes` and `render_audio` register only after the human starts audio. The UI counts successful registrations rather than assuming every tool is available.
 
@@ -165,14 +165,14 @@ For a restore, provide `action: 'restore'`, `entryId`, and a fresh `expectedRevi
 
 WebMCP requires a secure context: deploy over HTTPS, or use `localhost` during development. At the time of writing it is an experimental browser feature; use a WebMCP-enabled Chrome build/flag and a compatible client such as ChatGPT's experimental browser integration. Audio still follows browser autoplay policy: a human user gesture must click **CLICK TO START AUDIO** before `play_notes` or `render_audio` can run.
 
-Soundgineer accepts both the current standards callback shape,
+coSynth accepts both the current standards callback shape,
 `execute(input, { signal })`, and experimental clients that omit the execution
 options or its `AbortSignal`. Invocations without a signal remain cancellable
 through page lifecycle disposal.
 
 `render_audio` is intentionally **real-time**, not offline and not deterministic. It taps the current AudioWorklet graph through `MediaStreamAudioDestinationNode`/`MediaRecorder`, is capped at 15 seconds, revokes the previous blob URL, and always cleans up notes and recorder connections. AI patch mutations and preset loads are blocked for the complete play/render window. Rendered audio metrics include peak/RMS dB, clipping count, DC offset, spectral centroid, attack time, and stereo width. Replay history stores the note sequence, not old audio recordings.
 
-Reference audio is Base64-only: pass either raw Base64 or a `data:audio/...;base64,...` value to `analyze_reference_audio` (ASCII whitespace in the Base64 is allowed). The encoded input is limited to 16 MiB characters and browser-decoded audio is limited to 30 seconds. An optional name and audio MIME type may be supplied. Expensive metric calculation runs in a disposable Web Worker and is cancellable without blocking synth controls. Soundgineer does not upload reference audio, create a URL for it, or persist Base64/PCM; only the latest reference metadata and seven analysis metrics remain in the WebMCP tool closure until replacement or disposal.
+Reference audio is Base64-only: pass either raw Base64 or a `data:audio/...;base64,...` value to `analyze_reference_audio` (ASCII whitespace in the Base64 is allowed). The encoded input is limited to 16 MiB characters and browser-decoded audio is limited to 30 seconds. An optional name and audio MIME type may be supplied. Expensive metric calculation runs in a disposable Web Worker and is cancellable without blocking synth controls. coSynth does not upload reference audio, create a URL for it, or persist Base64/PCM; only the latest reference metadata and seven analysis metrics remain in the WebMCP tool closure until replacement or disposal.
 
 A typical iterative agent workflow is: analyze the Base64 reference once, adjust synth parameters, render actual synth output, call `compare_audio`, then repeat adjust/render/compare. Comparison returns a bounded overall similarity and signed deltas/similarities for peak dB, RMS dB, clipping count, DC offset, spectral centroid, attack time, and stereo width. These are summary-feature similarities for sound-design guidance, not proof that two sounds are perceptually identical.
 
@@ -188,12 +188,12 @@ node scripts/guide-smoke.mjs http://localhost:4173/
 node scripts/webmcp-smoke.mjs http://localhost:4173/
 # in another terminal:
 node scripts/webmcp-smoke.mjs
-SHOT=/tmp/aisoundgineer-smoke.png node scripts/smoke.mjs
+SHOT=/tmp/cosynth-smoke.png node scripts/smoke.mjs
 ```
 
 ## Hackathon work
 
-The synthesizer base is [`noisyloop/soundgineer`](https://github.com/noisyloop/soundgineer), used under its MIT license. This hackathon extension preserves and credits that upstream DSP/UI foundation. The work added here is the WebMCP progressive-enhancement adapter and eleven-tool semantic API, strict agent-facing validation and stable parameter semantics, abortable real-time output recording, reusable FFT-based audio analysis and Base64 reference comparison, shared validated preset persistence, and WebMCP unit/browser smoke coverage.
+The synthesizer base is [`noisyloop/soundgineer`](https://github.com/noisyloop/soundgineer), used under its MIT license. coSynth preserves and credits that upstream DSP/UI foundation. The work added here is the WebMCP progressive-enhancement adapter and semantic tool API, strict agent-facing validation and stable parameter semantics, abortable real-time output recording, reusable FFT-based audio analysis and Base64 reference comparison, shared validated preset persistence, and WebMCP unit/browser smoke coverage.
 
 ## Repository layout
 

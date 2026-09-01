@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { PresetData } from '../audio/engine'
 import { FX_IDS, MAX_MOD_SLOTS, defaultLfoShape } from './messages'
-import { loadPreset, listPresets, savePreset, validatePresetData, validatePresetName } from './preset-store'
+import { loadPreset, listPresets, PRESET_STORAGE_KEY, savePreset, validatePresetData, validatePresetName } from './preset-store'
 
 class MemoryStorage implements Storage {
   private data = new Map<string, string>()
@@ -42,10 +42,19 @@ describe('preset store', () => {
 
   it('returns an empty safe list for corrupt or structurally invalid storage', () => {
     const storage = new MemoryStorage()
-    storage.setItem('soundgineer.presets.v1', '{broken')
+    storage.setItem(PRESET_STORAGE_KEY, '{broken')
     expect(listPresets(storage)).toEqual([])
-    storage.setItem('soundgineer.presets.v1', JSON.stringify([{ name: '', params: null }]))
+    storage.setItem(PRESET_STORAGE_KEY, JSON.stringify([{ name: '', params: null }]))
     expect(listPresets(storage)).toEqual([])
+  })
+
+  it('keeps presets saved under the previous brand storage key', () => {
+    const storage = new MemoryStorage()
+    storage.setItem('soundgineer.presets.v1', JSON.stringify([preset('Legacy Patch')]))
+    expect(listPresets(storage).map(item => item.name)).toEqual(['Legacy Patch'])
+    savePreset(preset('New Patch'), storage)
+    expect(storage.getItem(PRESET_STORAGE_KEY)).not.toBeNull()
+    expect(listPresets(storage).map(item => item.name)).toEqual(['Legacy Patch', 'New Patch'])
   })
 
   it('does not expose mutable references from storage', () => {

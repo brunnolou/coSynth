@@ -22,7 +22,7 @@ try {
     window.__historyTools.get(name).execute(input, { signal: new AbortController().signal }), { name, input })
   const sounds = () => call('get_history', { view: 'sounds', limit: 20 })
   const replays = () => call('get_history', { view: 'replays', limit: 20 })
-  const patch = () => page.evaluate(() => window.soundgineer.toPreset('History smoke'))
+  const patch = () => page.evaluate(() => window.coSynth.toPreset('History smoke'))
   const update = (id, value) => call('update_parameters', { updates: [{ id, value }] })
   const navigate = async (action, entryId) => call('navigate_history', { action, entryId, expectedRevision: (await sounds()).revision })
   const target = id => page.locator(`[data-guide-id="${id}"]`)
@@ -37,7 +37,7 @@ try {
     await page.waitForFunction(() => window.__pendingHistoryResult !== undefined)
     return page.evaluate(() => window.__pendingHistoryResult)
   }
-  const held = () => page.evaluate(() => window.soundgineer.heldNotes.size)
+  const held = () => page.evaluate(() => window.coSynth.heldNotes.size)
   const noteOns = () => page.evaluate(() => window.__historyNotes.filter(event => event.on).map(event => event.midi))
   const drag = async (id, moves = 4) => {
     const canvas = target(id).locator('.knob-main-canvas')
@@ -69,7 +69,7 @@ try {
   await page.waitForFunction(() => window.__historyTools.size === 17)
   await page.evaluate(() => {
     window.__historyNotes = []
-    window.soundgineer.onNote((midi, on) => window.__historyNotes.push({ midi, on }))
+    window.coSynth.onNote((midi, on) => window.__historyNotes.push({ midi, on }))
   })
 
   // AI performs once. Subsequent human edits and history navigation never erase it.
@@ -171,13 +171,13 @@ try {
   assert.equal((await call('play_notes', { notes: [{ midi: 900, velocity: 1, start: 0, duration: 1 }] })).ok, false)
   assert.equal((await replays()).total, beforeInvalid)
   await startInBackground('play_notes', { notes: [{ midi: 60, velocity: 0.5, start: 0, duration: 3 }] })
-  await page.waitForFunction(() => window.soundgineer.heldNotes.has(60))
+  await page.waitForFunction(() => window.coSynth.heldNotes.has(60))
   await call('stop_performance')
   await finishBackground()
   assert.equal(await held(), 0)
   assert.ok((await replays()).items.some(entry => entry.kind === 'performance' && entry.status === 'cancelled'))
   await startInBackground('render_audio', { notes: [{ midi: 62, velocity: 0.5, start: 0, duration: 3 }], duration: 4 })
-  await page.waitForFunction(() => window.soundgineer.heldNotes.has(62))
+  await page.waitForFunction(() => window.coSynth.heldNotes.has(62))
   await navigate('undo')
   await finishBackground()
   assert.equal(await held(), 0, 'History restoration must await render note cleanup')

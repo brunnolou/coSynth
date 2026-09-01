@@ -23,7 +23,7 @@ const overlay = document.createElement('div')
 overlay.id = 'start-overlay'
 overlay.innerHTML = `
   <div class="start-box">
-    <h1>SOUNDGINEER</h1>
+    <h1 class="brand-logo">coSynth</h1>
     <p>Wavetable synthesizer · Web Audio</p>
     <button id="start-btn">CLICK TO START AUDIO</button>
   </div>`
@@ -71,7 +71,7 @@ const startFromKey = (event: KeyboardEvent) => {
 window.addEventListener('keydown', startFromKey)
 
 // expose for debugging / smoke tests
-;(window as unknown as { soundgineer: SynthEngine }).soundgineer = engine
+;(window as unknown as { coSynth: SynthEngine }).coSynth = engine
 
 // Progressive enhancement: WebMCP registration must never block synth startup.
 try {
