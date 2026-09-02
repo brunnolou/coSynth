@@ -12,7 +12,6 @@ const KEYMAP: Record<string, number> = {
 }
 
 const WHITE_OFFSETS = [0, 2, 4, 5, 7, 9, 11]
-const BLACK_OFFSETS: Record<number, number> = { 0: 1, 1: 3, 3: 6, 4: 8, 5: 10 }
 const KEYMAP_SPAN = Math.max(...Object.values(KEYMAP))
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 const noteName = (note: number) => `${NOTE_NAMES[note % 12]}${Math.floor(note / 12) - 1}`
@@ -136,6 +135,14 @@ export class Keyboard {
     this.pointerNotes.clear()
   }
 
+  /**
+   * Drawn extent in semitones. A single octave is the typeable window itself — C up to the F
+   * above, matching the octave label — rather than C to C, which stopped short of the label.
+   */
+  private drawnSpan(): number {
+    return this.octaves === 1 ? KEYMAP_SPAN : this.octaves * 12
+  }
+
   /** C-aligned range starts that keep the whole played window on screen, as [lowest, highest]. */
   private validStarts(span: number): [number, number] {
     const [lo, hi] = this.playableRange()
@@ -151,10 +158,10 @@ export class Keyboard {
    * step, which is what made Z / X look like it did nothing.
    */
   private rangeStart(): number {
-    const span = this.octaves * 12
+    const span = this.drawnSpan()
     const [lowest, highest] = this.validStarts(span)
-    // Narrow widths cannot hold the whole window; show it from its lowest note up.
-    if (lowest > highest) return highest
+    // Narrow widths leave under an octave of slack, so only one range can hold the window.
+    if (highest <= lowest) return highest
     if (this.drawnStart < 0) {
       // First draw, or a fresh width: centre the window in the view.
       const centred = Math.round((this.playableRange()[0] - (span - KEYMAP_SPAN) / 2) / 12) * 12
@@ -180,24 +187,28 @@ export class Keyboard {
   private buildKeys(startNote: number): void {
     this.keys.replaceChildren()
     this.keyEls.clear()
-    const numWhite = this.octaves * 7 + 1
+    const span = this.drawnSpan()
+    // startNote is always a C, so a semitone's offset doubles as its pitch class.
+    const isWhite = (semitone: number) => WHITE_OFFSETS.includes(semitone % 12)
+    let numWhite = 0
+    for (let semitone = 0; semitone <= span; semitone++) if (isWhite(semitone)) numWhite++
     this.keys.style.setProperty('--kb-white', `${100 / numWhite}%`)
-    for (let w = 0; w < numWhite; w++) {
-      const oct = Math.floor(w / 7)
-      const inOct = w % 7
-      const note = startNote + oct * 12 + WHITE_OFFSETS[inOct]
-      const key = el('div', 'key white')
-      key.dataset.note = String(note)
-      if (note % 12 === 0) key.appendChild(el('span', 'key-name', noteName(note)))
-      this.keys.appendChild(key)
-      this.keyEls.set(note, key)
-      if (w < numWhite - 1 && inOct in BLACK_OFFSETS) {
-        const bn = startNote + oct * 12 + BLACK_OFFSETS[inOct]
-        const bk = el('div', 'key black')
-        bk.dataset.note = String(bn)
-        bk.style.left = `${((w + 1) / numWhite) * 100}%`
-        this.keys.appendChild(bk)
-        this.keyEls.set(bn, bk)
+    let whiteIndex = -1
+    for (let semitone = 0; semitone <= span; semitone++) {
+      const note = startNote + semitone
+      if (isWhite(semitone)) {
+        whiteIndex++
+        const key = el('div', 'key white')
+        key.dataset.note = String(note)
+        if (note % 12 === 0) key.appendChild(el('span', 'key-name', noteName(note)))
+        this.keys.appendChild(key)
+        this.keyEls.set(note, key)
+      } else {
+        const key = el('div', 'key black')
+        key.dataset.note = String(note)
+        key.style.left = `${((whiteIndex + 1) / numWhite) * 100}%`
+        this.keys.appendChild(key)
+        this.keyEls.set(note, key)
       }
     }
     this.applyOctaveWindow()
