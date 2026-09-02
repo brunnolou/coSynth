@@ -14,10 +14,12 @@ import {
 } from '../shared/messages'
 import { generateWavetable, buildMips, wavToWavetable, decodeWav, type Wavetable } from '../shared/wavetable-gen'
 import { samePatchValue, type MutationOrigin, type PatchChange, type PatchMutation } from '../shared/patch-change'
+import { PRESET_VERSION } from '../shared/preset-store'
 
 export interface PresetData {
   name: string
-  version: 1
+  /** Format version. 1 is still accepted on load and upgraded by validatePresetData. */
+  version: 1 | 2
   params: Record<string, number> // param id -> normalized value
   mods: { source: string; dest: string; depth: number; enabled: boolean }[]
   lfoShapes: LfoPoint[][]
@@ -637,7 +639,7 @@ export class SynthEngine {
       }))
     return {
       name,
-      version: 1,
+      version: PRESET_VERSION,
       params,
       mods,
       lfoShapes: this.lfoShapes.map(pts => pts.map(p => ({ ...p }))),

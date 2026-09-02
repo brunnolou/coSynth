@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SynthEngine } from '../audio/engine'
-import { savePreset, loadPreset, listPresets } from '../shared/preset-store'
+import { savePreset, loadPreset, listPresets, PRESET_STORAGE_KEY } from '../shared/preset-store'
+import { defaultLfoShape, FX_IDS } from '../shared/messages'
+import { normToValue, paramDef, paramIndex, SYNC_DIVISIONS } from '../shared/params'
 import { PresetBrowser } from './presets'
 
 describe('compact preset browser', () => {
@@ -201,6 +203,36 @@ describe('compact preset browser', () => {
     press()
     expect(actions().open).toBe(false)
     expect(trigger().getAttribute('aria-expanded')).toBe('false')
+  })
+
+  // The slow LFO divisions changed how a division normalizes. Factory presets
+  // are authored in raw indices and normalized at module load, so they follow
+  // the current scale for free; user presets on disk are format 1 and have to
+  // be upgraded on the way in. Both land on the division they were written as.
+  const divisionOf = (id: string) =>
+    SYNC_DIVISIONS[normToValue(paramDef(id), engine.getParam(paramIndex(id)))]
+
+  it('loads factory presets on the current division scale', () => {
+    select().value = 'factory:Wobble Bass'
+    select().dispatchEvent(new Event('change'))
+    expect(engine.loadPreset).toHaveBeenLastCalledWith(expect.objectContaining({ name: 'Wobble Bass' }))
+    expect(divisionOf('lfo1.division')).toBe('1/4')
+    expect(divisionOf('delay.division')).toBe('1/8')
+  })
+
+  it('upgrades a format 1 user preset in storage to the current division scale', () => {
+    localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify([{
+      name: 'Old Patch', version: 1,
+      // Format 1 wrote 1/4 as 4/12 and the delay's 1/8 as 7/12.
+      params: { 'lfo1.division': 4 / 12, 'delay.division': 7 / 12 },
+      mods: [], lfoShapes: Array.from({ length: 8 }, () => defaultLfoShape()), fxOrder: [...FX_IDS]
+    }]))
+    browser = new PresetBrowser(engine)
+    document.body.replaceChildren(browser.root)
+    select().value = 'user:Old Patch'
+    select().dispatchEvent(new Event('change'))
+    expect(divisionOf('lfo1.division')).toBe('1/4')
+    expect(divisionOf('delay.division')).toBe('1/8')
   })
 
   it('exports the current patch through the existing JSON download', () => {
