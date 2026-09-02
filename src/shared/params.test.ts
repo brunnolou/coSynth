@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { PARAMS, paramDef } from './params'
+import { DELAY_DIVISIONS, divisionToBeats, PARAMS, paramDef, SYNC_DIVISIONS, SYNC_DIVISION_ORDER } from './params'
 
 // `unit` is the only scale hint an agent gets before it sends a raw value, so
 // it must describe the RAW `min..max` scale — never the scale `fmt` happens to
@@ -59,5 +59,70 @@ describe('parameter unit hints', () => {
     // Seconds raw, rendered in milliseconds below 1 s.
     expect(paramDef('env1.attack').unit).toBe('s')
     expect(paramDef('delay.time').unit).toBe('s')
+  })
+})
+
+
+// The thirteen divisions that shipped first. Presets address a division by its
+// position in SYNC_DIVISIONS, so this list has to stay put at the front.
+const ORIGINAL = ['1/1', '1/2', '1/2T', '1/4.', '1/4', '1/4T', '1/8.', '1/8', '1/8T', '1/16.', '1/16', '1/16T', '1/32']
+const ORIGINAL_BEATS = [4, 2, 4 / 3, 1.5, 1, 2 / 3, 0.75, 0.5, 1 / 3, 0.375, 0.25, 1 / 6, 0.125]
+
+describe('sync divisions', () => {
+  it('keeps every pre-existing index pointing at the same division', () => {
+    expect(SYNC_DIVISIONS.slice(0, ORIGINAL.length)).toEqual(ORIGINAL)
+    expect(SYNC_DIVISIONS[4]).toBe('1/4')  // lfo*.division default
+    expect(SYNC_DIVISIONS[7]).toBe('1/8')  // delay.division default
+  })
+
+  it('appends the slow whole note multiples 2/1..31/1', () => {
+    expect(SYNC_DIVISIONS.slice(ORIGINAL.length)).toEqual(
+      Array.from({ length: 30 }, (_, i) => `${i + 2}/1`)
+    )
+    expect(SYNC_DIVISIONS).toHaveLength(43)
+  })
+
+  it('leaves the beats of every original division unchanged', () => {
+    ORIGINAL_BEATS.forEach((beats, i) => expect(divisionToBeats(i)).toBeCloseTo(beats, 10))
+  })
+
+  it('reads N/1 as N whole notes, i.e. 4N beats', () => {
+    for (let n = 2; n <= 31; n++) {
+      expect(divisionToBeats(SYNC_DIVISIONS.indexOf(`${n}/1`))).toBe(4 * n)
+    }
+  })
+
+  it('spans 62 s per cycle at the slow end at 120 BPM', () => {
+    const seconds = (index: number) => divisionToBeats(index) * 60 / 120
+    expect(seconds(SYNC_DIVISIONS.indexOf('31/1'))).toBe(62)
+    expect(seconds(SYNC_DIVISIONS.indexOf('1/32'))).toBeCloseTo(0.0625, 10)
+  })
+
+  it('falls back to one beat for an out-of-range index', () => {
+    expect(divisionToBeats(-1)).toBe(1)
+    expect(divisionToBeats(SYNC_DIVISIONS.length)).toBe(1)
+  })
+
+  it('orders the menu slowest first without touching the stored indices', () => {
+    const beats = SYNC_DIVISION_ORDER.map(divisionToBeats)
+    expect(beats).toEqual([...beats].sort((a, b) => b - a))
+    expect(SYNC_DIVISIONS[SYNC_DIVISION_ORDER[0]]).toBe('31/1')
+    expect(SYNC_DIVISIONS[SYNC_DIVISION_ORDER.at(-1)!]).toBe('1/32')
+    expect([...SYNC_DIVISION_ORDER].sort((a, b) => a - b)).toEqual(SYNC_DIVISIONS.map((_, i) => i))
+  })
+
+  it('keeps the delay on the fast set the 2.5 s delay line can reach', () => {
+    expect(DELAY_DIVISIONS).toEqual(ORIGINAL)
+    const def = paramDef('delay.division')
+    expect(def.choices).toBe(DELAY_DIVISIONS)
+    expect(def.max).toBe(ORIGINAL.length - 1)
+    expect(def.def).toBe(7)
+  })
+
+  it('offers the full set to the LFOs', () => {
+    const def = paramDef('lfo1.division')
+    expect(def.choices).toBe(SYNC_DIVISIONS)
+    expect(def.max).toBe(SYNC_DIVISIONS.length - 1)
+    expect(def.def).toBe(4)
   })
 })

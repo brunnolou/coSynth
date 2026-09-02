@@ -8,6 +8,8 @@ import { guideTarget } from './guide-target'
 
 export interface ParamSelectOptions {
   choiceLabels?: readonly string[]
+  /** Choice indices in menu order. Only reorders the options; values stay the choice index. */
+  choiceOrder?: readonly number[]
   separatorBefore?: string
   onSelect?: (choice: string, index: number) => boolean | void
 }
@@ -18,7 +20,9 @@ export function paramSelect(engine: SynthEngine, id: string, options: ParamSelec
   const choices = def.choices ?? []
   const sel = el('select', 'param-select') as HTMLSelectElement
   guideTarget(sel, `param.${id}`, `${def.group} ${def.name}`, 'select')
-  choices.forEach((c, i) => {
+  const order = options.choiceOrder ?? choices.map((_, i) => i)
+  order.forEach(i => {
+    const c = choices[i]
     if (c === options.separatorBefore) {
       const separator = el('option', undefined, '──────────') as HTMLOptionElement
       separator.disabled = true
@@ -62,6 +66,37 @@ export function bindEnabledState(engine: SynthEngine, id: string, target: HTMLEl
   const index = paramIndex(id)
   const sync = (value = engine.getParam(index)) => {
     target.classList.toggle('is-disabled', value < 0.5)
+  }
+  sync()
+  return engine.onParam(index, sync)
+}
+
+export interface SyncGating {
+  /** Gate the free-running control (LFO rate, delay time): it is bypassed while synced. */
+  free: boolean
+  /** Gate the tempo division: it is bypassed while free-running. */
+  division: boolean
+}
+
+/** Which half of a SYNC pair has no effect for the given toggle state. */
+export function syncGating(syncOn: boolean): SyncGating {
+  return { free: syncOn, division: !syncOn }
+}
+
+/** Mute a control and take it out of pointer, keyboard and AT reach. Never writes the param. */
+export function setControlGated(target: HTMLElement, gated: boolean): void {
+  target.classList.toggle('is-gated', gated)
+  target.setAttribute('aria-disabled', String(gated))
+  if ('disabled' in target) (target as HTMLElement & { disabled: boolean }).disabled = gated
+}
+
+/** Keep a SYNC pair's inactive half gated, on first render and on every later change. */
+export function bindSyncGating(engine: SynthEngine, syncId: string, pair: { free: HTMLElement; division: HTMLElement }): () => void {
+  const index = paramIndex(syncId)
+  const sync = (value = engine.getParam(index)) => {
+    const gated = syncGating(value >= 0.5)
+    setControlGated(pair.free, gated.free)
+    setControlGated(pair.division, gated.division)
   }
   sync()
   return engine.onParam(index, sync)

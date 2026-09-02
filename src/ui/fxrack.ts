@@ -4,7 +4,7 @@
 import { FX_IDS } from '../shared/messages'
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
-import { bindEnabledState, paramToggle, paramSelect, knobRow } from './controls'
+import { bindEnabledState, bindSyncGating, paramToggle, paramSelect, knobRow } from './controls'
 import { guideTarget } from './guide-target'
 
 const FX_LABELS: Record<string, string> = {
@@ -62,14 +62,22 @@ export class FxRack {
     unit.appendChild(head)
 
     const body = el('div', 'fx-body')
+    let division: HTMLElement | undefined
     if (id === 'delay') {
       const opts = el('div', 'fx-opts')
+      division = paramSelect(this.engine, 'delay.division')
       opts.appendChild(paramToggle(this.engine, 'delay.sync', 'SYNC'))
-      opts.appendChild(paramSelect(this.engine, 'delay.division'))
+      opts.appendChild(division)
       opts.appendChild(paramToggle(this.engine, 'delay.pingpong', 'PING'))
       body.appendChild(opts)
     }
-    body.appendChild(knobRow(this.engine, FX_KNOBS[id], 40))
+    const knobs = knobRow(this.engine, FX_KNOBS[id], 40)
+    body.appendChild(knobs)
+    if (division) {
+      // Delay time and division are the two halves of one SYNC pair.
+      const time = knobs.children[FX_KNOBS[id].indexOf('delay.time')] as HTMLElement
+      bindSyncGating(this.engine, 'delay.sync', { free: time, division })
+    }
     unit.appendChild(body)
     bindEnabledState(this.engine, `${id}.enabled`, unit)
     return unit

@@ -388,6 +388,13 @@ main {
 .is-disabled {
   opacity: 0.48;
 }
+/* A control the current mode bypasses (rate while synced, division while free):
+   muted and inert for pointer and keyboard, value left untouched. */
+.is-gated {
+  opacity: 0.35;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
 
 .panel-head {
   display: flex;

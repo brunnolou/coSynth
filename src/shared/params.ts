@@ -37,16 +37,30 @@ export const NOISE_TYPES = ['White', 'Pink', 'Sample']
 export const DIST_TYPES = ['Soft Clip', 'Hard Clip', 'Wavefold', 'Bitcrush']
 export const FILTER_ROUTINGS = ['Series', 'Parallel']
 export const LFO_MODES = ['Trigger', 'Free', 'Sync']
-export const SYNC_DIVISIONS = ['1/1', '1/2', '1/2T', '1/4.', '1/4', '1/4T', '1/8.', '1/8', '1/8T', '1/16.', '1/16', '1/16T', '1/32']
+// Original one-bar-and-faster set. Presets store a division as its position in
+// the array, so these thirteen entries are frozen: new divisions are appended,
+// never inserted. The delay reuses this set on its own (see DELAY_DIVISIONS).
+const BEAT_DIVISIONS = ['1/1', '1/2', '1/2T', '1/4.', '1/4', '1/4T', '1/8.', '1/8', '1/8T', '1/16.', '1/16', '1/16T', '1/32']
+/** Whole note multiples 2/1..31/1 (N/1 = N whole notes = 4N beats), for slow LFO sweeps. */
+const SLOW_DIVISIONS = Array.from({ length: 30 }, (_, i) => `${i + 2}/1`)
+export const SYNC_DIVISIONS = [...BEAT_DIVISIONS, ...SLOW_DIVISIONS]
+// The stereo delay line only buffers 2.5 s, so a multi-bar division would be
+// silently clamped. The delay keeps the fast set instead of offering a lie.
+export const DELAY_DIVISIONS = BEAT_DIVISIONS
+/** SYNC_DIVISIONS indices in menu order: slowest cycle first. */
+export const SYNC_DIVISION_ORDER = SYNC_DIVISIONS
+  .map((_, i) => i)
+  .sort((a, b) => divisionToBeats(b) - divisionToBeats(a))
 export const WAVETABLE_NAMES = ['Basic Shapes', 'Harmonic Sweep', 'PWM', 'Vocal', 'FM Bell', 'Digital', 'Custom']
 
-/** Beats per whole note division. */
+/** Beats per cycle for a sync division: `n/d` is 4n/d beats, `.` dotted, `T` triplet. */
 export function divisionToBeats(divIndex: number): number {
-  const base = [4, 2, 2, 1, 1, 1, 0.5, 0.5, 0.5, 0.25, 0.25, 0.25, 0.125]
   const name = SYNC_DIVISIONS[divIndex] ?? '1/4'
-  let b = base[divIndex] ?? 1
-  if (name.endsWith('.')) b *= 1.5
-  if (name.endsWith('T')) b *= 2 / 3
+  const m = /^(\d+)\/(\d+)([.T]?)$/.exec(name)
+  if (!m) return 1
+  let b = (4 * Number(m[1])) / Number(m[2])
+  if (m[3] === '.') b *= 1.5
+  if (m[3] === 'T') b *= 2 / 3
   return b
 }
 
@@ -171,7 +185,7 @@ p({ id: 'flanger.mix', name: 'Mix', group: 'flanger', min: 0, max: 1, def: 0.5, 
 
 p({ id: 'delay.enabled', name: 'On', group: 'delay', min: 0, max: 1, def: 0, step: 1 })
 p({ id: 'delay.sync', name: 'Sync', group: 'delay', min: 0, max: 1, def: 1, step: 1 })
-p({ id: 'delay.division', name: 'Div', group: 'delay', min: 0, max: SYNC_DIVISIONS.length - 1, def: 7, choices: SYNC_DIVISIONS })
+p({ id: 'delay.division', name: 'Div', group: 'delay', min: 0, max: DELAY_DIVISIONS.length - 1, def: 7, choices: DELAY_DIVISIONS })
 p({ id: 'delay.time', name: 'Time', group: 'delay', min: 0.01, max: 2, def: 0.35, curve: 'exp', moddable: true, fmt: ms })
 p({ id: 'delay.feedback', name: 'Fdbk', group: 'delay', min: 0, max: 0.98, def: 0.4, moddable: true, fmt: pct })
 p({ id: 'delay.pingpong', name: 'PingPong', group: 'delay', min: 0, max: 1, def: 0, step: 1 })
