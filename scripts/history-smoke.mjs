@@ -2,6 +2,11 @@
 import assert from 'node:assert/strict'
 import { chromium } from 'playwright'
 
+// Only play_notes waits for the audio gesture; render_audio registers at load
+// because it renders offline.
+const TOOLS_AT_LOAD = 17
+const TOOLS_AFTER_AUDIO = 18
+
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined })
 try {
   const page = await browser.newPage({ viewport: { width: 1280, height: 1000 }, reducedMotion: 'reduce' })
@@ -50,7 +55,7 @@ try {
     await page.mouse.up()
   }
 
-  await page.waitForFunction(() => window.__historyTools.size === 15)
+  await page.waitForFunction(count => window.__historyTools.size === count, TOOLS_AT_LOAD)
   const preAudio = await sounds()
   const octave = await page.locator('.oct-label').textContent()
   await page.keyboard.press('Control+z')
@@ -66,7 +71,7 @@ try {
   assert.equal(await page.locator('.driver-popover-description').textContent(), 'History works before audio starts.')
   await clearGuide()
   await page.locator('#start-btn').click()
-  await page.waitForFunction(() => window.__historyTools.size === 17)
+  await page.waitForFunction(count => window.__historyTools.size === count, TOOLS_AFTER_AUDIO)
   await page.evaluate(() => {
     window.__historyNotes = []
     window.coSynth.onNote((midi, on) => window.__historyNotes.push({ midi, on }))

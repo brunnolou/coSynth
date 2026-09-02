@@ -24,8 +24,14 @@ if (await page.locator('.driver-popover-title').textContent() !== 'Create sounds
   console.error('First-run walkthrough did not open after audio started')
   process.exit(1)
 }
-if (await page.locator('[data-guide-id="button.agent.show-changes"]').getAttribute('aria-label') !== 'AI tool availability') {
-  console.error('Walkthrough did not remain available without WebMCP')
+// This browser exposes no native modelContext, so the vendored webmcp.dev
+// widget is the registration path. It does register, which flips the Bot button
+// from the "AI tool availability" explainer to a working change toggle - so this
+// asserts the legacy fallback reached the tools end to end. Before that fallback
+// existed, no-WebMCP meant no tools and the label stayed on the explainer.
+const botLabel = await page.locator('[data-guide-id="button.agent.show-changes"]').getAttribute('aria-label')
+if (botLabel !== 'Show AI changes') {
+  console.error(`Legacy WebMCP fallback did not register tools; Bot button reads ${JSON.stringify(botLabel)}`)
   process.exit(1)
 }
 
