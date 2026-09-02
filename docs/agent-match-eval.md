@@ -152,7 +152,7 @@ renders. The loop converges and the harness makes the convergence visible.
   Worth watching for in the first agent run.
 - **`details.bands` sat at 0.000–0.008 through every iteration** while eight other
   metrics moved. A metric that never responds cannot be steered by, and it is one
-  of eleven contributing equally to the overall `similarity`, so it caps the
+  of ten contributing equally to the overall `similarity`, so it caps the
   achievable figure. Either it is genuinely that far off, or its scale is too
   tight to be informative — an agent has no way to tell which.
 - **`decayT60Ms` is `null` on a sustaining patch** and its comparison detail
