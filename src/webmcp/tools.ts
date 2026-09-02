@@ -518,8 +518,13 @@ export function createWebMcpTools(
         const includeParameters = format === 'compact' || group !== undefined || search !== undefined || value.parameterOffset !== undefined || value.parameterLimit !== undefined
         const includeModulations = value.modulationOffset !== undefined || value.modulationLimit !== undefined
         const includeLfo = value.lfo !== undefined || value.lfoPointOffset !== undefined || value.lfoPointLimit !== undefined
-        if (Number(includeParameters) + Number(includeModulations) + Number(includeLfo) > 1) {
-          throw new Error('Request parameters, modulations, or one LFO shape in separate calls')
+        // Modulation paging is deliberately not part of this exclusivity: the
+        // routes always ship, so a wider page of them is a bigger slice of a
+        // field that is already there, not a competing view. It used to count,
+        // which made `{format:'compact', modulationLimit:32}` throw - exactly
+        // the recovery this tool's own description tells an agent to reach for.
+        if (Number(includeParameters) + Number(includeLfo) > 1) {
+          throw new Error('Request a detailed parameter page or one LFO shape in separate calls')
         }
         if (includeLfo && value.lfo === undefined) throw new Error('lfo is required when paging LFO points')
         const modulations = engine.modSlots.flatMap((route, slot) => route ? [routeValue(slot, route)] : [])

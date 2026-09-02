@@ -421,6 +421,19 @@ describe('state and parameter tools', () => {
       expect(state.patch.modulations.total).toBe(2)
       expect(state.patch.modulationCount).toBe(2)
     }
+    // ...and the widening the description points at must actually work in the
+    // mode the same description recommends first. This threw before: compact
+    // set the parameters flag, so any modulation paging looked like a second
+    // competing view and the named recovery path failed.
+    for (const input of [{ format: 'compact', modulationLimit: MAX_MOD_SLOTS }, { modulationLimit: MAX_MOD_SLOTS }, { format: 'compact', modulationOffset: 0 }]) {
+      const wide = await execute('get_synth_state', input)
+      expect(wide.patch.modulations.items, JSON.stringify(input)).toContainEqual(route)
+      expect(wide.patch.modulations.total, JSON.stringify(input)).toBe(2)
+    }
+    // A detailed parameter page and an LFO shape are still separate calls:
+    // those are two genuinely expensive views, unlike an always-present field.
+    await expect(execute('get_synth_state', { group: 'env1', lfo: 1 })).rejects.toThrow(/separate calls/)
+
     // The description must name the keys the payload actually uses.
     const { byName } = setup()
     const description = byName.get('get_synth_state')!.description
