@@ -455,8 +455,14 @@ export function createWebMcpTools(
           format: { type: 'string', enum: ['full', 'compact'] },
           group: { type: 'string', maxLength: MAX_QUERY_LENGTH },
           search: { type: 'string', maxLength: MAX_QUERY_LENGTH },
-          parameterOffset: { type: 'integer', minimum: 0 },
-          parameterLimit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE },
+          parameterOffset: {
+            type: 'integer', minimum: 0,
+            description: 'Paging cursor into the filtered parameter list. Only needed for the full format, or to continue a compact page you limited yourself — omit it (and `parameterLimit`) with `format: "compact"` to get every non-default parameter at once.'
+          },
+          parameterLimit: {
+            type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE,
+            description: `Page size for the full format (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}). Omit it with \`format: "compact"\`, which then returns every non-default parameter in one response; an explicit limit pages the compact format too, so it costs several calls instead of one.`
+          },
           modulationOffset: { type: 'integer', minimum: 0 },
           modulationLimit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE },
           lfo: { type: 'integer', minimum: 1, maximum: 8 },
@@ -540,8 +546,14 @@ export function createWebMcpTools(
           format: { type: 'string', enum: ['full', 'compact'] },
           group: { type: 'string', maxLength: MAX_QUERY_LENGTH },
           search: { type: 'string', maxLength: MAX_QUERY_LENGTH },
-          offset: { type: 'integer', minimum: 0 },
-          limit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE },
+          offset: {
+            type: 'integer', minimum: 0,
+            description: `Paging cursor into the filtered parameter list. Only needed for the full format, or to continue a compact page you limited yourself — omit it (and \`limit\`) with \`format: "compact"\` to get all ${PARAMS.length} parameters at once.`
+          },
+          limit: {
+            type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE,
+            description: `Page size for the full format (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}). Omit it with \`format: "compact"\`, which then returns all ${PARAMS.length} parameters in one response; an explicit limit pages the compact format too, so it costs several calls instead of one.`
+          },
           sourceOffset: { type: 'integer', minimum: 0 },
           sourceLimit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE }
         }, additionalProperties: false

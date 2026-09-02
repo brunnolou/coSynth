@@ -239,6 +239,22 @@ describe('single-round-trip discovery', () => {
     await expect(execute('get_parameter_schema', { format: 'compact', limit: 61 })).rejects.toThrow(/1\.\.60/)
   })
 
+  it('says in the input schema that compact needs no limit', () => {
+    const { byName } = setup()
+    // An evaluated agent read "call once with format: compact", then sent
+    // `{ format: 'compact', limit: 60 }` because the schema advertised a
+    // maximum and said nothing about compact — and paged four times.
+    const schema = byName.get('get_parameter_schema')!.inputSchema as any
+    expect(schema.properties.limit.description).toMatch(/compact/i)
+    expect(schema.properties.limit.description).toMatch(/omit/i)
+    expect(schema.properties.limit.description).toContain(String(PARAMS.length))
+    expect(schema.properties.offset.description).toMatch(/compact/i)
+    const state = byName.get('get_synth_state')!.inputSchema as any
+    expect(state.properties.parameterLimit.description).toMatch(/compact/i)
+    expect(state.properties.parameterLimit.description).toMatch(/omit/i)
+    expect(state.properties.parameterOffset.description).toMatch(/compact/i)
+  })
+
   it('lists only non-default parameters when synth state is compact', async () => {
     const { engine, execute } = setup()
     await execute('update_parameters', { updates: [{ id: 'filter1.cutoff', value: 1200 }] })
