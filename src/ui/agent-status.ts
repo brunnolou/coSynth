@@ -1,11 +1,8 @@
-import { Bot, BotOff } from 'lucide'
 import type { SynthEngine } from '../audio/engine'
 import { normToValue, PARAMS, paramIndex } from '../shared/params'
 import type { AgentAction, AgentActivitySnapshot } from '../webmcp/activity'
 import { el } from './common'
 import { guideTarget } from './guide-target'
-import { iconButton, setButtonIcon } from './icon-button'
-import { Popover } from './popover'
 import './agent-status.css'
 
 const RUNNING: Record<string, string> = {
@@ -35,17 +32,26 @@ export function readinessSentence(state: AgentActivitySnapshot): string {
   return `${ready}${state.audioToolsLocked ? ' · Start audio to unlock 1' : ''}`
 }
 
+/** Short state word for the single AI button, so the icon never has to carry meaning alone. */
+export function stateLabel(state: AgentActivitySnapshot, working: boolean): string {
+  if (state.toolAvailability === 'unavailable') return 'AI off'
+  if (state.toolAvailability === 'checking') return 'AI starting'
+  if (state.toolAvailability === 'error' || state.lastError) return 'AI error'
+  if (working) return 'AI working'
+  const count = state.pendingChanges.length
+  if (count) return `${count} change${count === 1 ? '' : 's'}`
+  return 'AI ready'
+}
+
 /** Status presentation is separate from tool ownership, history and control markers. */
 export class AgentStatus {
   readonly root = el('div', 'agent-ai-strip')
-  readonly bot = iconButton('Show AI changes', Bot)
-  readonly status = el('button', 'agent-btn agent-icon-button agent-status-button')
+  readonly status = el('button', 'agent-btn agent-status-button')
   private readonly group = el('div', 'agent-ai-group')
   private readonly orb = el('span', 'agent-status-orb')
+  private readonly label = el('span', 'agent-status-label')
   private readonly feed = el('div', 'agent-feed')
   private readonly live = el('span', 'agent-live-message')
-  private readonly help = new Popover('AI tool availability')
-  private readonly helpText = el('p')
   private state: AgentActivitySnapshot
   private playing = false
   private burstStart: number | null = null
@@ -54,35 +60,25 @@ export class AgentStatus {
   private feedTimer?: ReturnType<typeof setTimeout>
   private feedKey = ''
   private line: HTMLElement | null = null
-  private botOff: boolean | null = null
   private readonly unsubscribe: () => void
 
-  constructor(engine: SynthEngine, state: AgentActivitySnapshot, toggle: () => void, review: () => void) {
+  constructor(engine: SynthEngine, state: AgentActivitySnapshot, review: () => void) {
     this.state = state
     this.group.setAttribute('role', 'group')
     this.group.setAttribute('aria-label', 'AI controls')
     this.status.type = 'button'
     this.status.setAttribute('aria-haspopup', 'dialog')
-    this.status.setAttribute('aria-label', 'AI status and changes')
     this.orb.setAttribute('aria-hidden', 'true')
-    this.status.append(this.orb)
+    this.status.append(this.orb, this.label)
     guideTarget(this.group, 'panel.agent.ai', 'AI status and controls', 'panel')
-    guideTarget(this.bot, 'button.agent.show-changes', 'Show AI change markers', 'button')
     guideTarget(this.status, 'button.agent.checkpoint', 'AI status and pending changes', 'button')
-    this.bot.addEventListener('click', () => {
-      if (this.usable()) toggle()
-      else this.help.toggle(this.bot)
-    })
-    this.status.addEventListener('click', () => {
-      if (this.usable()) { this.help.close(); review() }
-      else this.help.toggle(this.status)
-    })
-    this.group.append(this.bot, this.status)
+    // One button, one destination: the activity dialog explains every state, including no AI yet.
+    this.status.addEventListener('click', review)
+    this.group.append(this.status)
     this.feed.setAttribute('aria-hidden', 'true')
     this.live.setAttribute('role', 'status')
     this.live.setAttribute('aria-atomic', 'true')
-    this.help.root.append(this.helpText)
-    this.root.append(this.group, this.feed, this.live, this.help.root)
+    this.root.append(this.group, this.feed, this.live)
     const bpmIndex = paramIndex('master.bpm')
     const updateBpm = () => this.root.style.setProperty('--agent-beat-duration', `${60000 / normToValue(PARAMS[bpmIndex], engine.getParam(bpmIndex))}ms`)
     updateBpm()
@@ -90,34 +86,17 @@ export class AgentStatus {
     this.update(state, false)
   }
 
-  private usable(): boolean { return this.state.readyTools > 0 }
-
   update(state: AgentActivitySnapshot, playing: boolean): void {
     this.state = state
     this.playing = playing
     const off = state.toolAvailability === 'unavailable'
-    if (off !== this.botOff) { setButtonIcon(this.bot, 'Show AI changes', off ? BotOff : Bot); this.botOff = off }
-    if (this.usable()) {
-      this.bot.setAttribute('aria-pressed', String(state.showChanges))
-      this.bot.removeAttribute('aria-haspopup')
-      this.bot.setAttribute('aria-label', 'Show AI changes')
-      this.bot.title = state.showChanges ? 'Hide AI change markers' : 'Show AI change markers'
-      if (!this.help.root.hidden) this.help.close(true)
-    } else {
-      this.bot.removeAttribute('aria-pressed')
-      this.bot.setAttribute('aria-haspopup', 'dialog')
-      this.bot.setAttribute('aria-label', 'AI tool availability')
-      this.bot.title = 'AI tool availability'
-    }
-    this.helpText.textContent = off
-      ? 'AI tools aren’t available in this browser. Try opening coSynth in ChatGPT Desktop. You can still play and edit sounds here.'
-      : state.toolAvailability === 'checking' ? 'Registering AI tools. You can still play and edit sounds while they load.'
-      : `This browser exposes WebMCP, but tool registration failed. ${state.registrationErrors.map(error => `${error.tool}: ${error.message}`).join(' ')} Try reloading the page.`
     const count = state.pendingChanges.length
     const humanError = state.lastAction?.tool === 'human_checkpoint' && state.lastAction.status === 'failed' ? state.lastAction : null
     const error = state.lastError?.summary ?? state.registrationErrors[0]?.message ?? humanError?.summary
+    const label = stateLabel(state, state.activeToolCalls > 0)
+    if (this.label.textContent !== label) this.label.textContent = label
     this.status.title = `${readinessSentence(state)}. ${error ? `Error: ${error}. ` : ''}${count} pending AI change${count === 1 ? '' : 's'}. Open activity and review.`
-    this.status.setAttribute('aria-label', `AI status and changes: ${count} pending${error ? ', error' : ''}`)
+    this.status.setAttribute('aria-label', `AI activity — ${label}: ${count} pending change${count === 1 ? '' : 's'}${error ? ', error' : ''}`)
     this.group.dataset.tone = off ? 'off' : error ? 'error' : count ? 'pending' : 'idle'
     this.renderMotion()
     const action = state.actions.at(-1)
@@ -167,6 +146,5 @@ export class AgentStatus {
     this.unsubscribe()
     clearTimeout(this.timer)
     clearTimeout(this.feedTimer)
-    this.help.close()
   }
 }

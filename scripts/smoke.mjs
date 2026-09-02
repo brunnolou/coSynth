@@ -25,13 +25,20 @@ if (await page.locator('.driver-popover-title').textContent() !== 'Create sounds
   process.exit(1)
 }
 // This browser exposes no native modelContext, so the vendored webmcp.dev
-// widget is the registration path. It does register, which flips the Bot button
-// from the "AI tool availability" explainer to a working change toggle - so this
-// asserts the legacy fallback reached the tools end to end. Before that fallback
-// existed, no-WebMCP meant no tools and the label stayed on the explainer.
-const botLabel = await page.locator('[data-guide-id="button.agent.show-changes"]').getAttribute('aria-label')
-if (botLabel !== 'Show AI changes') {
-  console.error(`Legacy WebMCP fallback did not register tools; Bot button reads ${JSON.stringify(botLabel)}`)
+// widget is the registration path. It does register, which moves the AI status
+// button off "AI off" and makes the strip report a tool count - so this asserts
+// the legacy fallback reached the tools end to end. Before that fallback
+// existed, no-WebMCP meant no tools and the button stayed off.
+const aiButton = page.locator('[data-guide-id="button.agent.checkpoint"] .agent-status-label')
+try {
+  await aiButton.filter({ hasText: 'AI ready' }).waitFor({ timeout: 10000 })
+} catch {
+  console.error(`Legacy WebMCP fallback did not register tools; AI button reads ${JSON.stringify(await aiButton.textContent())}`)
+  process.exit(1)
+}
+const readiness = await page.locator('.agent-live-message').textContent()
+if (!/\d+ tools ready/.test(readiness ?? '')) {
+  console.error(`AI strip did not report a registered tool count; it reads ${JSON.stringify(readiness)}`)
   process.exit(1)
 }
 

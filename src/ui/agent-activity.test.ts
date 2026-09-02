@@ -162,20 +162,39 @@ it('disables unavailable operations and drops subscriptions at disposal', () => 
   expect(listeners.size).toBe(0)
 })
 
-it('replaces the checkbox with a Bot toggle and allows empty activity review', () => {
-  const activity = agentActivityFor(engine)
-  const bot = panel.root.querySelector('[data-guide-id="button.agent.show-changes"]') as HTMLButtonElement
+it('offers one AI button that opens activity and invites a first prompt', () => {
   const review = panel.root.querySelector('[data-guide-id="button.agent.checkpoint"]') as HTMLButtonElement
   expect(panel.root.querySelector('input[type="checkbox"]')).toBeNull()
-  expect(bot.getAttribute('aria-pressed')).toBe('true')
-  bot.click()
-  expect(activity.snapshot().showChanges).toBe(false)
-  expect(bot.getAttribute('aria-pressed')).toBe('false')
-  expect(bot.querySelector('svg')).not.toBeNull()
+  expect(panel.root.querySelectorAll('.agent-ai-group button')).toHaveLength(1)
+  expect(panel.root.querySelector('[data-guide-id="button.agent.show-changes"]')).toBeNull()
+  expect(review.textContent).toBe('AI ready')
   expect(review.disabled).toBe(false)
   review.click()
   expect((panel.root.querySelector('[data-guide-id="dialog.agent-changes"]') as HTMLDialogElement).open).toBe(true)
+  const onboarding = panel.root.querySelector('.agent-onboarding') as HTMLElement
+  expect(onboarding.hidden).toBe(false)
+  expect(onboarding.textContent).toContain('Open this page in the ChatGPT Desktop app and ask.')
+  expect(onboarding.querySelectorAll('.agent-onboarding-prompts li').length).toBeGreaterThan(2)
+  const keep = [...panel.root.querySelectorAll('button')].find(node => node.textContent === 'Keep changes') as HTMLButtonElement
+  expect(keep.hidden).toBe(true) // Nothing to keep, so no dead controls or reject explainer.
+  expect((panel.root.querySelector('.agent-param-list') as HTMLElement).hidden).toBe(true)
   expect(panel.root.querySelector('.agent-feed')?.textContent).toBe('15 tools ready · Start audio to unlock 1')
+})
+
+it('names the pending count on the button and swaps the invitation for the change list', () => {
+  const activity = agentActivityFor(engine)
+  const review = panel.root.querySelector('[data-guide-id="button.agent.checkpoint"]') as HTMLButtonElement
+  activity.setToolReadiness(0, true, { available: false })
+  expect(review.textContent).toBe('AI off')
+  expect(panel.root.querySelector('.agent-onboarding')?.textContent).toContain('ChatGPT Desktop app')
+  activity.setToolReadiness(17, false, { available: true })
+  engine.setParamById('osc1.level', 0.1, 'ai')
+  expect(review.textContent).toBe('1 change')
+  expect(review.getAttribute('aria-label')).toContain('1 pending change')
+  expect((panel.root.querySelector('.agent-onboarding') as HTMLElement).hidden).toBe(true)
+  const keep = [...panel.root.querySelectorAll('button')].find(node => node.textContent === 'Keep changes') as HTMLButtonElement
+  expect(keep.hidden).toBe(false)
+  expect(panel.root.querySelector('.agent-onboarding + .agent-section-title')?.textContent).toBe('Pending changes (1)')
 })
 
 it('uses a 2s minimum activity burst, a 600ms settle, and BPM playback priority', async () => {
@@ -254,26 +273,19 @@ it('updates completion in place, retains concurrent failures and keeps the feed 
   expect(panel.root.querySelectorAll('.agent-tool-call')).toHaveLength(3)
 })
 
-it('shows capability-specific help with Escape and outside-click dismissal', () => {
+it('explains a browser without AI tools inside the activity dialog', () => {
   const activity = agentActivityFor(engine)
-  const bot = panel.root.querySelector('[data-guide-id="button.agent.show-changes"]') as HTMLButtonElement
-  const help = panel.root.querySelector('.app-popover') as HTMLElement
+  const review = panel.root.querySelector('[data-guide-id="button.agent.checkpoint"]') as HTMLButtonElement
+  const onboarding = panel.root.querySelector('.agent-onboarding') as HTMLElement
   activity.setToolReadiness(0, true, { available: false })
   expect(panel.root.querySelector('.agent-ai-group')?.getAttribute('data-tone')).toBe('off')
-  expect(bot.hasAttribute('aria-pressed')).toBe(false)
-  bot.click()
-  expect(help.hidden).toBe(false)
-  expect(help.textContent).toContain('ChatGPT Desktop')
-  expect(document.activeElement).toBe(help)
-  help.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-  expect(help.hidden).toBe(true)
-  expect(document.activeElement).toBe(bot)
+  review.click()
+  expect((panel.root.querySelector('[data-guide-id="dialog.agent-changes"]') as HTMLDialogElement).open).toBe(true)
+  expect(onboarding.hidden).toBe(false)
+  expect(onboarding.textContent).toContain('can’t reach the AI tools. Open this page in the ChatGPT Desktop app and ask.')
   activity.setToolReadiness(0, true, { available: true, errors: [{ tool: 'get_synth_state', message: 'Denied' }] })
-  bot.click()
-  expect(help.textContent).toContain('registration failed')
-  expect(help.textContent).not.toContain('ChatGPT Desktop')
-  document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }))
-  expect(help.hidden).toBe(true)
-  activity.setToolReadiness(17, false, { available: true })
-  expect(bot.getAttribute('aria-pressed')).toBe('true')
+  expect(review.textContent).toBe('AI error')
+  expect(onboarding.textContent).toContain('failed to register')
+  expect(onboarding.textContent).toContain('open this page in the ChatGPT Desktop app and ask.')
+  expect(panel.root.querySelector('[data-guide-id="dialog.agent-changes"] .history-error')?.textContent).toContain('get_synth_state: Denied')
 })

@@ -22,6 +22,27 @@ function comparisonLine(metric: string, value: { candidate: number | null; delta
   return `${metric}: ${value.candidate.toFixed(2)}${delta}`
 }
 
+/** Different from the welcome tour's list on purpose: a second set of ideas to try. */
+const PROMPT_IDEAS = [
+  'Build me a rubbery acid bass.',
+  'Make a glassy bell pluck with a long tail.',
+  'Give this more air and less mud.',
+  'Wobble the filter in time with the beat.',
+  'Play a dreamy four-chord loop.',
+  'Compare this to the preset I started from.',
+  'Teach me how the envelope shapes the attack.'
+]
+
+function invitation(state: AgentActivitySnapshot): string {
+  const invite = 'Open this page in the ChatGPT Desktop app and ask.'
+  if (state.toolAvailability === 'unavailable') {
+    return `Nothing yet — this browser can’t reach the AI tools. ${invite} ChatGPT then designs sounds with you right here. Keep playing meanwhile.`
+  }
+  if (state.toolAvailability === 'checking') return `Getting the AI tools ready. ${invite} Every move ChatGPT makes shows up here.`
+  if (state.toolAvailability === 'error') return `The AI tools failed to register. Reload the page, or ${invite.charAt(0).toLowerCase()}${invite.slice(1)}`
+  return `Nothing yet. ${invite} Every parameter ChatGPT touches lands here for you to keep or reject.`
+}
+
 interface HistoryRow { root: HTMLElement; label: HTMLElement; meta: HTMLElement; direct: HTMLElement; details: HTMLElement; action: HTMLButtonElement; signature: string }
 
 /** One view for human and AI edits, with a separate list of replayable actions. */
@@ -42,8 +63,11 @@ export class AgentActivityPanel {
   private readonly toolLogSummary = el('summary', '', 'Tool calls (0)')
   private readonly toolLogList = el('ol', 'agent-tool-log-list')
   private logSignature = ''
+  private readonly explainer = el('p', '', 'Reject undoes only pending AI changes and adds one sound-history entry. Your manual edits are kept. Editing a route, LFO shape, or FX order makes that whole unit yours.')
   private readonly changeCount = el('h3', 'agent-section-title')
   private readonly changeList = el('div', 'agent-param-list')
+  private readonly onboarding = el('div', 'agent-modal-section agent-onboarding')
+  private readonly onboardingText = el('p', 'agent-empty')
   private readonly comparison = el('div', 'agent-modal-section')
   private readonly keep = button('Keep changes')
   private readonly reject = button('Reject changes')
@@ -71,8 +95,7 @@ export class AgentActivityPanel {
     open.classList.add('agent-history-open')
     const walkthrough = iconButton('Walkthrough', CircleHelp)
     walkthrough.classList.add('agent-walkthrough')
-    this.indicator = new AgentStatus(engine, this.state,
-      () => activity.setShowChanges(!this.state.showChanges), () => this.reviewDialog.open())
+    this.indicator = new AgentStatus(engine, this.state, () => this.reviewDialog.open())
     guideTarget(this.root, 'panel.agent', 'History and agent activity', 'panel')
     for (const [node, id, label] of [
       [this.undo, 'undo', 'Undo sound edit'], [this.redo, 'redo', 'Redo sound edit'],
@@ -112,9 +135,11 @@ export class AgentActivityPanel {
       if (activity.restoreCheckpoint()) this.reviewDialog.close()
     })
     this.toolLog.append(this.toolLogSummary, el('p', 'agent-empty', 'Latest 100 tool calls, kept in this tab until reload.'), this.toolLogList)
-    this.reviewDialog.body.append(this.readiness, this.activityError,
-      el('p', '', 'Reject undoes only pending AI changes and adds one sound-history entry. Your manual edits are kept. Editing a route, LFO shape, or FX order makes that whole unit yours.'),
-      this.changeCount, this.changeList, this.comparison, this.toolLog
+    const ideas = el('ul', 'agent-onboarding-prompts')
+    ideas.append(...PROMPT_IDEAS.map(idea => el('li', '', idea)))
+    this.onboarding.append(el('h3', 'agent-section-title', 'Design a sound with AI'), this.onboardingText, ideas)
+    this.reviewDialog.body.append(this.readiness, this.activityError, this.explainer,
+      this.onboarding, this.changeCount, this.changeList, this.comparison, this.toolLog
     )
     this.reviewDialog.footer.append(this.keep, this.reject)
     this.activityError.setAttribute('role', 'alert')
@@ -154,6 +179,11 @@ export class AgentActivityPanel {
       services.performance.subscribe(() => this.render())
     )
     this.render()
+  }
+
+  /** Lets a control outside this panel (the keyboard bar) raise the same dialog. */
+  openHistory(): void {
+    this.dialog.open()
   }
 
   dispose(): void {
@@ -259,6 +289,12 @@ export class AgentActivityPanel {
       }))
     }
     this.keep.disabled = this.reject.disabled = !count || busy
+    // Nothing has happened yet: invite the user in instead of explaining a reject they cannot do.
+    const fresh = !count && !this.state.actions.length
+    this.keep.hidden = this.reject.hidden = this.explainer.hidden = !count
+    this.onboarding.hidden = !fresh
+    this.changeCount.hidden = this.changeList.hidden = fresh
+    this.onboardingText.textContent = invitation(this.state)
     const signature = JSON.stringify([this.state.pendingChanges, this.state.comparison])
     if (signature === this.reviewSignature) return
     this.reviewSignature = signature
