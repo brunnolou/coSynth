@@ -222,6 +222,49 @@ export class SynthEngine {
     this.node?.port.postMessage(msg, transfer ?? [])
   }
 
+  /**
+   * Resolve once the worklet processor has handled every message posted so far,
+   * reporting whether that was actually confirmed.
+   *
+   * `AudioWorkletNode.port.postMessage` hands work to the audio thread
+   * asynchronously and with no ordering against rendering. That is invisible in
+   * a live context, which renders in real time and has whole milliseconds to
+   * drain the queue, but an `OfflineAudioContext` starts rendering the moment
+   * `startRendering()` is called and can outrun its own message queue: a
+   * note-on posted just before it may not reach the processor until the render
+   * next idles, by which point the note's whole envelope is already behind it.
+   *
+   * The barrier is the standard fix. A `MessagePort` delivers in order and the
+   * processor answers `ping` from inside the same handler that applies every
+   * other message, so an acknowledgement is proof the queue has drained. The
+   * reply comes back over a transferred channel of its own rather than the
+   * node's port, so an offline engine — which deliberately leaves
+   * `port.onmessage` unset to avoid paying for scope and status frames it would
+   * never read — does not have to start that port to hear it.
+   *
+   * Resolves `false` rather than hanging when the acknowledgement does not
+   * arrive inside `timeoutMs`, or when there is no worklet or no
+   * `MessageChannel` to ask over. Callers must stay correct without the
+   * guarantee: a barrier that could stall is worse than the race it closes.
+   */
+  async awaitWorkletSync(timeoutMs = 2000): Promise<boolean> {
+    const node = this.node
+    if (!node || typeof MessageChannel !== 'function') return false
+    const channel = new MessageChannel()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await new Promise<boolean>(resolve => {
+        channel.port1.onmessage = () => resolve(true)
+        timer = setTimeout(() => resolve(false), timeoutMs)
+        this.post({ type: 'ping', port: channel.port2 }, [channel.port2])
+      })
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      channel.port1.onmessage = null
+      channel.port1.close()
+    }
+  }
+
   /** Push the complete current state to the worklet (startup / preset load). */
   private syncAll(): void {
     for (let i = 0; i < NUM_PARAMS; i++) this.post({ type: 'param', index: i, value: this.values[i] })

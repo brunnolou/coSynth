@@ -30,11 +30,23 @@ export interface OfflineRenderOptions {
   createContext?: (options: { numberOfChannels: number; length: number; sampleRate: number }) => BaseAudioContext
   /** Seam for tests: build the scratch engine over that context. */
   createEngine?: (context: BaseAudioContext) => SynthEngine
+  /**
+   * How long each worklet barrier waits for its acknowledgement before giving
+   * up on the guarantee and rendering anyway. See `SYNC_TIMEOUT_MS`.
+   */
+  syncTimeoutMs?: number
 }
 
 /** Web Audio renders in 128-frame quanta; `suspend()` only accepts boundaries. */
 const RENDER_QUANTUM = 128
 const DEFAULT_SAMPLE_RATE = 48000
+/**
+ * How long a render waits for the worklet to acknowledge its messages. Long
+ * enough for a wavetable-and-sample `syncAll()` on a loaded machine, short
+ * enough that a browser whose offline worklet never answers costs a render
+ * rather than a session.
+ */
+const SYNC_TIMEOUT_MS = 2000
 
 /** Mono WAV handed to audio-capable agents: small enough to put in a message. */
 export const BASE64_SAMPLE_RATE = 22050
@@ -170,6 +182,15 @@ function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose
 /**
  * Render `notes` through a throwaway copy of `engine`'s patch and return the
  * result as lossless PCM plus a WAV blob.
+ *
+ * The patch and the note events reach the render worklet as port messages,
+ * which `startRendering()` does not wait for, so each attempt puts a
+ * `SynthEngine.awaitWorkletSync` barrier in front of rendering and in front of
+ * every mid-render `resume()`.
+ *
+ * The barrier is allowed to give up rather than hang, so it closes the race
+ * without being a guarantee: a browser whose offline worklet never answers gets
+ * exactly the behaviour it had before.
  */
 export async function renderOffline(
   engine: SynthEngine,
@@ -222,6 +243,7 @@ export async function renderOffline(
     throw new Error('Offline rendering is unavailable here: this OfflineAudioContext has no suspend()')
   }
 
+  const syncTimeout = options.syncTimeoutMs ?? SYNC_TIMEOUT_MS
   const player = new OfflineNotes(scratch)
   const events = noteEvents(notes, duration, sampleRate)
   const immediate = events.filter(event => event.frame === 0)
@@ -238,16 +260,31 @@ export async function renderOffline(
     else byFrame.set(event.frame, [event])
   }
   for (const [frame, bucket] of [...byFrame.entries()].sort((a, b) => a[0] - b[0])) {
-    pending.push(suspendable.suspend(frame / sampleRate).then(() => {
+    pending.push(suspendable.suspend(frame / sampleRate).then(async () => {
       // Once cancelled, stop scheduling: no further note events are applied, so
       // an abandoned render cannot keep mutating the scratch engine.
-      if (!signal?.aborted) for (const event of bucket) player.apply(event)
+      if (!signal?.aborted) {
+        for (const event of bucket) player.apply(event)
+        // Held suspended until the processor confirms it has these events, for
+        // the same reason as the barrier before `startRendering()`: resuming
+        // first would let the render outrun them and place the event late by
+        // however many quanta the queue took to drain. `awaitWorkletSync`
+        // resolves either way, so this cannot leave the render suspended.
+        await scratch.awaitWorkletSync(syncTimeout)
+      }
       // Deliberately not awaited: resuming is what lets rendering continue.
       // Still resumed after an abort, so the orphaned render below can finish
       // and be collected instead of sitting suspended forever.
       void suspendable.resume?.()
     }))
   }
+
+  // The barrier that closes the race this whole render turns on: everything
+  // above — the patch, the modulation, the wavetables, the frame-0 note-ons —
+  // reached the processor as port messages, and `startRendering()` does not
+  // wait for them. See `SynthEngine.awaitWorkletSync`.
+  await scratch.awaitWorkletSync(syncTimeout)
+  if (signal?.aborted) throw abortError()
 
   // The Web Audio API offers no way to cancel an in-flight `startRendering()`.
   // Racing it against the signal is therefore about the CALLER, not the CPU:

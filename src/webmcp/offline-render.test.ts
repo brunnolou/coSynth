@@ -32,6 +32,8 @@ class FakeOfflineContext {
   readonly resumes: number[] = []
   /** True once `startRendering()` has actually produced its buffer. */
   rendered = false
+  /** True as soon as `startRendering()` is entered, buffer or not. */
+  startedRendering = false
   /** Awaited just before the buffer is returned, so a test can stall a render. */
   hold: Promise<void> | null = null
   /** Called after each suspension callback (and its `resume`) has run. */
@@ -59,6 +61,7 @@ class FakeOfflineContext {
   }
 
   async startRendering() {
+    this.startedRendering = true
     // Everything posted before rendering starts belongs to frame 0.
     const marks: { frame: number; upTo: number }[] = [{ frame: 0, upTo: this.messages.length }]
     const order = [...this.waiting].sort((a, b) => a.time - b.time)
@@ -147,6 +150,15 @@ function stubWorkletNode(): ToWorklet[] {
     port = {
       onmessage: null as unknown,
       postMessage: (message: ToWorklet, transfer: Transferable[]) => {
+        // The real processor answers `ping` from inside the same handler that
+        // applies every other message, which is what makes the acknowledgement
+        // proof the queue has drained. `SynthEngine.awaitWorkletSync` waits on
+        // that reply, so a double that stayed silent would model a browser
+        // whose worklet never answers rather than this one.
+        if (message.type === 'ping') {
+          message.port.postMessage(true)
+          return
+        }
         messages.push(structuredClone(message, { transfer }))
       }
     }
@@ -493,6 +505,104 @@ describe('renderOffline', () => {
     expect(contexts[0].sampleRate).toBe(48000)
     expect(recording.sampleRate).toBe(48000)
     await expect(renderOffline(new SynthEngine(), [], 0)).rejects.toThrow(/greater than zero/i)
+  })
+})
+
+describe('renderOffline worklet barrier', () => {
+  /**
+   * A worklet stub whose `ping` acknowledgements are held back, so a test can
+   * decide whether — and when — the processor confirms it has the queue. This
+   * models the real bug: `port.postMessage` reaches the audio thread
+   * asynchronously while an `OfflineAudioContext` renders at CPU speed, so a
+   * note-on posted just before `startRendering()` can arrive after the note is
+   * already over.
+   */
+  function heldWorkletNode() {
+    const messages: ToWorklet[] = []
+    const held: (() => void)[] = []
+    vi.stubGlobal('AudioWorkletNode', class {
+      port = {
+        onmessage: null as unknown,
+        postMessage: (message: ToWorklet, transfer: Transferable[]) => {
+          if (message.type === 'ping') {
+            held.push(() => message.port.postMessage(true))
+            return
+          }
+          messages.push(structuredClone(message, { transfer }))
+        }
+      }
+      connect() {}
+    })
+    return { messages, held, ack: () => { for (const reply of held.splice(0)) reply() } }
+  }
+
+  const NOTES: PerformanceNote[] = [{ midi: 60, velocity: 1, start: 0, duration: 0.1 }]
+
+  /** Let the pending microtasks and zero-delay timers drain. */
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0))
+
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('does not start rendering until the worklet acknowledges the patch and note events', async () => {
+    const { messages, held, ack } = heldWorkletNode()
+    let context: FakeOfflineContext | null = null
+    const pending = renderOffline(liveEngineStub(), NOTES, 0.3, {
+      createContext: options => {
+        context = new FakeOfflineContext(options, messages)
+        return context as unknown as BaseAudioContext
+      }
+    })
+    await settle()
+    expect(held.length, 'a barrier was posted').toBe(1)
+    expect(context!.startedRendering, 'rendering must wait behind the acknowledgement').toBe(false)
+    expect(messages.some(message => message.type === 'noteOn'), 'the frame-0 note-on was posted first').toBe(true)
+    ack()
+    await pending
+    expect(context!.rendered).toBe(true)
+  })
+
+  it('gives up on an unanswered barrier and renders anyway rather than hanging', async () => {
+    const { messages } = heldWorkletNode()
+    const recording = await renderOffline(liveEngineStub(), NOTES, 0.3, {
+      createContext: options => new FakeOfflineContext(options, messages) as unknown as BaseAudioContext,
+      syncTimeoutMs: 5
+    })
+    // The fake still synthesises from the posted messages, so this is a real
+    // buffer: the barrier is an ordering guarantee, never a precondition.
+    expect(recording.channelData[0].some(sample => sample !== 0)).toBe(true)
+  })
+
+
+
+  it('holds each mid-render suspension until its events are acknowledged, then resumes', async () => {
+    const { messages, held, ack } = heldWorkletNode()
+    let context: FakeOfflineContext | null = null
+    const pending = renderOffline(liveEngineStub(), [{ midi: 60, velocity: 1, start: 0.25, duration: 0.1 }], 0.5, {
+      createContext: options => {
+        context = new FakeOfflineContext(options, messages)
+        return context as unknown as BaseAudioContext
+      }
+    })
+    await settle()
+    // The pre-render barrier: rendering has not begun.
+    expect(context!.startedRendering).toBe(false)
+    ack()
+    await settle()
+    expect(context!.startedRendering, 'the acknowledgement let rendering start').toBe(true)
+    // The first suspension applied its note-on and is now behind its own
+    // barrier, so it has not resumed yet.
+    expect(context!.resumes.length, 'a suspension does not resume ahead of its own events').toBe(0)
+    ack()
+    await settle()
+    expect(context!.resumes.length).toBeGreaterThan(0)
+    ack()
+    await pending
+    expect(context!.rendered).toBe(true)
+  })
+
+  it('reports an unavailable barrier instead of waiting on an engine with no worklet', async () => {
+    // No `start()` has run, so there is no node to ask and no guarantee to give.
+    expect(await new SynthEngine().awaitWorkletSync(5)).toBe(false)
   })
 })
 
