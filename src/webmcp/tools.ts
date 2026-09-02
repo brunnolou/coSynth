@@ -903,7 +903,7 @@ export function createWebMcpTools(
     },
     {
       name: 'play_notes',
-      description: 'Play a bounded sequence of MIDI notes with relative start and duration values, in seconds. A repeated pitch retriggers its voice. Requires runtime.running=true; otherwise click CLICK TO START AUDIO first. Example: {"notes":[{"midi":60,"velocity":0.8,"start":0,"duration":0.5}]}',
+      description: 'Play a bounded MIDI note sequence live; start/duration relative, in seconds. Runs only once a human clicks CLICK TO START AUDIO (runtime.running=true); before that use `render_audio`, which needs no gesture. A repeated pitch retriggers. Example: {"notes":[{"midi":60,"velocity":0.8,"start":0,"duration":0.5}]}',
       inputSchema: {
         type: 'object', properties: { notes: { type: 'array', minItems: 1, maxItems: MAX_NOTES, items: noteSchema } },
         required: ['notes'], additionalProperties: false
@@ -913,7 +913,7 @@ export function createWebMcpTools(
         return runPerformance(invocationSignal(options), async operationSignal => {
           const value = assertObject(input, 'input', ['notes'], ['notes'])
           const sequence = validatePerformanceNotes(value.notes, MAX_PLAY_SECONDS)
-          if (!engine.running) throw new Error('Start audio with a user gesture before playing notes')
+          if (!engine.running) throw new Error('Start audio with a user gesture before playing notes; render_audio needs no gesture and renders the same notes offline')
           assertNotesAvailable(engine, sequence.notes)
           throwIfAborted(operationSignal)
           const replayId = dependencies.replays?.startPerformance(sequence.notes, sequence.duration, 'AI note sequence', dependencies.currentSoundEntryId?.())
@@ -930,7 +930,7 @@ export function createWebMcpTools(
     },
     {
       name: 'render_audio',
-      description: 'Render a bounded note sequence and return `metrics` for it (plus `metricNotes`, which says how to read them). Offline by default: repeatable scheduling, far faster than real time, and available before the human has started audio — only `play_notes` needs that gesture. A single-pitch sequence also gets `metrics.harmonics`.',
+      description: 'Render a bounded note sequence and return `metrics` for it (plus `metricNotes`, which says how to read them). Offline by default: repeatable scheduling, far faster than real time, and available before the human starts audio. A single-pitch sequence also gets `metrics.harmonics`.',
       inputSchema: {
         type: 'object',
         properties: {

@@ -773,7 +773,10 @@ describe('note tools', () => {
 
   it('requires started audio and bounds the sequence', async () => {
     const first = setup(); first.engine.running = false
-    await expect(first.execute('play_notes', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }] })).rejects.toThrow(/start audio/i)
+    // play_notes is now registered at page load, so an agent meets this error
+    // rather than an absent tool. It has to name the thing to do instead.
+    await expect(first.execute('play_notes', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }] }))
+      .rejects.toThrow(/start audio.*render_audio/is)
     await expect(setup().execute('play_notes', { notes: [{ midi: 60, velocity: 1, start: 30, duration: 1 }] })).rejects.toThrow(/30 seconds/i)
     await expect(setup().execute('play_notes', { notes: Array.from({ length: 129 }, () => ({ midi: 60, velocity: 1, start: 0, duration: 1 })) })).rejects.toThrow(/128/i)
   })
@@ -1187,6 +1190,9 @@ describe('offline rendering', () => {
     expect(tool.description).toMatch(/offline/i)
     expect(tool.description).not.toMatch(/CLICK TO START AUDIO/i)
     expect(byName.get('play_notes')!.description).toMatch(/CLICK TO START AUDIO/i)
+    // play_notes registers at page load, so its description is read long
+    // before it is usable: it must point at the tool that needs no gesture.
+    expect(byName.get('play_notes')!.description).toMatch(/render_audio/)
   })
 
   it('renders offline by default, without a Start gesture, and repeats itself exactly', async () => {

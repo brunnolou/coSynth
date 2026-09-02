@@ -10,9 +10,9 @@ describe('registerLegacyWebMcpTools', () => {
       registerTool(name, _description, _schema, execute) { calls.push({ name, execute }) },
       disconnect() { disconnected++ }
     }
-    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
+    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
-    expect(calls).toHaveLength(11)
+    expect(calls).toHaveLength(12)
     expect(calls.map(call => call.name)).toContain('get_synth_state')
     await expect(calls.find(call => call.name === 'update_parameters')!.execute({ updates: [{ id: 'missing', value: 1 }] }))
       .resolves.toMatchObject({ ok: false, error: { code: 'tool_error', message: expect.stringContaining("Unknown parameter 'missing'") } })
@@ -23,9 +23,9 @@ describe('registerLegacyWebMcpTools', () => {
 
   it('counts every tool when the widget exposes no availableTools map', async () => {
     const legacy: LegacyWebMcp = { registerTool() {} }
-    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
+    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
-    expect(registration.registeredCount).toBe(11)
+    expect(registration.registeredCount).toBe(12)
     expect(registration.errors).toEqual([])
   })
 
@@ -37,9 +37,9 @@ describe('registerLegacyWebMcpTools', () => {
         legacy.availableTools!.set(name, {})
       }
     }
-    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
+    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
-    expect(registration.registeredCount).toBe(10)
+    expect(registration.registeredCount).toBe(11)
     expect(registration.errors).toEqual([{ tool: 'get_synth_state', message: 'widget refused the tool' }])
   })
 
@@ -53,9 +53,9 @@ describe('registerLegacyWebMcpTools', () => {
         legacy.availableTools!.set(name, {})
       }
     }
-    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
+    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
-    expect(registration.registeredCount).toBe(10)
+    expect(registration.registeredCount).toBe(11)
     expect(registration.errors).toHaveLength(1)
     expect(registration.errors[0].tool).toBe('update_parameters')
     expect(registration.errors[0].message).toContain('update_parameters')
@@ -73,9 +73,9 @@ describe('registerLegacyWebMcpTools', () => {
         return Promise.resolve()
       }
     }
-    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
+    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
-    expect(registration.registeredCount).toBe(10)
+    expect(registration.registeredCount).toBe(11)
     expect(registration.errors).toEqual([{ tool: 'get_synth_state', message: 'widget refused the tool' }])
   })
 
@@ -86,10 +86,10 @@ describe('registerLegacyWebMcpTools', () => {
         return Promise.resolve().then(() => { legacy.availableTools!.set(name, {}) })
       }
     }
-    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
+    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
     expect(registration.errors).toEqual([])
-    expect(registration.registeredCount).toBe(11)
+    expect(registration.registeredCount).toBe(12)
   })
 })
 
