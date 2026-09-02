@@ -19,6 +19,38 @@ export interface AudioMetrics {
   envelopeDb: number[]
   /** Gated RMS: envelope windows below -60 dBFS are dropped, so reverb tails and silence do not dilute it. */
   loudnessDb: number
+  /**
+   * Ten octave-band levels centred 31.25 Hz, 62.5 Hz … 16 kHz, in dB relative to the
+   * total spectral power, floored at -100 and rounded to 0.1. Silence reads all -100.
+   */
+  bandsDb: number[]
+  /** Frequency below which 85% of the spectral power lies. 0 for silence. */
+  spectralRolloffHz: number
+  /** Geometric over arithmetic mean of the power spectrum: 0 is tonal, 1 is noise. */
+  spectralFlatness: number
+  /** Present only when `analyzeAudio` was given an `f0Hz`; never fabricated. */
+  harmonics?: HarmonicMetrics
+}
+
+export interface HarmonicMetrics {
+  /**
+   * The first 12 partials, in dB relative to the loudest partial found (so the loudest
+   * reads 0). A partial with no peak above the noise reads the -120 dB floor.
+   */
+  amplitudesDb: number[]
+  /**
+   * B fitted from `f_n = n·f0·√(1 + B·n²)`. 0 is perfectly harmonic (an organ);
+   * a piano string is roughly 1e-4 … 1e-3; stiffer, more bell-like partials are higher.
+   */
+  inharmonicity: number
+}
+
+export interface AnalyzeAudioOptions {
+  /**
+   * Fundamental of the tone in Hz. Supply it for a single-pitch render and the analyzer
+   * adds `harmonics`; without it `harmonics` is absent rather than guessed.
+   */
+  f0Hz?: number
 }
 
 /** Metrics `compareAudioMetrics` scores one against one. */
@@ -48,6 +80,8 @@ export interface AudioMetricsComparison {
     & { decayT60Ms: NullableMetricComparisonDetail }
     /** Pearson correlation of the two `envelopeDb` curves; reference/candidate are their mean levels. */
     & { envelope: AudioMetricComparisonDetail }
+    /** Mean absolute dB difference across `bandsDb`; reference/candidate are their mean levels. */
+    & { bands: AudioMetricComparisonDetail }
 }
 
 const clampSimilarity = (value: number): number => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
@@ -61,19 +95,35 @@ const metricKeys: ComparedMetricKey[] = [
 const scalarMetricKeys: (keyof AudioMetrics)[] = [
   'peakDb', 'rmsDb', 'clippingCount', 'dcOffset',
   'spectralCentroidHz', 'attackMs', 'stereoWidth',
-  'timeToPeakMs', 'sustainDb', 'loudnessDb'
+  'timeToPeakMs', 'sustainDb', 'loudnessDb',
+  'spectralRolloffHz', 'spectralFlatness'
 ]
 const ENVELOPE_POINTS = 64
+/** Round to 0.1 dB and normalise -0, which reads as an oddity in JSON diffs. */
+const roundDb = (value: number): number => (Math.round(value * 10) / 10) + 0 || 0
+const BAND_COUNT = 10
+/** Octave band centres: 31.25 Hz doubled nine times, ending at 16 kHz. */
+const BAND_CENTERS_HZ = Array.from({ length: BAND_COUNT }, (_, index) => 31.25 * 2 ** index)
+const BAND_FLOOR_DB = -100
+const HARMONIC_COUNT = 12
+/** Partials quieter than this relative to the loudest are not real peaks; they do not constrain B. */
+const HARMONIC_FIT_FLOOR_DB = -60
+const HARMONIC_AMPLITUDE_FLOOR_DB = -120
 
-function assertEnvelopeDb(label: string, values: unknown): number[] {
-  if (!Array.isArray(values) || values.length !== ENVELOPE_POINTS) {
-    throw new Error(`${label}.envelopeDb must be an array of ${ENVELOPE_POINTS} numbers`)
+function assertNumberArray(label: string, field: string, values: unknown, expected: number): number[] {
+  if (!Array.isArray(values) || values.length !== expected) {
+    throw new Error(`${label}.${field} must be an array of ${expected} numbers`)
   }
   if (values.some(value => typeof value !== 'number' || !Number.isFinite(value))) {
-    throw new Error(`${label}.envelopeDb must contain finite numbers`)
+    throw new Error(`${label}.${field} must contain finite numbers`)
   }
   return values as number[]
 }
+
+const assertEnvelopeDb = (label: string, values: unknown): number[] =>
+  assertNumberArray(label, 'envelopeDb', values, ENVELOPE_POINTS)
+const assertBandsDb = (label: string, values: unknown): number[] =>
+  assertNumberArray(label, 'bandsDb', values, BAND_COUNT)
 
 /** Pearson correlation, so a shape match scores high regardless of overall level. */
 function correlation(left: readonly number[], right: readonly number[]): number {
@@ -111,6 +161,21 @@ function decayDetail(
   }
 }
 
+/** Mean absolute dB difference across the band vector, on a 6 dB scale. */
+function bandsDetail(reference: readonly number[], candidate: readonly number[]): AudioMetricComparisonDetail {
+  const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
+  let absoluteError = 0
+  for (let index = 0; index < reference.length; index++) absoluteError += Math.abs(candidate[index] - reference[index])
+  const referenceMean = mean(reference)
+  const candidateMean = mean(candidate)
+  return {
+    reference: referenceMean,
+    candidate: candidateMean,
+    delta: candidateMean - referenceMean,
+    similarity: exponentialSimilarity(absoluteError / reference.length, 6)
+  }
+}
+
 function envelopeDetail(reference: readonly number[], candidate: readonly number[]): AudioMetricComparisonDetail {
   const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
   const identical = reference.every((value, index) => value === candidate[index])
@@ -136,6 +201,7 @@ export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMet
       throw new Error(`${label}.clippingCount must be a nonnegative integer`)
     }
     assertEnvelopeDb(label, metrics.envelopeDb)
+    assertBandsDb(label, metrics.bandsDb)
   }
   for (const key of metricKeys) {
     if (key === 'decayT60Ms') continue
@@ -171,10 +237,11 @@ export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMet
     )),
     stereoWidth: detail('stereoWidth', exponentialSimilarity(candidate.stereoWidth - reference.stereoWidth, 0.35)),
     decayT60Ms: decayDetail(reference.decayT60Ms, candidate.decayT60Ms, logRatio),
-    envelope: envelopeDetail(reference.envelopeDb, candidate.envelopeDb)
+    envelope: envelopeDetail(reference.envelopeDb, candidate.envelopeDb),
+    bands: bandsDetail(reference.bandsDb, candidate.bandsDb)
   }
 
-  const overallKeys = [...metricKeys.filter(key => key !== 'clippingCount'), 'envelope' as const]
+  const overallKeys = [...metricKeys.filter(key => key !== 'clippingCount'), 'envelope' as const, 'bands' as const]
   const similarity = overallKeys.reduce((sum, key) => sum + details[key].similarity, 0) / overallKeys.length
   return { similarity: clampSimilarity(similarity), details }
 }
@@ -311,7 +378,178 @@ function measureDecayT60Ms(envelope: Envelope, startIndex: number, level: number
   return Number.isFinite(t60) && t60 > 0 ? t60 : null
 }
 
-export function analyzeAudio(channels: readonly Float32Array[], sampleRate: number): AudioMetrics {
+/**
+ * Hann-windowed power spectrum summed over channels; index 0 is DC. Tiles the whole buffer
+ * unless `singleWindowStart` asks for one window at a given offset.
+ */
+function accumulateSpectrum(
+  channels: readonly Float32Array[],
+  length: number,
+  fftSize: number,
+  singleWindowStart?: number
+): Float64Array {
+  const starts: number[] = []
+  if (singleWindowStart !== undefined) {
+    starts.push(Math.max(0, Math.min(singleWindowStart, length - fftSize)))
+  } else {
+    for (let start = 0; start + fftSize <= length; start += fftSize) starts.push(start)
+    const finalStart = length - fftSize
+    if (starts[starts.length - 1] !== finalStart) starts.push(finalStart)
+  }
+
+  const spectrum = new Float64Array(fftSize / 2 + 1)
+  const re = new Float32Array(fftSize)
+  const im = new Float32Array(fftSize)
+  for (const start of starts) {
+    for (const channel of channels) {
+      im.fill(0)
+      for (let i = 0; i < fftSize; i++) {
+        const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (fftSize - 1))
+        re[i] = channel[start + i] * window
+      }
+      fft(re, im)
+      for (let bin = 0; bin < spectrum.length; bin++) {
+        spectrum[bin] += re[bin] * re[bin] + im[bin] * im[bin]
+      }
+    }
+  }
+  return spectrum
+}
+
+/**
+ * Geometric over arithmetic mean of the power bins. A pure tone puts everything in one
+ * bin and scores near 0; white noise spreads evenly and approaches 1.
+ */
+function measureFlatness(spectrum: Float64Array): number {
+  let maximum = 0
+  for (let bin = 1; bin < spectrum.length; bin++) maximum = Math.max(maximum, spectrum[bin])
+  if (!(maximum > 0)) return 0
+  // A floor 200 dB down keeps log(0) out without lifting a real noise floor.
+  const floor = maximum * 1e-20
+  let logSum = 0
+  let sum = 0
+  let count = 0
+  for (let bin = 1; bin < spectrum.length; bin++) {
+    const power = Math.max(floor, spectrum[bin])
+    logSum += Math.log(power)
+    sum += power
+    count++
+  }
+  if (count === 0) return 0
+  const flatness = Math.exp(logSum / count) / (sum / count)
+  return Number.isFinite(flatness) ? Math.max(0, Math.min(1, flatness)) : 0
+}
+
+/** Ten octave bands, each spanning centre/√2 … centre·√2, in dB relative to the total power. */
+function measureBands(spectrum: Float64Array, binHz: number, totalPower: number): number[] {
+  const bandPower = new Array<number>(BAND_COUNT).fill(0)
+  for (let bin = 1; bin < spectrum.length; bin++) {
+    const frequency = bin * binHz
+    for (let band = 0; band < BAND_COUNT; band++) {
+      const centre = BAND_CENTERS_HZ[band]
+      if (frequency >= centre / Math.SQRT2 && frequency < centre * Math.SQRT2) {
+        bandPower[band] += spectrum[bin]
+        break
+      }
+    }
+  }
+  return bandPower.map(power => {
+    const db = power > 0 ? 10 * Math.log10(power / totalPower) : BAND_FLOOR_DB
+    return roundDb(Math.max(BAND_FLOOR_DB, db))
+  })
+}
+
+/**
+ * Locate the first 12 partials by peak-picking ±3 % around n·f0 and fit the stiffness
+ * coefficient B of `f_n = n·f0·√(1 + B·n²)`.
+ *
+ * The window is taken at the envelope peak and is as long as the buffer allows (up to
+ * 32768 samples), because a decaying note only holds its partials near the onset and
+ * because B is only visible with sub-bin frequency accuracy — hence the parabolic
+ * interpolation over log magnitudes.
+ */
+function analyzeHarmonics(
+  channels: readonly Float32Array[],
+  length: number,
+  sampleRate: number,
+  f0Hz: number,
+  peakSampleIndex: number
+): HarmonicMetrics | undefined {
+  if (!Number.isFinite(f0Hz) || f0Hz <= 0) return undefined
+  let size = 1
+  while ((size << 1) <= Math.min(length, 32768)) size <<= 1
+  if (size < 256) return undefined
+
+  const spectrum = accumulateSpectrum(channels, length, size, peakSampleIndex)
+  const half = size / 2
+  const magnitude = new Float64Array(half + 1)
+  let strongest = 0
+  for (let bin = 0; bin <= half; bin++) {
+    magnitude[bin] = Math.sqrt(spectrum[bin])
+    if (bin > 0) strongest = Math.max(strongest, magnitude[bin])
+  }
+  if (!(strongest > 0)) return undefined
+
+  const binsPerHz = size / sampleRate
+  const logFloor = Math.log(Math.max(strongest * 1e-12, Number.MIN_VALUE))
+  const logMagnitude = (bin: number) => magnitude[bin] > 0 ? Math.max(logFloor, Math.log(magnitude[bin])) : logFloor
+  const partials: { frequency: number; amplitude: number }[] = []
+  for (let n = 1; n <= HARMONIC_COUNT; n++) {
+    const centreBin = n * f0Hz * binsPerHz
+    const low = Math.max(1, Math.floor(centreBin * 0.97))
+    const high = Math.min(half - 1, Math.ceil(centreBin * 1.03))
+    if (high < low) {
+      partials.push({ frequency: 0, amplitude: 0 })
+      continue
+    }
+    let bestBin = low
+    for (let bin = low; bin <= high; bin++) {
+      if (magnitude[bin] > magnitude[bestBin]) bestBin = bin
+    }
+    // Parabolic interpolation over log magnitudes: sub-bin accuracy is what makes B visible.
+    const a = logMagnitude(bestBin - 1)
+    const b = logMagnitude(bestBin)
+    const c = logMagnitude(bestBin + 1)
+    const denominator = a - 2 * b + c
+    const shift = denominator < 0 ? Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / denominator)) : 0
+    const amplitude = Math.exp(b - 0.25 * (a - c) * shift)
+    partials.push({
+      frequency: (bestBin + shift) * sampleRate / size,
+      amplitude: Number.isFinite(amplitude) ? amplitude : magnitude[bestBin]
+    })
+  }
+
+  const loudest = partials.reduce((best, partial) => Math.max(best, partial.amplitude), 0)
+  if (!(loudest > 0)) return undefined
+  const amplitudesDb = partials.map(partial => {
+    const db = partial.amplitude > 0 ? 20 * Math.log10(partial.amplitude / loudest) : HARMONIC_AMPLITUDE_FLOOR_DB
+    return roundDb(Math.max(HARMONIC_AMPLITUDE_FLOOR_DB, db))
+  })
+
+  // (f_n / (n·f0))² - 1 = B·n², so B is a least-squares fit through the origin.
+  let numerator = 0
+  let denominator = 0
+  for (let n = 1; n <= HARMONIC_COUNT; n++) {
+    const partial = partials[n - 1]
+    if (amplitudesDb[n - 1] <= HARMONIC_FIT_FLOOR_DB || !(partial.frequency > 0)) continue
+    const ratio = partial.frequency / (n * f0Hz)
+    const y = ratio * ratio - 1
+    const x = n * n
+    numerator += x * y
+    denominator += x * x
+  }
+  const inharmonicity = denominator > 0 ? numerator / denominator : 0
+  return {
+    amplitudesDb,
+    inharmonicity: Number.isFinite(inharmonicity) ? inharmonicity : 0
+  }
+}
+
+export function analyzeAudio(
+  channels: readonly Float32Array[],
+  sampleRate: number,
+  options: AnalyzeAudioOptions = {}
+): AudioMetrics {
   if (!channels.length || channels.some(channel => !(channel instanceof Float32Array) || channel.length === 0)) {
     throw new Error('At least one non-empty audio channel is required')
   }
@@ -376,30 +614,31 @@ export function analyzeAudio(channels: readonly Float32Array[], sampleRate: numb
   let fftSize = 1
   while ((fftSize << 1) <= Math.min(length, 4096)) fftSize <<= 1
   let spectralCentroidHz = 0
+  let spectralRolloffHz = 0
+  let spectralFlatness = 0
+  let bandsDb = new Array<number>(BAND_COUNT).fill(BAND_FLOOR_DB)
   if (fftSize >= 2 && peak > 0) {
-    const windowStarts: number[] = []
-    for (let start = 0; start + fftSize <= length; start += fftSize) windowStarts.push(start)
-    const finalStart = length - fftSize
-    if (windowStarts[windowStarts.length - 1] !== finalStart) windowStarts.push(finalStart)
+    const spectrum = accumulateSpectrum(channels, length, fftSize)
+    const binHz = sampleRate / fftSize
     let weightedPower = 0
     let totalPower = 0
-    for (const start of windowStarts) {
-      for (const channel of channels) {
-        const re = new Float32Array(fftSize)
-        const im = new Float32Array(fftSize)
-        for (let i = 0; i < fftSize; i++) {
-          const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (fftSize - 1))
-          re[i] = channel[start + i] * window
-        }
-        fft(re, im)
-        for (let bin = 1; bin <= fftSize / 2; bin++) {
-          const power = re[bin] * re[bin] + im[bin] * im[bin]
-          weightedPower += power * bin * sampleRate / fftSize
-          totalPower += power
+    for (let bin = 1; bin < spectrum.length; bin++) {
+      weightedPower += spectrum[bin] * bin * binHz
+      totalPower += spectrum[bin]
+    }
+    if (totalPower > 0) {
+      spectralCentroidHz = weightedPower / totalPower
+      let cumulative = 0
+      for (let bin = 1; bin < spectrum.length; bin++) {
+        cumulative += spectrum[bin]
+        if (cumulative >= 0.85 * totalPower) {
+          spectralRolloffHz = bin * binHz
+          break
         }
       }
+      spectralFlatness = measureFlatness(spectrum)
+      bandsDb = measureBands(spectrum, binHz, totalPower)
     }
-    if (totalPower > 0) spectralCentroidHz = weightedPower / totalPower
   }
 
   let stereoWidth = 0
@@ -432,7 +671,15 @@ export function analyzeAudio(channels: readonly Float32Array[], sampleRate: numb
     decayT60Ms,
     sustainDb,
     envelopeDb,
-    loudnessDb
+    loudnessDb,
+    bandsDb,
+    spectralRolloffHz,
+    spectralFlatness
+  }
+  if (options.f0Hz !== undefined) {
+    const peakSampleIndex = Math.round(envelope.peakIndex * hopMs * sampleRate / 1000)
+    const harmonics = peak > 0 ? analyzeHarmonics(channels, length, sampleRate, options.f0Hz, peakSampleIndex) : undefined
+    if (harmonics) metrics.harmonics = harmonics
   }
   for (const key of scalarMetricKeys) {
     if (!Number.isFinite(metrics[key])) {
@@ -444,6 +691,16 @@ export function analyzeAudio(channels: readonly Float32Array[], sampleRate: numb
   }
   if (!metrics.envelopeDb.every(Number.isFinite)) {
     throw new Error('Audio analysis produced nonfinite metric: envelopeDb')
+  }
+  if (metrics.bandsDb.length !== BAND_COUNT || !metrics.bandsDb.every(Number.isFinite)) {
+    throw new Error('Audio analysis produced nonfinite metric: bandsDb')
+  }
+  if (metrics.harmonics && !(
+    metrics.harmonics.amplitudesDb.length === HARMONIC_COUNT &&
+    metrics.harmonics.amplitudesDb.every(Number.isFinite) &&
+    Number.isFinite(metrics.harmonics.inharmonicity)
+  )) {
+    throw new Error('Audio analysis produced nonfinite metric: harmonics')
   }
   if (!Number.isInteger(metrics.clippingCount) || metrics.clippingCount < 0) {
     throw new Error('Audio analysis produced invalid clippingCount; expected a nonnegative integer')

@@ -13,6 +13,34 @@ describe('analyzeAudioAbortably', () => {
     })
   })
 
+  it('forwards analysis options to the inline fallback so single-note renders get harmonics', async () => {
+    vi.stubGlobal('Worker', undefined)
+    const sampleRate = 48000
+    const tone = Float32Array.from({ length: sampleRate }, (_, i) => {
+      let value = 0
+      for (let n = 1; n <= 8; n++) value += Math.sin(2 * Math.PI * 440 * n * i / sampleRate) / n
+      return 0.4 * value
+    })
+    const withF0 = await analyzeAudioAbortably([tone], sampleRate, undefined, { f0Hz: 440 })
+    expect(withF0.harmonics?.amplitudesDb).toHaveLength(12)
+    expect((await analyzeAudioAbortably([tone], sampleRate)).harmonics).toBeUndefined()
+  })
+
+  it('includes analysis options in the worker payload', () => {
+    const postMessage = vi.fn()
+    class FakeWorker {
+      addEventListener = vi.fn()
+      postMessage = postMessage
+      terminate = vi.fn()
+    }
+    vi.stubGlobal('Worker', FakeWorker)
+    void analyzeAudioAbortably([new Float32Array(4)], 8000, undefined, { f0Hz: 220 })
+    expect(postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ sampleRate: 8000, options: { f0Hz: 220 } }),
+      expect.any(Array)
+    )
+  })
+
   it('rejects without doing work when already aborted', async () => {
     const controller = new AbortController()
     controller.abort()
