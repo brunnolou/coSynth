@@ -160,7 +160,16 @@ export async function renderOffline(
   // OfflineAudioContext is single-use, so this object is discarded afterwards.
   const scratch = options.createEngine ? options.createEngine(ctx) : new SynthEngine({ context: ctx })
   await scratch.start()
-  scratch.loadPreset(engine.toPreset('render'))
+  // A snapshot, not a preset: a preset carries only parameters, modulation, LFO
+  // shapes and FX order, so a round-trip through one silently swaps an imported
+  // Custom wavetable for a built-in and drops the imported noise sample
+  // entirely — the render would then measure a different sound than the one the
+  // human hears. `captureSoundState()` includes both PCM assets and
+  // `restoreSoundState()` re-posts them via `syncAll()`. Its other side effects
+  // (`notifyPatch`, `allNotesOff`, param/matrix/FX-order listeners, the
+  // enclosing `batchSoundChange` notification) are no-ops on a scratch engine:
+  // it holds no notes and has no listeners registered.
+  scratch.restoreSoundState(engine.captureSoundState())
 
   // A context without `suspend` cannot place an event in time at all: every
   // note would be struck and released before rendering starts, returning

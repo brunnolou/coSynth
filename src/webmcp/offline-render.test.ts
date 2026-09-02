@@ -3,6 +3,8 @@ import { SynthEngine } from '../audio/engine'
 import { performNotes, type NoteEngine } from '../history/performance'
 import type { PerformanceNote } from '../history/types'
 import type { ToWorklet } from '../shared/messages'
+import { paramIndex, WAVETABLE_NAMES } from '../shared/params'
+import { NUM_MIPS, type Wavetable } from '../shared/wavetable-gen'
 import {
   BASE64_MAX_SECONDS, BASE64_SAMPLE_RATE, encodeWav, monoWavBase64, offlineRenderAvailable, renderOffline
 } from './offline-render'
@@ -350,6 +352,46 @@ describe('renderOffline', () => {
     expect(scratchEngines[0].started).toBe(true)
     expect(engine.started, 'the live engine was never started').toBe(false)
     expect(engine.heldNotes.size).toBe(0)
+  })
+
+  it('carries imported PCM assets into the scratch engine, not just the preset parameters', async () => {
+    const { messages, createContext } = harness()
+    const engine = liveEngineStub()
+    // An imported Custom wavetable and an imported noise sample: neither is
+    // part of a preset, so a preset round-trip would substitute a built-in
+    // table and no sample at all.
+    const table: Wavetable = {
+      name: 'Imported',
+      frameSize: 8,
+      numFrames: 1,
+      data: Float32Array.from([0, 0.25, 0.5, 0.75, 1, 0.75, 0.5, 0.25])
+    }
+    const noise = { data: Float32Array.from([0.1, -0.2, 0.3, -0.4]), sampleRate: 32000 }
+    engine.setParam(paramIndex('osc1.wavetable'), WAVETABLE_NAMES.indexOf('Custom') / (WAVETABLE_NAMES.length - 1))
+    engine.restoreSoundState({
+      ...engine.captureSoundState(),
+      customTables: [table, null, null],
+      noiseSample: noise
+    })
+
+    await renderOffline(engine, [{ midi: 60, velocity: 1, start: 0, duration: 0.1 }], 0.2, { createContext })
+
+    const wavetables = messages.filter((message): message is Extract<ToWorklet, { type: 'wavetable' }> =>
+      message.type === 'wavetable' && message.osc === 0)
+    expect(wavetables.length).toBeGreaterThan(0)
+    const posted = wavetables[wavetables.length - 1]
+    expect(posted.frameSize, 'the imported table, not a built-in substitute').toBe(table.frameSize)
+    expect(posted.numFrames).toBe(table.numFrames)
+    expect(posted.mips).toHaveLength(table.numFrames * NUM_MIPS * table.frameSize)
+    // Mip 0 is the untouched cycle, so the imported PCM is verifiable verbatim.
+    expect(Array.from(posted.mips.subarray(0, table.frameSize))).toEqual(Array.from(table.data))
+
+    const samples = messages.filter((message): message is Extract<ToWorklet, { type: 'sample' }> =>
+      message.type === 'sample')
+    expect(samples.length).toBeGreaterThan(0)
+    const sample = samples[samples.length - 1]
+    expect(sample.sampleRate, 'the imported sample reached the render worklet').toBe(noise.sampleRate)
+    expect(Array.from(sample.data)).toEqual(Array.from(noise.data))
   })
 
   it('uses the default sample rate when no context exists yet, and rejects a zero duration', async () => {
