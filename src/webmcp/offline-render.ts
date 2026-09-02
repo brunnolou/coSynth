@@ -4,8 +4,11 @@
  *
  * A scratch `SynthEngine` is built on a single-use `OfflineAudioContext`, loaded
  * with the live engine's current patch, and driven with sample-accurate note
- * events. Nothing touches the live graph, so a render needs no user gesture, no
- * wall-clock time, and produces the same samples every call.
+ * events. Nothing touches the live graph, so a render needs no user gesture and
+ * no wall-clock time. The scheduling is exact and repeatable; the samples are
+ * only repeatable up to the patch's own noise and random sources (noise
+ * oscillators, oscillator start-phase randomisation, the `random` mod source),
+ * which draw from `Math.random()` on every render.
  */
 import { SynthEngine, type RecordedAudio } from '../audio/engine'
 import type { PerformanceNote } from '../history/types'
@@ -38,13 +41,20 @@ export const BASE64_MAX_SECONDS = 8
  * True when this browser can render offline at all. jsdom and older embedded
  * browsers have neither constructor; without them `render_audio` must say so
  * and fall back to the real-time capture path.
+ *
+ * `suspend()` counts too: Safari has shipped an `OfflineAudioContext` without
+ * it, and with no way to place events in time a render can only be silence.
+ * Reporting unavailable sends the caller to the real-time path instead.
  */
 export function offlineRenderAvailable(): boolean {
   if (typeof OfflineAudioContext !== 'function') return false
   if (typeof AudioWorkletNode !== 'function') return false
+  const offlineProto: unknown = OfflineAudioContext.prototype
+  if (typeof offlineProto !== 'object' || offlineProto === null) return false
+  if (!('suspend' in (offlineProto as object))) return false
   const proto: unknown = typeof BaseAudioContext === 'function'
     ? BaseAudioContext.prototype
-    : OfflineAudioContext.prototype
+    : offlineProto
   return typeof proto === 'object' && proto !== null && 'audioWorklet' in (proto as object)
 }
 
@@ -53,9 +63,22 @@ interface NoteEvent {
   on: boolean
   midi: number
   velocity: number
+  /** Ordering within a quantum: releases, then strikes, then same-quantum releases. */
+  rank: number
 }
 
-/** Note-ons and note-offs on the render timeline, offs first within a quantum. */
+const RANK_OFF = 0
+const RANK_ON = 1
+/** A note whose end quantizes onto its own start still has to sound first. */
+const RANK_OFF_SAME_QUANTUM = 2
+
+/**
+ * Note-ons and note-offs on the render timeline. Within a quantum a release
+ * comes before a strike, so a note handing over to the next one frees its voice
+ * first — except for a note shorter than one quantum, whose own release must
+ * follow its own strike or the strike would leave the voice held for the whole
+ * render.
+ */
 function noteEvents(notes: readonly PerformanceNote[], duration: number, sampleRate: number): NoteEvent[] {
   const lastFrame = Math.max(0, Math.ceil(duration * sampleRate) - 1)
   const quantize = (seconds: number) => {
@@ -64,15 +87,48 @@ function noteEvents(notes: readonly PerformanceNote[], duration: number, sampleR
   }
   const events: NoteEvent[] = []
   for (const note of notes) {
-    events.push({ frame: quantize(note.start), on: true, midi: note.midi, velocity: note.velocity })
-    events.push({ frame: quantize(note.start + note.duration), on: false, midi: note.midi, velocity: note.velocity })
+    const on = quantize(note.start)
+    const off = quantize(note.start + note.duration)
+    events.push({ frame: on, on: true, midi: note.midi, velocity: note.velocity, rank: RANK_ON })
+    events.push({
+      frame: off,
+      on: false,
+      midi: note.midi,
+      velocity: note.velocity,
+      rank: off <= on ? RANK_OFF_SAME_QUANTUM : RANK_OFF
+    })
   }
-  return events.sort((a, b) => a.frame - b.frame || Number(a.on) - Number(b.on))
+  return events.sort((a, b) => a.frame - b.frame || a.rank - b.rank)
 }
 
-function applyEvent(engine: SynthEngine, event: NoteEvent): void {
-  if (event.on) engine.noteOn(event.midi, event.velocity)
-  else engine.noteOff(event.midi)
+/**
+ * Applies events to the scratch engine with the same per-pitch counting
+ * `performNotes` (src/history/performance.ts) uses, so a render hears exactly
+ * what `play_notes` plays: a repeated pitch releases and restrikes, and only
+ * the last instance's end releases the note. `SynthEngine.noteOn` is a no-op
+ * for a pitch already held, so without this the restrike is swallowed and the
+ * first note-off cuts the sound short.
+ */
+class OfflineNotes {
+  private readonly owner = Symbol('offline-render')
+  /** Active instances per pitch. */
+  private readonly active = new Map<number, number>()
+
+  constructor(private readonly engine: SynthEngine) {}
+
+  apply(event: NoteEvent): void {
+    const count = this.active.get(event.midi) ?? 0
+    if (event.on) {
+      if (count > 0) this.engine.noteOff(event.midi, this.owner)
+      this.engine.noteOn(event.midi, event.velocity, this.owner)
+      this.active.set(event.midi, count + 1)
+    } else if (count === 1) {
+      this.active.delete(event.midi)
+      this.engine.noteOff(event.midi, this.owner)
+    } else if (count > 1) {
+      this.active.set(event.midi, count - 1)
+    }
+  }
 }
 
 /**
@@ -106,10 +162,19 @@ export async function renderOffline(
   await scratch.start()
   scratch.loadPreset(engine.toPreset('render'))
 
+  // A context without `suspend` cannot place an event in time at all: every
+  // note would be struck and released before rendering starts, returning
+  // silence that looks like a successful render. `offlineRenderAvailable()`
+  // screens for this; refusing here keeps a caller that skipped it honest.
+  if (typeof suspendable.suspend !== 'function') {
+    throw new Error('Offline rendering is unavailable here: this OfflineAudioContext has no suspend()')
+  }
+
+  const player = new OfflineNotes(scratch)
   const events = noteEvents(notes, duration, sampleRate)
   const immediate = events.filter(event => event.frame === 0)
   const scheduled = events.filter(event => event.frame > 0)
-  for (const event of immediate) applyEvent(scratch, event)
+  for (const event of immediate) player.apply(event)
 
   // Register every suspension before rendering starts; one suspension per
   // quantum boundary, because a second suspend at the same frame is rejected.
@@ -120,18 +185,12 @@ export async function renderOffline(
     if (bucket) bucket.push(event)
     else byFrame.set(event.frame, [event])
   }
-  if (typeof suspendable.suspend === 'function') {
-    for (const [frame, bucket] of [...byFrame.entries()].sort((a, b) => a[0] - b[0])) {
-      pending.push(suspendable.suspend(frame / sampleRate).then(() => {
-        for (const event of bucket) applyEvent(scratch, event)
-        // Deliberately not awaited: resuming is what lets rendering continue.
-        void suspendable.resume?.()
-      }))
-    }
-  } else {
-    // A context without `suspend` cannot place events in time; apply them all up
-    // front rather than dropping the notes entirely.
-    for (const event of scheduled) applyEvent(scratch, event)
+  for (const [frame, bucket] of [...byFrame.entries()].sort((a, b) => a[0] - b[0])) {
+    pending.push(suspendable.suspend(frame / sampleRate).then(() => {
+      for (const event of bucket) player.apply(event)
+      // Deliberately not awaited: resuming is what lets rendering continue.
+      void suspendable.resume?.()
+    }))
   }
 
   const buffer = await suspendable.startRendering()
