@@ -224,6 +224,21 @@ describe('single-round-trip discovery', () => {
     await expect(execute('get_parameter_schema', { format: 'brief' })).rejects.toThrow(/format/i)
   })
 
+  it('reports the whole instrument and the next page when a compact call is truncated', async () => {
+    const { execute } = setup()
+    const result = await execute('get_parameter_schema', { format: 'compact', limit: 10 })
+    expect(result.parameters.items).toHaveLength(10)
+    // `total` is the instrument, not the page: a truncated page that claimed
+    // ten parameters would leave the agent believing it had seen everything.
+    expect(result.parameters.total).toBe(PARAMS.length)
+    expect(result.parameters.nextOffset).toBe(10)
+    const next = await execute('get_parameter_schema', { format: 'compact', offset: 10, limit: 10 })
+    expect(next.parameters.items).not.toContain(result.parameters.items[0])
+    expect(next.parameters.total).toBe(PARAMS.length)
+    // A compact limit is bounded by the maximum the input schema advertises.
+    await expect(execute('get_parameter_schema', { format: 'compact', limit: 61 })).rejects.toThrow(/1\.\.60/)
+  })
+
   it('lists only non-default parameters when synth state is compact', async () => {
     const { engine, execute } = setup()
     await execute('update_parameters', { updates: [{ id: 'filter1.cutoff', value: 1200 }] })

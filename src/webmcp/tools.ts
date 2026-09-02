@@ -471,7 +471,7 @@ export function createWebMcpTools(
         if (group && group.length > MAX_QUERY_LENGTH) throw new Error(`group is limited to ${MAX_QUERY_LENGTH} characters`)
         if (search && search.length > MAX_QUERY_LENGTH) throw new Error(`search is limited to ${MAX_QUERY_LENGTH} characters`)
         const offset = boundedInteger(value.parameterOffset, 'parameterOffset', 0, 0, PARAMS.length)
-        const limit = boundedInteger(value.parameterLimit, 'parameterLimit', format === 'compact' ? COMPACT_PAGE_SIZE : DEFAULT_PAGE_SIZE, 1, format === 'compact' ? COMPACT_PAGE_SIZE : MAX_PAGE_SIZE)
+        const limit = boundedInteger(value.parameterLimit, 'parameterLimit', format === 'compact' ? COMPACT_PAGE_SIZE : DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
         const matches = filteredParameters(group, search)
         const includeParameters = format === 'compact' || group !== undefined || search !== undefined || value.parameterOffset !== undefined || value.parameterLimit !== undefined
         const includeModulations = value.modulationOffset !== undefined || value.modulationLimit !== undefined
@@ -549,7 +549,9 @@ export function createWebMcpTools(
         if ((value.search as string | undefined)?.length && (value.search as string).length > MAX_QUERY_LENGTH) throw new Error(`search is limited to ${MAX_QUERY_LENGTH} characters`)
         const matches = filteredParameters(value.group as string | undefined, value.search as string | undefined)
         const offset = boundedInteger(value.offset, 'offset', 0, 0, PARAMS.length)
-        const limit = boundedInteger(value.limit, 'limit', format === 'compact' ? COMPACT_PAGE_SIZE : DEFAULT_PAGE_SIZE, 1, format === 'compact' ? COMPACT_PAGE_SIZE : MAX_PAGE_SIZE)
+        // An explicit limit is bounded by what the schema advertises; only the
+        // compact default reaches past it, to hand over the whole space at once.
+        const limit = boundedInteger(value.limit, 'limit', format === 'compact' ? COMPACT_PAGE_SIZE : DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
         const page = matches.slice(offset, offset + limit)
         const parameters = page.map(def => ({
           id: def.id, name: def.name, group: def.group,
@@ -569,7 +571,10 @@ export function createWebMcpTools(
         return {
           groups: [...PARAMETER_GROUPS],
           parameters: format === 'compact'
-            ? { items: page.map(compactParameter), total: page.length, format: 'compact' as const }
+            ? {
+              items: page.map(compactParameter), total: matches.length, format: 'compact' as const,
+              ...(offset + page.length < matches.length ? { nextOffset: offset + page.length } : {})
+            }
             : { items: parameters, offset, limit, total: matches.length, ...(offset + page.length < matches.length ? { nextOffset: offset + page.length } : {}) },
           ...(sourceOffset === undefined ? {} : {
             modulationSources: { items: sources.map(source => ({ ...source })), offset: sourceOffset, limit: sourceLimit, total: MOD_SOURCES.length, ...(sourceOffset + sources.length < MOD_SOURCES.length ? { nextOffset: sourceOffset + sources.length } : {}) }
