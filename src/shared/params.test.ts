@@ -63,6 +63,32 @@ describe('parameter unit hints', () => {
 })
 
 
+// `group` is what `get_parameter_schema` advertises as the filter key, so a
+// group name no id carries sends an agent looking for `<group>.*` parameters
+// that do not exist. A group is legitimate when some id starts with its name,
+// or when it deliberately collects several sections (`macros` holds
+// macro1..macro4). `global` is the one grandfathered exception: it holds the
+// `master.*` parameters under the section name the UI has always shown.
+const AGGREGATE_GROUPS = ['global']
+
+describe('parameter groups', () => {
+  it('names every group after a prefix its parameters actually use', () => {
+    const prefixes = new Set(PARAMS.map(def => def.id.split('.')[0]))
+    for (const group of new Set(PARAMS.map(def => def.group))) {
+      if (AGGREGATE_GROUPS.includes(group)) continue
+      const memberPrefixes = new Set(PARAMS.filter(def => def.group === group).map(def => def.id.split('.')[0]))
+      const named = prefixes.has(group) || memberPrefixes.size > 1
+      expect(named, `group '${group}' matches no parameter id prefix (${[...memberPrefixes].join(', ')})`).toBe(true)
+    }
+  })
+
+  it('keeps the persisted filter.routing id while grouping it with the filters', () => {
+    expect(paramDef('filter.routing').id).toBe('filter.routing')
+    expect(paramDef('filter.routing').group).toBe('filter')
+  })
+})
+
+
 // The thirteen divisions that shipped first. Presets address a division by its
 // position in SYNC_DIVISIONS, so this list has to stay put at the front.
 const ORIGINAL = ['1/1', '1/2', '1/2T', '1/4.', '1/4', '1/4T', '1/8.', '1/8', '1/8T', '1/16.', '1/16', '1/16T', '1/32']

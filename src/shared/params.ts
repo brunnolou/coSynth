@@ -141,7 +141,9 @@ for (let f = 1; f <= 2; f++) {
   p({ id: `${g}.keytrack`, name: 'Key Trk', group: g, min: 0, max: 1, def: 0, moddable: true, fmt: pct })
   p({ id: `${g}.mix`, name: 'Mix', group: g, min: 0, max: 1, def: 1, moddable: true, fmt: pct })
 }
-p({ id: 'filter.routing', name: 'Routing', group: 'filterRouting', min: 0, max: 1, def: 0, choices: FILTER_ROUTINGS })
+// Grouped as `filter` to match the id prefix: presets persist the id, never the
+// group, and a `filterRouting` group had agents filtering on a name no id carries.
+p({ id: 'filter.routing', name: 'Routing', group: 'filter', min: 0, max: 1, def: 0, choices: FILTER_ROUTINGS })
 
 // ---------------------------------------------------------------- distortion section (per-voice)
 p({ id: 'dist.enabled', name: 'On', group: 'dist', min: 0, max: 1, def: 0, step: 1 })
