@@ -1,7 +1,14 @@
 import { analyzeAudio, type AnalyzeAudioOptions, type AudioMetrics } from '../shared/audio-analysis'
 import { cachedScriptUrlNow, forgetCachedScript } from '../shared/cached-script-url'
-
-const workerUrl = new URL('./audio-analysis.worker.ts', import.meta.url).href
+// `?worker&url` — the same idiom the DSP worklet uses (see `src/audio/engine.ts`).
+// It is what makes Vite treat this file as a worker entry and emit a bundled
+// asset for it. Computing the URL with `new URL('./…worker.ts', import.meta.url)`
+// outside a `new Worker(...)` call does not: Vite stops emitting the worker
+// entirely and the URL resolves to the SPA's HTML fallback at runtime, so every
+// analysis silently fell back to the render thread. The bundled URL also keeps
+// the script self-contained, which is what lets `cachedScriptUrl` serve it from
+// a `blob:` URL that has no base URL to resolve imports against.
+import workerUrl from './audio-analysis.worker.ts?worker&url'
 
 function abortError(): Error {
   const error = new Error('Execution aborted')
