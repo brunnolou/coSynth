@@ -212,9 +212,9 @@ export class Keyboard {
       }
     }
     this.applyOctaveWindow()
-    for (const note of [...this.pointerNotes.values(), ...this.keyboardNotes.values()]) {
-      this.keyEls.get(note)?.classList.add('held')
-    }
+    // The engine's set covers every owner — MIDI and agents included — not just this widget's
+    // own notes, and onNote does not fire again for a note that is already down.
+    for (const note of this.engine.heldNotes) this.keyEls.get(note)?.classList.add('held')
   }
 
   /** Labels the played range and dims the keys the computer keyboard cannot reach. */
