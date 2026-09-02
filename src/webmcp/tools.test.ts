@@ -370,6 +370,22 @@ describe('state and parameter tools', () => {
     expect(paged.modulationSources).toMatchObject({ offset: 6, limit: 5, nextOffset: 11 })
   })
 
+  it('says decayT60Ms is measured from the rendered tail, not read back from env1.decay', async () => {
+    const { byName } = setup()
+    const description = byName.get('render_audio')!.description
+    // An agent read decayT60Ms as a readback of env1.decay, then spent a
+    // render discovering the note's own length moves it.
+    expect(description).toContain('decayT60Ms')
+    expect(description).toMatch(/decayT60Ms[^.]*(tail|rendered)/i)
+    expect(description).toContain('env1.release')
+    expect(description).toMatch(/null/i)
+    // The sentences earlier findings put here must survive.
+    expect(description).toContain('`peakDb` is an instantaneous peak')
+    expect(description).toContain('mode: "realtime"')
+    expect(description).toContain('metrics.harmonics')
+    expect(description).toContain('renderModeFallback')
+  })
+
   it('names the valid modulation sources in the set_modulation description', async () => {
     const { byName } = setup()
     const description = byName.get('set_modulation')!.description
