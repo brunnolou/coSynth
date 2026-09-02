@@ -376,10 +376,38 @@ describe('state and parameter tools', () => {
     for (const source of MOD_SOURCES) expect(description).toContain(source.id)
   })
 
+  it('returns modulation routes by default, as get_synth_state promises', async () => {
+    const { engine, execute } = setup()
+    engine.modSlots[3] = { source: modSourceIndex('lfo1'), dest: paramIndex('filter1.cutoff'), depth: 0.4, enabled: true }
+    engine.modSlots[7] = { source: modSourceIndex('env2'), dest: paramIndex('osc1.level'), depth: -0.2, enabled: true }
+    // An agent that just added two routes and wants to confirm them must not
+    // have to discover `modulationLimit` first.
+    const route = { slot: 3, source: 'lfo1', destination: 'filter1.cutoff', depth: 0.4, enabled: true }
+    for (const input of [{}, { format: 'compact' }, { group: 'env1' }]) {
+      const state = await execute('get_synth_state', input)
+      expect(state.patch.modulations.items, JSON.stringify(input)).toContainEqual(route)
+      expect(state.patch.modulations.total).toBe(2)
+      expect(state.patch.modulationCount).toBe(2)
+    }
+    // The description must name the keys the payload actually uses.
+    const { byName } = setup()
+    const description = byName.get('get_synth_state')!.description
+    expect(description).toContain('modulations')
+    expect(description).toContain('lfoShape')
+  })
+
   it('keeps default discovery responses within the recommended WebMCP output budget', async () => {
-    const { execute } = setup()
+    const { engine, execute } = setup()
     expect(JSON.stringify(await execute('get_synth_state')).length).toBeLessThanOrEqual(1500)
     expect(JSON.stringify(await execute('get_parameter_schema')).length).toBeLessThanOrEqual(1500)
+    // Routes are returned by default, so a fully wired matrix must still fit:
+    // the default page caps it and `nextOffset` carries the rest.
+    for (let slot = 0; slot < MAX_MOD_SLOTS; slot++) {
+      engine.modSlots[slot] = { source: modSourceIndex('lfo1'), dest: paramIndex('filter1.cutoff'), depth: 0.4, enabled: true }
+    }
+    const saturated = await execute('get_synth_state')
+    expect(JSON.stringify(saturated).length).toBeLessThanOrEqual(1500)
+    expect(saturated.patch.modulations.nextOffset).toBe(saturated.patch.modulations.items.length)
   })
 
   it('atomically applies linear, exponential, step, and choice values canonically', async () => {

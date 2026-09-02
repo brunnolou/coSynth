@@ -478,7 +478,7 @@ export function createWebMcpTools(
   return [
     {
       name: 'get_synth_state',
-      description: 'Get live synth state. Call with `format: "compact"` to see every parameter that differs from its default as `id=formatted` lines — the cheapest way to verify a patch. Runtime, modulation routes, and FX order are returned by default; use group/search/offset for a detailed parameter page, or `lfo` for one LFO shape.',
+      description: 'Get live synth state. Call with `format: "compact"` to see every parameter that differs from its default as `id=formatted` lines — the cheapest way to verify a patch. Runtime, FX order, and the first modulation routes are returned by default under `patch.modulations.items` (with `total`, and `nextOffset` when more routes exist — raise `modulationLimit` to see them all); use group/search/offset for a detailed parameter page, or `lfo: 1` for one LFO shape, returned as `patch.lfoShape`.',
       inputSchema: {
         type: 'object', properties: {
           format: { type: 'string', enum: ['full', 'compact'] },
@@ -541,10 +541,13 @@ export function createWebMcpTools(
           patch: {
             ...fxOrder(engine),
             modulationCount: modulations.length,
-            ...(includeModulations ? { modulations: {
+            // Returned by default: an agent verifying a patch it just wrote
+            // needs the routes, and the default page keeps a saturated matrix
+            // inside the discovery output budget.
+            modulations: {
               items: modulationPage, offset: modulationOffset, limit: modulationLimit, total: modulations.length,
               ...(modulationOffset + modulationPage.length < modulations.length ? { nextOffset: modulationOffset + modulationPage.length } : {})
-            } } : {}),
+            },
             ...(includeParameters ? {
               parameters: format === 'compact'
                 ? { items: changed, total: changed.length, format: 'compact' as const }
