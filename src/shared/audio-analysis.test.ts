@@ -1,9 +1,33 @@
 import { describe, expect, it } from 'vitest'
-import { analyzeAudio, compareAudioMetrics, type AudioMetrics } from './audio-analysis'
+import { analyzeAudio, compareAudioMetrics, type AudioMetrics, type ComparedMetricKey } from './audio-analysis'
 
 function sine(frequency: number, sampleRate: number, seconds: number, amplitude = 1, phase = 0): Float32Array {
   return Float32Array.from({ length: Math.round(sampleRate * seconds) }, (_, i) =>
     amplitude * Math.sin(2 * Math.PI * frequency * i / sampleRate + phase))
+}
+
+/** 440 Hz tone with a linear attack and an exponential decay of the given T60. */
+function pluck(sampleRate: number, seconds: number, attackSeconds: number, t60Seconds: number): Float32Array {
+  const decay = Math.log(1000) / t60Seconds
+  return Float32Array.from({ length: Math.round(sampleRate * seconds) }, (_, i) => {
+    const t = i / sampleRate
+    const attack = attackSeconds > 0 ? Math.min(1, t / attackSeconds) : 1
+    return attack * Math.exp(-decay * t) * Math.sin(2 * Math.PI * 440 * t)
+  })
+}
+
+/**
+ * Two sines 1 Hz apart, phased so the unison beat peaks a third of a second in -
+ * the shape that made the old rectified-sample attack report hundreds of ms.
+ */
+function beating(sampleRate: number, seconds: number, attackSeconds: number): Float32Array {
+  return Float32Array.from({ length: Math.round(sampleRate * seconds) }, (_, i) => {
+    const t = i / sampleRate
+    const attack = attackSeconds > 0 ? Math.min(1, t / attackSeconds) : 1
+    const first = Math.sin(2 * Math.PI * 441 * t - 2 * Math.PI / 3)
+    const second = Math.sin(2 * Math.PI * 440 * t)
+    return attack * 0.4 * (first + second)
+  })
 }
 
 describe('analyzeAudio', () => {
@@ -69,14 +93,71 @@ describe('analyzeAudio', () => {
     expect(analyzeAudio([left, right], 8192).spectralCentroidHz).toBeCloseTo(716.8, 0)
   })
 
+  it('measures a 5ms attack and a 2s T60 on a plucked tone', () => {
+    const sampleRate = 8000
+    const metrics = analyzeAudio([pluck(sampleRate, 1.5, 0.005, 2)], sampleRate)
+    expect(metrics.attackMs).toBeCloseTo(5, 0)
+    expect(metrics.decayT60Ms).not.toBeNull()
+    expect(metrics.decayT60Ms as number).toBeGreaterThan(1900)
+    expect(metrics.decayT60Ms as number).toBeLessThan(2100)
+    expect(metrics.sustainDb).toBeLessThan(-20)
+    expect(metrics.timeToPeakMs).toBeLessThan(20)
+  })
+
+  it('measures the attack of a beating unison instead of the beat rise', () => {
+    const sampleRate = 8000
+    const metrics = analyzeAudio([beating(sampleRate, 1, 0.002)], sampleRate)
+    expect(metrics.attackMs).toBeLessThan(10)
+    expect(metrics.attackMs).toBeGreaterThan(0)
+    // The old behaviour - the global peak sits on the beat maximum a third of a second in.
+    expect(metrics.timeToPeakMs).toBeCloseTo(333, -1)
+  })
+
+  it('returns a 64-point envelope in dB relative to the peak', () => {
+    const sampleRate = 8000
+    const metrics = analyzeAudio([pluck(sampleRate, 1, 0.005, 2)], sampleRate)
+    expect(metrics.envelopeDb).toHaveLength(64)
+    expect(metrics.envelopeDb.every(value => Number.isFinite(value) && value <= 0)).toBe(true)
+    expect(metrics.envelopeDb.every(value => Math.abs(value * 10 - Math.round(value * 10)) < 1e-9)).toBe(true)
+    // Evenly spaced points need not land exactly on the peak hop, but must bracket it.
+    expect(Math.max(...metrics.envelopeDb)).toBeGreaterThan(-2)
+    expect(metrics.envelopeDb[63]).toBeLessThan(metrics.envelopeDb[10])
+  })
+
+  it('reports no T60 when the signal never falls 20 dB inside the buffer', () => {
+    const sampleRate = 8000
+    expect(analyzeAudio([sine(440, sampleRate, 0.5, 0.5)], sampleRate).decayT60Ms).toBeNull()
+  })
+
+  it('reports strictly increasing gated loudness for the same tone at rising amplitudes', () => {
+    const sampleRate = 8000
+    const loudness = [0.25, 0.5, 1].map(amplitude => {
+      const tone = sine(440, sampleRate, 0.5, amplitude)
+      const padded = new Float32Array(sampleRate)
+      padded.set(tone, 0)
+      return analyzeAudio([padded], sampleRate).loudnessDb
+    })
+    expect(loudness[0]).toBeLessThan(loudness[1])
+    expect(loudness[1]).toBeLessThan(loudness[2])
+    // Gating the trailing silence keeps the steps at the true 6 dB.
+    expect(loudness[1] - loudness[0]).toBeCloseTo(6.02, 1)
+    expect(loudness[2] - loudness[1]).toBeCloseTo(6.02, 1)
+  })
+
   it('handles silence and rejects malformed input', () => {
-    expect(analyzeAudio([new Float32Array(32)], 48000)).toMatchObject({
+    const silence = analyzeAudio([new Float32Array(32)], 48000)
+    expect(silence).toMatchObject({
       peakDb: -160,
       rmsDb: -160,
       spectralCentroidHz: 0,
       attackMs: 0,
-      stereoWidth: 0
+      stereoWidth: 0,
+      timeToPeakMs: 0,
+      decayT60Ms: null,
+      sustainDb: 0,
+      loudnessDb: -160
     })
+    expect(silence.envelopeDb).toEqual(new Array(64).fill(0))
     expect(() => analyzeAudio([], 48000)).toThrow(/channel/i)
     expect(() => analyzeAudio([new Float32Array(2)], 0)).toThrow(/sample rate/i)
   })
@@ -91,17 +172,31 @@ describe('analyzeAudio', () => {
     expect(() => analyzeAudio([huge], 48000)).toThrow(/analysis.*nonfinite/i)
   })
 
-  it('returns accepted metrics whose JSON serialization contains no null numeric values', () => {
-    const metrics = analyzeAudio([sine(440, 48000, 0.01, 0.25)], 48000)
-    expect(Object.values(metrics).every(Number.isFinite)).toBe(true)
+  it('returns accepted metrics whose scalars are finite and never serialize as null', () => {
+    const metrics = analyzeAudio([pluck(8000, 1.5, 0.005, 0.4)], 8000)
+    const { decayT60Ms, envelopeDb, ...scalars } = metrics
+    expect(Object.values(scalars).every(Number.isFinite)).toBe(true)
+    expect(envelopeDb.every(Number.isFinite)).toBe(true)
+    expect(decayT60Ms).toBeGreaterThan(0)
     expect(JSON.stringify(metrics)).not.toContain('null')
+  })
+
+  it('serializes decayT60Ms as null - the only nullable metric - when there is no measurable decay', () => {
+    const metrics = analyzeAudio([sine(440, 48000, 0.01, 0.25)], 48000)
+    expect(metrics.decayT60Ms).toBeNull()
+    expect(JSON.stringify(metrics).match(/null/g)).toHaveLength(1)
   })
 })
 
-const metricKeys: (keyof AudioMetrics)[] = [
+const metricKeys: ComparedMetricKey[] = [
   'peakDb', 'rmsDb', 'clippingCount', 'dcOffset',
-  'spectralCentroidHz', 'attackMs', 'stereoWidth'
+  'spectralCentroidHz', 'attackMs', 'stereoWidth', 'decayT60Ms'
 ]
+const detailKeys = [...metricKeys, 'envelope'] as const
+
+/** A decaying shape, so envelope correlation has something to correlate. */
+const rampEnvelope = (start: number, end: number): number[] =>
+  Array.from({ length: 64 }, (_, i) => Math.round((start + (end - start) * i / 63) * 10) / 10)
 
 const referenceMetrics: AudioMetrics = {
   peakDb: -6,
@@ -110,14 +205,19 @@ const referenceMetrics: AudioMetrics = {
   dcOffset: 0.001,
   spectralCentroidHz: 1200,
   attackMs: 25,
-  stereoWidth: 0.2
+  stereoWidth: 0.2,
+  timeToPeakMs: 30,
+  decayT60Ms: 800,
+  sustainDb: -30,
+  envelopeDb: rampEnvelope(0, -60),
+  loudnessDb: -14
 }
 
 describe('compareAudioMetrics', () => {
   it('returns exact overall and per-metric similarity of 1 for identical metrics', () => {
     const result = compareAudioMetrics(referenceMetrics, { ...referenceMetrics })
     expect(result.similarity).toBe(1)
-    expect(Object.keys(result.details)).toEqual(metricKeys)
+    expect(Object.keys(result.details)).toEqual(detailKeys)
     for (const key of metricKeys) {
       expect(result.details[key]).toEqual({
         reference: referenceMetrics[key],
@@ -130,13 +230,15 @@ describe('compareAudioMetrics', () => {
 
   it('returns every signed delta and lowers bounded scores for meaningful differences', () => {
     const candidate: AudioMetrics = {
+      ...referenceMetrics,
       peakDb: -18,
       rmsDb: -30,
       clippingCount: 20,
       dcOffset: -0.05,
       spectralCentroidHz: 4800,
       attackMs: 200,
-      stereoWidth: 0.9
+      stereoWidth: 0.9,
+      decayT60Ms: 60
     }
     const result = compareAudioMetrics(referenceMetrics, candidate)
     expect(result.similarity).toBeGreaterThanOrEqual(0)
@@ -144,7 +246,7 @@ describe('compareAudioMetrics', () => {
     for (const key of metricKeys) {
       expect(result.details[key].reference).toBe(referenceMetrics[key])
       expect(result.details[key].candidate).toBe(candidate[key])
-      expect(result.details[key].delta).toBe(candidate[key] - referenceMetrics[key])
+      expect(result.details[key].delta).toBe((candidate[key] as number) - (referenceMetrics[key] as number))
       expect(result.details[key].similarity).toBeGreaterThanOrEqual(0)
       expect(result.details[key].similarity).toBeLessThanOrEqual(1)
     }
@@ -155,17 +257,20 @@ describe('compareAudioMetrics', () => {
   it('uses finite robust math for silence, zero, and nonnegative edge values', () => {
     const silence: AudioMetrics = {
       peakDb: -160, rmsDb: -160, clippingCount: 0, dcOffset: 0,
-      spectralCentroidHz: 0, attackMs: 0, stereoWidth: 0
+      spectralCentroidHz: 0, attackMs: 0, stereoWidth: 0,
+      timeToPeakMs: 0, decayT60Ms: null, sustainDb: 0,
+      envelopeDb: new Array(64).fill(0), loudnessDb: -160
     }
     const changed: AudioMetrics = {
       peakDb: -159, rmsDb: -140, clippingCount: 1, dcOffset: 0,
-      spectralCentroidHz: 20, attackMs: 1, stereoWidth: 0
+      spectralCentroidHz: 20, attackMs: 1, stereoWidth: 0,
+      timeToPeakMs: 1, decayT60Ms: 5, sustainDb: -3,
+      envelopeDb: rampEnvelope(0, -12), loudnessDb: -140
     }
     for (const result of [compareAudioMetrics(silence, silence), compareAudioMetrics(silence, changed)]) {
       expect(Number.isFinite(result.similarity)).toBe(true)
-      for (const key of metricKeys) {
+      for (const key of detailKeys) {
         expect(Number.isFinite(result.details[key].similarity)).toBe(true)
-        expect(Number.isFinite(result.details[key].delta)).toBe(true)
       }
     }
   })
@@ -180,6 +285,33 @@ describe('compareAudioMetrics', () => {
   it.each(metricKeys)('rejects nonfinite reference and candidate %s values', key => {
     expect(() => compareAudioMetrics({ ...referenceMetrics, [key]: Number.NaN }, referenceMetrics)).toThrow(/finite/i)
     expect(() => compareAudioMetrics(referenceMetrics, { ...referenceMetrics, [key]: Infinity })).toThrow(/finite/i)
+  })
+
+  it('scores decayT60Ms by log ratio and treats null as an unmeasurable decay', () => {
+    const quiet = { ...referenceMetrics, decayT60Ms: null }
+    expect(compareAudioMetrics(quiet, { ...quiet }).details.decayT60Ms).toEqual({
+      reference: null, candidate: null, delta: null, similarity: 1
+    })
+    const mismatch = compareAudioMetrics(quiet, referenceMetrics).details.decayT60Ms
+    expect(mismatch).toEqual({ reference: null, candidate: 800, delta: null, similarity: 0 })
+    const shorter = compareAudioMetrics(referenceMetrics, { ...referenceMetrics, decayT60Ms: 100 })
+    expect(shorter.details.decayT60Ms.delta).toBe(-700)
+    expect(shorter.details.decayT60Ms.similarity).toBeLessThan(0.7)
+  })
+
+  it('scores envelope shape by correlation, not by absolute level', () => {
+    const shifted = { ...referenceMetrics, envelopeDb: rampEnvelope(-6, -66) }
+    expect(compareAudioMetrics(referenceMetrics, shifted).details.envelope.similarity).toBeCloseTo(1, 5)
+    const inverted = { ...referenceMetrics, envelopeDb: rampEnvelope(-60, 0) }
+    expect(compareAudioMetrics(referenceMetrics, inverted).details.envelope.similarity).toBeCloseTo(0, 5)
+    expect(compareAudioMetrics(referenceMetrics, referenceMetrics).details.envelope.similarity).toBe(1)
+  })
+
+  it('rejects malformed envelope arrays', () => {
+    const broken = { ...referenceMetrics, envelopeDb: [1, 2, 3] }
+    expect(() => compareAudioMetrics(referenceMetrics, broken)).toThrow(/envelopeDb/i)
+    expect(() => compareAudioMetrics({ ...referenceMetrics, envelopeDb: rampEnvelope(0, Number.NaN) }, referenceMetrics))
+      .toThrow(/envelopeDb/i)
   })
 
   it('requires clippingCount to be a nonnegative integer', () => {

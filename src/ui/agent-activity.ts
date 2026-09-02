@@ -15,6 +15,13 @@ function button(label: string): HTMLButtonElement {
   return node
 }
 
+/** `decayT60Ms` is null whenever a sound never decayed, so no comparison figure exists. */
+function comparisonLine(metric: string, value: { candidate: number | null; delta: number | null }): string {
+  if (value.candidate === null) return `${metric}: not measurable`
+  const delta = value.delta === null ? '' : ` (${value.delta >= 0 ? '+' : ''}${value.delta.toFixed(2)})`
+  return `${metric}: ${value.candidate.toFixed(2)}${delta}`
+}
+
 interface HistoryRow { root: HTMLElement; label: HTMLElement; meta: HTMLElement; direct: HTMLElement; details: HTMLElement; action: HTMLButtonElement; signature: string }
 
 /** One view for human and AI edits, with a separate list of replayable actions. */
@@ -265,7 +272,7 @@ export class AgentActivityPanel {
     else {
       this.comparison.append(el('p', '', `${Math.round(this.state.comparison.similarity * 100)}% similarity`))
       for (const [metric, value] of Object.entries(this.state.comparison.details)) {
-        this.comparison.append(el('div', 'history-comparison', `${metric}: ${value.candidate.toFixed(2)} (${value.delta >= 0 ? '+' : ''}${value.delta.toFixed(2)})`))
+        this.comparison.append(el('div', 'history-comparison', comparisonLine(metric, value)))
       }
     }
   }
@@ -310,7 +317,7 @@ export class AgentActivityPanel {
     if (entry.comparison) {
       content.append(el('p', '', `${Math.round(entry.comparison.similarity * 100)}% similarity`))
       for (const [metric, value] of Object.entries(entry.comparison.details)) {
-        content.append(el('div', 'history-comparison', `${metric}: ${value.candidate.toFixed(2)} (${value.delta >= 0 ? '+' : ''}${value.delta.toFixed(2)})`))
+        content.append(el('div', 'history-comparison', comparisonLine(metric, value)))
       }
     }
   }
