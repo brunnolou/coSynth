@@ -31,22 +31,51 @@ export interface OfflineRenderOptions {
   /** Seam for tests: build the scratch engine over that context. */
   createEngine?: (context: BaseAudioContext) => SynthEngine
   /**
-   * How long each worklet barrier waits for its acknowledgement before giving
-   * up on the guarantee and rendering anyway. See `SYNC_TIMEOUT_MS`.
+   * How long the barrier before `startRendering()` waits for its
+   * acknowledgement before giving up on the guarantee and rendering anyway.
+   * See `SYNC_TIMEOUT_MS`.
    */
   syncTimeoutMs?: number
+  /**
+   * The same, for each mid-render barrier. Defaults to the smaller of
+   * `syncTimeoutMs` and `MID_RENDER_SYNC_TIMEOUT_MS`.
+   */
+  midRenderSyncTimeoutMs?: number
 }
 
 /** Web Audio renders in 128-frame quanta; `suspend()` only accepts boundaries. */
 const RENDER_QUANTUM = 128
 const DEFAULT_SAMPLE_RATE = 48000
 /**
- * How long a render waits for the worklet to acknowledge its messages. Long
- * enough for a wavetable-and-sample `syncAll()` on a loaded machine, short
- * enough that a browser whose offline worklet never answers costs a render
- * rather than a session.
+ * How long the barrier in front of `startRendering()` waits for the worklet to
+ * acknowledge its messages. Long enough for a wavetable-and-sample `syncAll()`
+ * on a loaded machine, short enough that a browser whose offline worklet never
+ * answers costs a render rather than a session. This is the barrier that must
+ * not be skipped: it is what stops a render from outrunning its own frame-0
+ * note events and coming back as silence, so it is allowed to wait.
  */
 const SYNC_TIMEOUT_MS = 2000
+/**
+ * How long a MID-RENDER barrier waits, which is a different bargain. A
+ * suspension's barrier carries only the handful of note messages for that one
+ * quantum — the patch, wavetables and noise sample all went through the
+ * pre-render barrier — and it buys placement, not existence: give up and the
+ * event lands a few quanta late rather than not at all.
+ *
+ * That matters because the whole mechanism rests on the port queue draining
+ * while an `OfflineAudioContext` is suspended. Chromium does drain it (measured
+ * through the probe harness: render wall clock stays ~200 ms whether a render
+ * has one mid-render suspension or fifteen), but nothing in the spec promises
+ * it. On an engine that does not, every suspension would wait out its full
+ * budget, and at `SYNC_TIMEOUT_MS` each a fifteen-event render would take half
+ * a minute — correct, and useless. At 50 ms the same render pays 0.75 s.
+ *
+ * 50 ms is also far above the acknowledgement latency actually observed: fifteen
+ * barriers plus the rendering itself fit inside ~200 ms, so the round trip costs
+ * single-digit milliseconds and this leaves an order of magnitude of headroom
+ * for a jankier main thread.
+ */
+const MID_RENDER_SYNC_TIMEOUT_MS = 50
 
 /** Mono WAV handed to audio-capable agents: small enough to put in a message. */
 export const BASE64_SAMPLE_RATE = 22050
@@ -285,6 +314,10 @@ async function renderOnce(
   }
 
   const syncTimeout = options.syncTimeoutMs ?? SYNC_TIMEOUT_MS
+  // Never longer than the pre-render budget: a caller that asked for a short
+  // barrier means it everywhere, and a test that shortens one wants both.
+  const midRenderSyncTimeout = options.midRenderSyncTimeoutMs
+    ?? Math.min(syncTimeout, MID_RENDER_SYNC_TIMEOUT_MS)
   // Set false by any barrier that went unacknowledged; see the silence guard at
   // the end of this function.
   let synced = true
@@ -312,9 +345,10 @@ async function renderOnce(
         // Held suspended until the processor confirms it has these events, for
         // the same reason as the barrier before `startRendering()`: resuming
         // first would let the render outrun them and place the event late by
-        // however many quanta the queue took to drain. `awaitWorkletSync`
-        // resolves either way, so this cannot leave the render suspended.
-        if (!await scratch.awaitWorkletSync(syncTimeout)) synced = false
+        // however many quanta the queue took to drain. On its own budget,
+        // because this barrier only improves placement: see
+        // `MID_RENDER_SYNC_TIMEOUT_MS`.
+        if (!await scratch.awaitWorkletSync(midRenderSyncTimeout)) synced = false
       }
       // Deliberately not awaited: resuming is what lets rendering continue.
       // Still resumed after an abort, so the orphaned render below can finish

@@ -517,15 +517,23 @@ describe('renderOffline worklet barrier and silence guard', () => {
    * note-on posted just before `startRendering()` can arrive after the note is
    * already over.
    */
-  function heldWorkletNode() {
+  function heldWorkletNode(options: { autoAck?: (index: number) => boolean } = {}) {
     const messages: ToWorklet[] = []
     const held: (() => void)[] = []
+    let pings = 0
     vi.stubGlobal('AudioWorkletNode', class {
       port = {
         onmessage: null as unknown,
         postMessage: (message: ToWorklet, transfer: Transferable[]) => {
           if (message.type === 'ping') {
-            held.push(() => message.port.postMessage(true))
+            const reply = () => message.port.postMessage(true)
+            // `autoAck` decides per barrier, in the order they are posted (the
+            // pre-render barrier is 0). Answering some and not others is how a
+            // browser that does NOT flush the port queue while the context is
+            // suspended behaves: the barrier before `startRendering()` comes
+            // back, every mid-render one times out.
+            if (options.autoAck?.(pings++)) reply()
+            else held.push(reply)
             return
           }
           messages.push(structuredClone(message, { transfer }))
@@ -648,6 +656,41 @@ describe('renderOffline worklet barrier and silence guard', () => {
     ack()
     await pending
     expect(context!.rendered).toBe(true)
+  })
+
+  it('holds a mid-render barrier on its own short budget, not the pre-render one', async () => {
+    // The reviewer's portability worry, modelled: the pre-render barrier is
+    // answered, every mid-render one is ignored forever. jsdom cannot measure a
+    // real browser's render clock, but it can prove the *budget* a stalled
+    // mid-render barrier is charged against, which is the part that would make
+    // renders pathologically slow on a non-flushing engine.
+    const { messages } = heldWorkletNode({ autoAck: index => index === 0 })
+    let context: FakeOfflineContext | null = null
+    const started = Date.now()
+    const recording = await renderOffline(
+      liveEngineStub(),
+      [{ midi: 60, velocity: 1, start: 0.1, duration: 0.05 }, { midi: 64, velocity: 1, start: 0.2, duration: 0.05 }],
+      0.4,
+      {
+        createContext: options => {
+          context = new FakeOfflineContext(options, messages)
+          return context as unknown as BaseAudioContext
+        },
+        // Deliberately generous, and deliberately not overriding the mid-render
+        // budget: the point is that the four unanswered suspensions do NOT get
+        // to spend this.
+        syncTimeoutMs: 600
+      }
+    )
+    const elapsed = Date.now() - started
+    expect(context!.suspendTimes.length, 'four scheduled events, four suspensions').toBe(4)
+    expect(elapsed, `a stalled mid-render barrier must not cost the pre-render budget (took ${elapsed}ms)`)
+      .toBeLessThan(300)
+    // Giving up is not skipping: the render finished and the events are in it.
+    expect(context!.rendered).toBe(true)
+    expect(messages.filter(message => message.type === 'noteOn').map(message => message.note)).toEqual([60, 64])
+    expect(messages.filter(message => message.type === 'noteOff').map(message => message.note)).toEqual([60, 64])
+    expect(recording.channelData[0].some(sample => sample !== 0), 'the render still sounds').toBe(true)
   })
 
   it('reports an unavailable barrier instead of waiting on an engine with no worklet', async () => {
