@@ -10,15 +10,22 @@
 .agent-icon-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .agent-ai-strip { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
 .agent-ai-group { display: flex; flex: 0 0 auto; }
-.agent-ai-group > button:first-child { border-radius: 5px 0 0 5px; }
-.agent-ai-group > button:last-child { border-radius: 0 5px 5px 0; margin-left: -1px; }
-.agent-ai-group > button[aria-pressed='true'] { color: var(--accent); }
-.agent-ai-group > button[aria-pressed='false'] { color: var(--text-dim); }
-.agent-ai-group svg { transform-origin: 50% 65%; }
+.agent-status-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 5px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.agent-status-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .agent-status-orb {
   display: block;
-  width: 26px;
-  height: 26px;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
   pointer-events: none;
   --ai-dot-x: 50%;
   --ai-dot-y: 50%;
@@ -32,17 +39,25 @@
   --ai-dot-spread: 3px;
   animation: agent-orb 2s linear infinite;
 }
-.agent-ai-group[data-motion='working'] svg { animation: agent-working 800ms ease-in-out infinite; }
-.agent-ai-group[data-motion='playing'] svg { animation: agent-playing var(--agent-beat-duration, 500ms) ease-in-out infinite; }
 .agent-ai-group[data-tone='idle'][data-motion='idle'] .agent-status-orb {
   background-image: radial-gradient(circle at center, #8690a1 0 2px, #8690a166 3px, transparent 4px);
 }
 .agent-ai-group[data-tone='off'] .agent-status-orb {
   background-image: radial-gradient(circle at center, #343945 0 3px, transparent 4px);
 }
+.agent-ai-group[data-tone='pending'][data-motion='idle'] .agent-status-orb {
+  background-image: radial-gradient(circle at center, var(--accent) 0 3px, #ffffff2e 4px, transparent 6px);
+}
 .agent-ai-group[data-tone='error'] .agent-status-orb {
   background-image: radial-gradient(circle at center, #ff6b6b 0 3px, #ff6b6b44 4px, transparent 7px);
 }
+.agent-status-label { line-height: 1; }
+.agent-ai-group[data-tone='idle'] .agent-status-button { color: var(--text-dim); }
+.agent-ai-group[data-tone='off'] .agent-status-button { color: var(--text-dim); opacity: .7; }
+.agent-ai-group[data-tone='pending'] .agent-status-button { color: var(--accent); border-color: var(--accent); }
+.agent-ai-group[data-tone='error'] .agent-status-button { color: #ff8d98; border-color: #ff6b6b; }
+.agent-ai-group[data-motion='working'] .agent-status-button,
+.agent-ai-group[data-motion='playing'] .agent-status-button { color: var(--accent); }
 .agent-feed { position: relative; flex: 1; min-width: 0; height: 22px; overflow: hidden; }
 .agent-feed-line {
   position: absolute; inset: 0; line-height: 22px; font-size: 11px;
@@ -59,19 +74,16 @@
 .agent-tool-log > summary { cursor: pointer; }
 .agent-tool-log-list { padding-left: 20px; font-size: 12px; }
 .agent-tool-call { margin: 8px 0; overflow-wrap: anywhere; }
-.app-popover {
-  position: fixed; z-index: 90; width: min(320px, calc(100vw - 16px)); max-height: calc(100vh - 16px);
-  overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: 8px;
-  background: var(--panel); color: var(--text); font-size: 12px; line-height: 1.5;
-  box-shadow: 0 8px 24px #0006;
+.agent-onboarding p { margin: 0 0 10px; }
+.agent-onboarding-prompts { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.agent-onboarding-prompts li {
+  padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: #ffffff08; color: var(--text); font-size: 12px;
 }
-.app-popover p { margin: 0; overflow-wrap: anywhere; }
 @keyframes agent-orb { to { --ai-glow-angle: 360deg; } }
-@keyframes agent-working { 0%, 100% { transform: rotate(-8deg); } 50% { transform: rotate(8deg); } }
-@keyframes agent-playing { 0%, 100% { transform: translateY(-1px); } 40% { transform: translateY(2px) rotate(3deg); } }
 @keyframes agent-feed-in { from { transform: translateY(100%); } to { transform: translateY(0); } }
 @keyframes agent-feed-out { from { transform: translateY(0); } to { transform: translateY(-100%); } }
 @media (prefers-reduced-motion: reduce) {
-  .agent-ai-group svg, .agent-ai-group .agent-status-orb, .agent-feed-line { animation: none !important; transition: none; }
+  .agent-ai-group .agent-status-orb, .agent-feed-line { animation: none !important; transition: none; }
   .agent-feed-line.leaving { visibility: hidden; }
 }
