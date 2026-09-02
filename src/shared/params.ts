@@ -203,19 +203,22 @@ p({ id: 'fxdist.mix', name: 'Mix', group: 'fxdist', min: 0, max: 1, def: 1, modd
 
 // ---------------------------------------------------------------- units
 // `unit` is a short machine-readable hint for agents reading the parameter
-// schema. The authoritative unit of every parameter already lives inside its
-// `fmt` closure, so derive the hint from what `fmt` actually emits instead of
-// repeating it (and risking divergence) on every definition.
+// schema, and it must describe the RAW scale that `min`/`max`/`def` and the
+// update API speak. `fmt` is a display concern that is free to rescale, so the
+// rendered suffix is only a clue to the raw unit, never the unit itself:
+// `ms` renders "5 ms" off a raw 0.005 SECONDS, so its hint is `s`. Formatters
+// whose rendered unit has no honest raw counterpart contribute no hint at all
+// (`pct` renders "70%" off a raw 0.7, the degree formatter "252°" off 0.7) —
+// advertising `%` or `°` there would invite values a hundredfold too large.
+// Where a raw unit exists but cannot be inferred, declare `unit` on the param.
 const UNIT_RULES: ReadonlyArray<readonly [RegExp, string]> = [
-  [/%$/, '%'],
   [/k?Hz$/, 'Hz'],
   [/\bct$/, 'ct'],
   [/\bst$/, 'st'],
   [/\bdB$/, 'dB'],
   [/\bbit$/, 'bit'],
   [/\boct$/, 'oct'],
-  [/\b(?:s|ms)$/, 'ms'],
-  [/°$/, '°'],
+  [/\b(?:s|ms)$/, 's'],
   [/:1$/, ':1'],
   [/\dv$/, 'voices'],
   [/\dx$/, 'x']

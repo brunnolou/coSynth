@@ -203,6 +203,9 @@ describe('single-round-trip discovery', () => {
       'filter1.type {LP 12|LP 24|HP 12|HP 24|BP 12|BP 24|Notch|Comb|Formant} =1'
     )
     expect(result.parameters.items).toContain('master.bpm BPM 20..300 step1 =120')
+    // Envelope times are advertised in the seconds the API accepts, not in the
+    // milliseconds the UI renders for short values.
+    expect(result.parameters.items).toContain('env1.attack s 0.001..10 exp =0.005 mod')
     expect(result.limits).toMatchObject({ modulationSlots: 32 })
   })
 
@@ -210,9 +213,13 @@ describe('single-round-trip discovery', () => {
     const { execute } = setup()
     const result = await execute('get_parameter_schema', { limit: 60 })
     expect(result.parameters.items).toHaveLength(60)
-    expect(result.parameters.items[0]).toMatchObject({ id: 'master.volume', unit: '%' })
+    // master.volume renders as a percentage but is raw 0..1.5, so it carries no
+    // unit at all rather than a `%` an agent would read as 0..100.
+    expect(result.parameters.items[0]).toMatchObject({ id: 'master.volume', min: 0, max: 1.5 })
+    expect(result.parameters.items[0]).not.toHaveProperty('unit')
+    // The envelope times render in ms but are accepted in seconds.
     const envelope = await execute('get_parameter_schema', { search: 'env1.attack' })
-    expect(envelope.parameters.items[0]).toMatchObject({ id: 'env1.attack', unit: 'ms', curve: 'exp' })
+    expect(envelope.parameters.items[0]).toMatchObject({ id: 'env1.attack', unit: 's', curve: 'exp' })
     await expect(execute('get_parameter_schema', { limit: 61 })).rejects.toThrow(/1\.\.60/)
     await expect(execute('get_parameter_schema', { format: 'brief' })).rejects.toThrow(/format/i)
   })
