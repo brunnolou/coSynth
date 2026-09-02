@@ -28,6 +28,7 @@ export class Keyboard {
   readonly root: HTMLElement
   private octave = 4 // C4-based
   private octaves = DEFAULT_OCTAVES
+  private drawnStart = -1
   private readonly keys = el('div', 'keyboard')
   private readonly octLabel = el('span', 'oct-label')
   private readonly keyEls = new Map<number, HTMLElement>()
@@ -44,7 +45,7 @@ export class Keyboard {
     guideTarget(octUp, 'button.octave.up', 'Keyboard octave up', 'button')
     const setOct = (o: number) => {
       this.octave = Math.max(0, Math.min(7, o))
-      this.applyOctaveWindow()
+      this.syncKeys()
     }
     octDown.addEventListener('click', () => setOct(this.octave - 1))
     octUp.addEventListener('click', () => setOct(this.octave + 1))
@@ -59,7 +60,7 @@ export class Keyboard {
     range.value = String(this.octaves)
     range.addEventListener('change', () => {
       this.octaves = Number(range.value)
-      this.buildKeys()
+      this.syncKeys(true)
     })
 
     const bar = el('div', 'kb-bar')
@@ -118,7 +119,7 @@ export class Keyboard {
       this.keyEls.get(note)?.classList.toggle('held', on)
     }))
 
-    this.buildKeys()
+    this.syncKeys(true)
 
     this.root.append(bar, this.keys)
   }
@@ -131,11 +132,34 @@ export class Keyboard {
     this.pointerNotes.clear()
   }
 
-  /** (Re)draws the key row for the current width, then restores window and held styling. */
-  private buildKeys(): void {
+  /**
+   * Lowest drawn note: anchored below C6 for the chosen width, then shifted in whole octaves
+   * (so the row still starts on a C) as far as needed to keep the played window on screen.
+   */
+  private rangeStart(): number {
+    const span = this.octaves * 12
+    const [lo, hi] = this.playableRange()
+    let start = Math.max(BOTTOM_NOTE, TOP_NOTE - span)
+    if (hi > start + span) start += Math.ceil((hi - start - span) / 12) * 12
+    if (lo < start) start -= Math.ceil((start - lo) / 12) * 12
+    return Math.max(0, Math.min(start, 127 - span))
+  }
+
+  /** Rebuilds the key row only when the drawn range moves; otherwise just restyles it. */
+  private syncKeys(force = false): void {
+    const start = this.rangeStart()
+    if (!force && start === this.drawnStart) {
+      this.applyOctaveWindow()
+      return
+    }
+    this.drawnStart = start
+    this.buildKeys(start)
+  }
+
+  /** (Re)draws the key row from `startNote`, then restores window and held styling. */
+  private buildKeys(startNote: number): void {
     this.keys.replaceChildren()
     this.keyEls.clear()
-    const startNote = Math.max(BOTTOM_NOTE, TOP_NOTE - this.octaves * 12)
     const numWhite = this.octaves * 7 + 1
     this.keys.style.setProperty('--kb-white', `${100 / numWhite}%`)
     for (let w = 0; w < numWhite; w++) {
