@@ -508,7 +508,7 @@ describe('renderOffline', () => {
   })
 })
 
-describe('renderOffline worklet barrier', () => {
+describe('renderOffline worklet barrier and silence guard', () => {
   /**
    * A worklet stub whose `ping` acknowledgements are held back, so a test can
    * decide whether — and when — the processor confirms it has the queue. This
@@ -534,6 +534,15 @@ describe('renderOffline worklet barrier', () => {
       connect() {}
     })
     return { messages, held, ack: () => { for (const reply of held.splice(0)) reply() } }
+  }
+
+  /** A context with `suspend()` that renders nothing at all. */
+  class SilentOfflineContext extends FakeOfflineContext {
+    override async startRendering() {
+      const buffer = await super.startRendering()
+      const silence = new Float32Array(this.length)
+      return { ...buffer, getChannelData: () => silence } as unknown as AudioBuffer
+    }
   }
 
   const NOTES: PerformanceNote[] = [{ midi: 60, velocity: 1, start: 0, duration: 0.1 }]
@@ -572,7 +581,48 @@ describe('renderOffline worklet barrier', () => {
     expect(recording.channelData[0].some(sample => sample !== 0)).toBe(true)
   })
 
+  it('retries once, then throws, when an unconfirmed render comes back as digital silence', async () => {
+    const { messages } = heldWorkletNode()
+    const contexts: SilentOfflineContext[] = []
+    await expect(renderOffline(liveEngineStub(), NOTES, 0.3, {
+      createContext: options => {
+        const context = new SilentOfflineContext(options, messages)
+        contexts.push(context)
+        return context as unknown as BaseAudioContext
+      },
+      syncTimeoutMs: 5
+    })).rejects.toThrow(/digital silence twice/)
+    expect(contexts.length, 'exactly one retry, on a fresh context').toBe(2)
+  })
 
+  it('returns silence the barrier confirmed, because a muted patch is a real answer', async () => {
+    const messages = stubWorkletNode()
+    const contexts: SilentOfflineContext[] = []
+    const recording = await renderOffline(liveEngineStub(), NOTES, 0.3, {
+      createContext: options => {
+        const context = new SilentOfflineContext(options, messages)
+        contexts.push(context)
+        return context as unknown as BaseAudioContext
+      }
+    })
+    expect(recording.channelData[0].every(sample => sample === 0)).toBe(true)
+    expect(contexts.length, 'a confirmed result is never re-rendered').toBe(1)
+  })
+
+  it('does not treat a render with no notes as suspect, however unconfirmed', async () => {
+    const { messages } = heldWorkletNode()
+    const contexts: SilentOfflineContext[] = []
+    const recording = await renderOffline(liveEngineStub(), [], 0.3, {
+      createContext: options => {
+        const context = new SilentOfflineContext(options, messages)
+        contexts.push(context)
+        return context as unknown as BaseAudioContext
+      },
+      syncTimeoutMs: 5
+    })
+    expect(recording.channelData[0].every(sample => sample === 0)).toBe(true)
+    expect(contexts.length, 'nothing was asked to sound, so nothing is missing').toBe(1)
+  })
 
   it('holds each mid-render suspension until its events are acknowledged, then resumes', async () => {
     const { messages, held, ack } = heldWorkletNode()
@@ -605,6 +655,7 @@ describe('renderOffline worklet barrier', () => {
     expect(await new SynthEngine().awaitWorkletSync(5)).toBe(false)
   })
 })
+
 
 describe('WAV encoding', () => {
   it('writes a 16-bit PCM header that matches the payload', () => {

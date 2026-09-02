@@ -188,9 +188,14 @@ function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose
  * `SynthEngine.awaitWorkletSync` barrier in front of rendering and in front of
  * every mid-render `resume()`.
  *
- * The barrier is allowed to give up rather than hang, so it closes the race
- * without being a guarantee: a browser whose offline worklet never answers gets
- * exactly the behaviour it had before.
+ * The barrier is allowed to give up rather than hang, so it is backed by a
+ * guard: an attempt that was asked for notes, returned digital silence, and
+ * could not confirm the worklet had its events is retried once on a fresh
+ * context, and a second such attempt throws. Silence is the one result an agent
+ * cannot audit — every metric collapses to -160 dB and reads as a real
+ * measurement of a dead patch — so it is the one result that must never be
+ * returned unverified. Silence the barrier *did* confirm is returned normally:
+ * a patch with its volume at zero renders nothing, and saying so is correct.
  */
 export async function renderOffline(
   engine: SynthEngine,
@@ -201,6 +206,42 @@ export async function renderOffline(
   const signal = options.signal
   if (signal?.aborted) throw abortError()
   if (!Number.isFinite(duration) || duration <= 0) throw new Error('Offline render duration must be greater than zero')
+  const first = await renderOnce(engine, notes, duration, options)
+  // A render is only suspect when it was asked to make a sound and made none.
+  if (!first.suspect) return first.recording
+  // One retry, on a wholly fresh context and scratch engine. A stuck barrier is
+  // a per-render accident, and silence that survives an independent second
+  // render is the patch's own: see `renderOffline`'s doc comment.
+  if (signal?.aborted) throw abortError()
+  const second = await renderOnce(engine, notes, duration, options)
+  if (!second.suspect) return second.recording
+  throw new Error(
+    'Offline render produced digital silence twice and could not be confirmed: the audio worklet never acknowledged the '
+    + 'patch and note events before rendering, so this result would be a measurement of nothing rather than of the patch. '
+    + 'Retry, or use mode: "realtime" once audio is running.'
+  )
+}
+
+/** What one render attempt produced, and whether it can be trusted. */
+interface Attempt {
+  recording: RecordedAudio
+  /**
+   * The render asked for notes, returned digital silence, AND could not confirm
+   * the worklet had its events — silence that may be the race rather than the
+   * patch. A confirmed silent render is not suspect: a patch with the volume at
+   * zero is entitled to render nothing, and reporting that honestly is the
+   * point.
+   */
+  suspect: boolean
+}
+
+async function renderOnce(
+  engine: SynthEngine,
+  notes: readonly PerformanceNote[],
+  duration: number,
+  options: OfflineRenderOptions
+): Promise<Attempt> {
+  const signal = options.signal
   const sampleRate = options.sampleRate
     ?? (engine.context ?? engine.ctx)?.sampleRate
     ?? DEFAULT_SAMPLE_RATE
@@ -244,6 +285,9 @@ export async function renderOffline(
   }
 
   const syncTimeout = options.syncTimeoutMs ?? SYNC_TIMEOUT_MS
+  // Set false by any barrier that went unacknowledged; see the silence guard at
+  // the end of this function.
+  let synced = true
   const player = new OfflineNotes(scratch)
   const events = noteEvents(notes, duration, sampleRate)
   const immediate = events.filter(event => event.frame === 0)
@@ -270,7 +314,7 @@ export async function renderOffline(
         // first would let the render outrun them and place the event late by
         // however many quanta the queue took to drain. `awaitWorkletSync`
         // resolves either way, so this cannot leave the render suspended.
-        await scratch.awaitWorkletSync(syncTimeout)
+        if (!await scratch.awaitWorkletSync(syncTimeout)) synced = false
       }
       // Deliberately not awaited: resuming is what lets rendering continue.
       // Still resumed after an abort, so the orphaned render below can finish
@@ -283,7 +327,7 @@ export async function renderOffline(
   // above — the patch, the modulation, the wavetables, the frame-0 note-ons —
   // reached the processor as port messages, and `startRendering()` does not
   // wait for them. See `SynthEngine.awaitWorkletSync`.
-  await scratch.awaitWorkletSync(syncTimeout)
+  if (!await scratch.awaitWorkletSync(syncTimeout)) synced = false
   if (signal?.aborted) throw abortError()
 
   // The Web Audio API offers no way to cancel an in-flight `startRendering()`.
@@ -310,12 +354,30 @@ export async function renderOffline(
   const renderedRate = buffer.sampleRate ?? sampleRate
   const wav = encodeWav(channelData, renderedRate)
   return {
-    blob: new Blob([wav], { type: 'audio/wav' }),
-    mimeType: 'audio/wav',
-    duration: (buffer.length ?? channelData[0]?.length ?? 0) / renderedRate,
-    sampleRate: renderedRate,
-    channelData
+    recording: {
+      blob: new Blob([wav], { type: 'audio/wav' }),
+      mimeType: 'audio/wav',
+      duration: (buffer.length ?? channelData[0]?.length ?? 0) / renderedRate,
+      sampleRate: renderedRate,
+      channelData
+    },
+    suspect: !synced && events.length > 0 && isSilent(channelData)
   }
+}
+
+/**
+ * Digital silence: every sample exactly zero. Deliberately not a dB threshold.
+ * A very quiet patch is a legitimate result an agent may be hunting for, and a
+ * floor low enough to be safe would be indistinguishable from zero anyway,
+ * while a floor high enough to be useful would reject real renders. The failure
+ * this guards is categorical — the note never reached the processor, so the
+ * output buffer was never written to at all.
+ */
+function isSilent(channels: readonly Float32Array[]): boolean {
+  for (const channel of channels) {
+    for (const sample of channel) if (sample !== 0) return false
+  }
+  return true
 }
 
 function clampSample(value: number): number {
