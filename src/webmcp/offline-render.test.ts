@@ -417,6 +417,46 @@ describe('renderOffline', () => {
     expect(contexts, 'no render context is even created').toHaveLength(0)
   })
 
+  it('bails when the abort lands during the scratch engine start, not after the render', async () => {
+    const controller = new AbortController()
+    // The render itself would succeed: only the abort inside `start()` can
+    // stop it, so nothing here masks a missed cancellation.
+    const { contexts, createContext, noteMessages } = harness()
+    let releaseStart = () => {}
+    const startBlocked = new Promise<void>(resolve => { releaseStart = resolve })
+    const settled: string[] = []
+
+    const pending = renderOffline(
+      liveEngineStub(),
+      [{ midi: 60, velocity: 1, start: 0, duration: 0.25 }, { midi: 64, velocity: 1, start: 0.5, duration: 0.25 }],
+      1,
+      {
+        createContext,
+        signal: controller.signal,
+        // `start()` awaits the worklet module in the real engine; here it awaits
+        // a promise the test controls, so the abort lands squarely inside it.
+        createEngine: context => {
+          const scratch = new SynthEngine({ context })
+          const start = scratch.start.bind(scratch)
+          scratch.start = async () => { await startBlocked; await start() }
+          return scratch
+        }
+      }
+    )
+    pending.then(() => settled.push('resolved'), error => settled.push(`rejected:${(error as Error).name}`))
+
+    // Abort while `start()` is still pending, then let it finish: the signal is
+    // already aborted by the time the render would be set up, so a listener-only
+    // abort path would never fire.
+    controller.abort()
+    releaseStart()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(settled, 'a cancelled render must never resolve with a recording').toEqual(['rejected:AbortError'])
+    expect(noteMessages(), 'no note event was applied').toEqual([])
+    expect(contexts[0].suspendTimes, 'no suspension was scheduled').toEqual([])
+    expect(contexts[0].rendered, 'rendering never started').toBe(false)
+  })
+
   it('stops scheduling and returns promptly when cancelled mid-render, without waiting for startRendering', async () => {
     const controller = new AbortController()
     // The render never completes: only the abort can settle the caller.

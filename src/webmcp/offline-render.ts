@@ -145,8 +145,18 @@ function abortError(): Error {
  * A promise that never resolves and rejects with `AbortError` when `signal`
  * aborts. `dispose()` unsubscribes; the pre-attached `catch` keeps a rejection
  * nobody raced from surfacing as an unhandled one.
+ *
+ * An `abort` event that has already fired is never delivered again, so an
+ * already-aborted signal must reject on the spot: attaching a listener to it
+ * would produce a promise that can only hang, and a `Promise.race` against it
+ * would silently wait out the very work the caller cancelled.
  */
 function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose: () => void } {
+  if (signal.aborted) {
+    const promise = Promise.reject(abortError())
+    promise.catch(() => {})
+    return { promise, dispose: () => {} }
+  }
   let dispose = () => {}
   const promise = new Promise<never>((_, reject) => {
     const onAbort = () => reject(abortError())
@@ -187,7 +197,12 @@ export async function renderOffline(
   // One scratch engine per render: `start()` is idempotent and an
   // OfflineAudioContext is single-use, so this object is discarded afterwards.
   const scratch = options.createEngine ? options.createEngine(ctx) : new SynthEngine({ context: ctx })
+  // `start()` awaits `audioWorklet.addModule()`, which is the one slow step
+  // before rendering. A cancel arriving inside that await must stop here, ahead
+  // of any suspension being scheduled or any note event being applied, rather
+  // than being left to the race further down.
   await scratch.start()
+  if (signal?.aborted) throw abortError()
   // A snapshot, not a preset: a preset carries only parameters, modulation, LFO
   // shapes and FX order, so a round-trip through one silently swaps an imported
   // Custom wavetable for a built-in and drops the imported noise sample
