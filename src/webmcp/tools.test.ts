@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { PARAMS, defaultValues, paramIndex } from '../shared/params'
-import { DEFAULT_FX_ORDER, FX_IDS, MAX_MOD_SLOTS, defaultLfoShape, modSourceIndex, type ModSlotState } from '../shared/messages'
+import { DEFAULT_FX_ORDER, FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, defaultLfoShape, modSourceIndex, type ModSlotState } from '../shared/messages'
 import type { PresetData, RecordedAudio, SynthEngine } from '../audio/engine'
 import { createWebMcpTools, type WebMcpToolDependencies } from './tools'
 import { encodeWav } from './offline-render'
@@ -321,6 +321,30 @@ describe('state and parameter tools', () => {
     })
     await expect(execute('get_parameter_schema', { search: 'x'.repeat(101) })).rejects.toThrow(/100 characters/i)
     await expect(execute('get_parameter_schema', { nope: true })).rejects.toThrow(/unexpected/i)
+  })
+
+  it('lists modulation sources from a bare sourceLimit and in compact format', async () => {
+    const { execute } = setup()
+    // A limit without an offset used to return nothing at all, which cost two
+    // agents a round trip each while guessing at the source vocabulary.
+    const limited = await execute('get_parameter_schema', { sourceLimit: 60 })
+    expect(limited.modulationSources.offset).toBe(0)
+    expect(limited.modulationSources.items).toHaveLength(MOD_SOURCES.length)
+    expect(limited.modulationSources.items.map((source: any) => source.id)).toContain('env2')
+    const compact = await execute('get_parameter_schema', { format: 'compact', sourceLimit: 60 })
+    expect(compact.modulationSources).toMatchObject({ format: 'compact', total: MOD_SOURCES.length })
+    expect(compact.modulationSources.items).toContain('env2 voice 0..1')
+    expect(compact.modulationSources.items).toContain('keytrack voice -1..1')
+    expect(compact.modulationSources.items).toContain('macro1 global 0..1')
+    // Paging still works, and the default page size is unchanged.
+    const paged = await execute('get_parameter_schema', { sourceOffset: 6 })
+    expect(paged.modulationSources).toMatchObject({ offset: 6, limit: 5, nextOffset: 11 })
+  })
+
+  it('names the valid modulation sources in the set_modulation description', async () => {
+    const { byName } = setup()
+    const description = byName.get('set_modulation')!.description
+    for (const source of MOD_SOURCES) expect(description).toContain(source.id)
   })
 
   it('keeps default discovery responses within the recommended WebMCP output budget', async () => {

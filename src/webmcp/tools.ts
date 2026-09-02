@@ -4,7 +4,7 @@ import {
   PARAMS, defaultNorm, formatValue, normToValue, paramIndex, valueToNorm,
   type ParamDef
 } from '../shared/params'
-import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type ModSlotState } from '../shared/messages'
+import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type ModSlotState, type ModSourceDef } from '../shared/messages'
 import { analyzeAudio, compareAudioMetrics, type AudioMetrics, type AudioMetricsComparison } from '../shared/audio-analysis'
 import { listPresets, loadPreset, savePreset, validatePresetData, validatePresetName } from '../shared/preset-store'
 import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
@@ -38,6 +38,8 @@ const MAX_PAGE_SIZE = 60
 const COMPACT_PAGE_SIZE = PARAMS.length
 const DEFAULT_PAGE_SIZE = 5
 const PARAMETER_GROUPS = [...new Set(PARAMS.map(def => def.group))]
+/** Derived at module load so the vocabulary in errors and descriptions cannot drift from `MOD_SOURCES`. */
+const MOD_SOURCE_IDS = MOD_SOURCES.map(source => source.id)
 
 type Input = Record<string, unknown>
 type DecodeAudio = typeof decodeBase64Audio
@@ -176,6 +178,11 @@ function compactParameter(def: ParamDef): string {
   parts.push(`=${def.def}`)
   if (def.moddable === true) parts.push('mod')
   return parts.join(' ')
+}
+
+/** One modulation source as a single line: `keytrack voice -1..1`. */
+function compactSource(def: ModSourceDef): string {
+  return `${def.id} ${def.perVoice ? 'voice' : 'global'} ${def.bipolar ? '-1..1' : '0..1'}`
 }
 
 function assertFormat(value: unknown): 'full' | 'compact' {
@@ -527,7 +534,7 @@ export function createWebMcpTools(
     },
     {
       name: 'get_parameter_schema',
-      description: 'Discover parameter units, ranges, defaults, curves, choices, and modulation capabilities. Call once with `format: "compact"` to see every parameter as one line each (`filter1.cutoff Hz 20..20000 exp =8000 mod`); use group/search/offset for detail in the full format.',
+      description: 'Discover parameter units, ranges, defaults, curves, choices, and modulation capabilities. Call once with `format: "compact"` to see every parameter as one line each (`filter1.cutoff Hz 20..20000 exp =8000 mod`); use group/search/offset for detail in the full format. Add `sourceLimit` to the same call to list every modulation source id `set_modulation` accepts.',
       inputSchema: {
         type: 'object', properties: {
           format: { type: 'string', enum: ['full', 'compact'] },
@@ -565,9 +572,15 @@ export function createWebMcpTools(
           curve: def.curve ?? 'lin',
           moddable: def.moddable === true
         }))
-        const sourceOffset = value.sourceOffset === undefined ? undefined : boundedInteger(value.sourceOffset, 'sourceOffset', 0, 0, MOD_SOURCES.length)
-        const sourceLimit = boundedInteger(value.sourceLimit, 'sourceLimit', 5, 1, MAX_PAGE_SIZE)
-        const sources = sourceOffset === undefined ? [] : MOD_SOURCES.slice(sourceOffset, sourceOffset + sourceLimit)
+        // Either paging key asks for the source vocabulary; a limit on its own
+        // implies offset 0, so `{ sourceLimit: 60 }` hands over the whole list.
+        const includeSources = value.sourceOffset !== undefined || value.sourceLimit !== undefined
+        const sourceOffset = boundedInteger(value.sourceOffset, 'sourceOffset', 0, 0, MOD_SOURCES.length)
+        const sourceLimit = boundedInteger(value.sourceLimit, 'sourceLimit', DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
+        const sources = includeSources ? MOD_SOURCES.slice(sourceOffset, sourceOffset + sourceLimit) : []
+        const nextSourceOffset = sourceOffset + sources.length < MOD_SOURCES.length
+          ? { nextOffset: sourceOffset + sources.length }
+          : {}
         return {
           groups: [...PARAMETER_GROUPS],
           parameters: format === 'compact'
@@ -576,8 +589,10 @@ export function createWebMcpTools(
               ...(offset + page.length < matches.length ? { nextOffset: offset + page.length } : {})
             }
             : { items: parameters, offset, limit, total: matches.length, ...(offset + page.length < matches.length ? { nextOffset: offset + page.length } : {}) },
-          ...(sourceOffset === undefined ? {} : {
-            modulationSources: { items: sources.map(source => ({ ...source })), offset: sourceOffset, limit: sourceLimit, total: MOD_SOURCES.length, ...(sourceOffset + sources.length < MOD_SOURCES.length ? { nextOffset: sourceOffset + sources.length } : {}) }
+          ...(!includeSources ? {} : {
+            modulationSources: format === 'compact'
+              ? { items: sources.map(compactSource), total: MOD_SOURCES.length, format: 'compact' as const, ...nextSourceOffset }
+              : { items: sources.map(source => ({ ...source })), offset: sourceOffset, limit: sourceLimit, total: MOD_SOURCES.length, ...nextSourceOffset }
           }),
           limits: {
             modulationSlots: MAX_MOD_SLOTS,
@@ -639,7 +654,7 @@ export function createWebMcpTools(
     },
     {
       name: 'set_modulation',
-      description: 'Add, update, remove, or clear validated modulation routes in the shared 32-slot matrix. `depth` is bipolar (-1..1): it is added to the destination parameter\'s normalized 0..1 value and the sum is clamped, so depth 0.5 on a parameter sitting at 0.5 sweeps it up to 1.0. Example: {"action":"add","source":"lfo1","destination":"filter1.cutoff","depth":0.4}',
+      description: `Add, update, remove, or clear validated modulation routes in the shared 32-slot matrix. \`depth\` is bipolar (-1..1): it is added to the destination parameter's normalized 0..1 value and the sum is clamped, so depth 0.5 on a parameter sitting at 0.5 sweeps it up to 1.0. \`source\` is one of ${MOD_SOURCE_IDS.join(', ')}; \`destination\` is any moddable parameter id. Example: {"action":"add","source":"lfo1","destination":"filter1.cutoff","depth":0.4}`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -687,9 +702,8 @@ export function createWebMcpTools(
         assertObject(input, 'input', ['action', 'source', 'destination', 'depth', 'enabled'], ['action', 'source', 'destination', 'depth'])
         if (typeof value.source !== 'string') throw new Error('source must be a string')
         let source: number
-        const sourceIds = MOD_SOURCES.map(candidate => candidate.id)
         try { source = modSourceIndex(value.source) } catch {
-          throw new Error(`Unknown modulation source '${value.source}'.${didYouMean(value.source, sourceIds)} Valid: ${sourceIds.join(', ')}`)
+          throw new Error(`Unknown modulation source '${value.source}'.${didYouMean(value.source, MOD_SOURCE_IDS)} Valid: ${MOD_SOURCE_IDS.join(', ')}`)
         }
         if (typeof value.destination !== 'string') throw new Error('destination must be a string')
         const def = PARAMS.find(candidate => candidate.id === value.destination)

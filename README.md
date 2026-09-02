@@ -86,7 +86,7 @@ coSynth progressively exposes the same live `SynthEngine` used by the UI through
 Eighteen semantic tools are available over the full audio-enabled lifecycle. Seventeen discovery, rendering, editing, teaching, and history tools register at page load; only `play_notes` waits for the human to start audio, because only it drives the live graph. `render_audio` defaults to an offline render and needs no user gesture, so an agent can design and measure a sound before anyone clicks Start. The UI counts successful registrations rather than assuming every tool is available.
 
 - `get_synth_state` — compact runtime summary plus FX/modulation counts, with bounded pages for filtered parameters, modulation routes, or one LFO shape.
-- `get_parameter_schema` — canonical parameter metadata. Call once with `format: 'compact'` for all 224 parameters as one line each (`filter1.cutoff Hz 20..20000 exp =8000 mod`); use `group`/`search`/`offset` for full detail, up to 60 per page.
+- `get_parameter_schema` — canonical parameter metadata. Call once with `format: 'compact'` for all 224 parameters as one line each (`filter1.cutoff Hz 20..20000 exp =8000 mod`); use `group`/`search`/`offset` for full detail, up to 60 per page. `sourceOffset`/`sourceLimit` — either one on its own is enough — add the modulation source vocabulary `set_modulation` accepts, one line each in compact format (`keytrack voice -1..1`).
 - `update_parameters` — atomic raw-unit/choice-label parameter batches with strict validation.
 - `set_modulation` — add/update/remove/clear operations over the 32-slot modulation matrix.
 - `play_notes` — bounded MIDI sequences with relative real-time timing and cancellation cleanup.
