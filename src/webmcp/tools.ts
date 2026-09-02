@@ -584,7 +584,7 @@ export function createWebMcpTools(
           try {
             await performance.trackPlayback(() => performNotes(engine, sequence.notes, operationSignal), 'ai')
             if (replayId) dependencies.replays!.finishPerformance(replayId, 'completed')
-            return { noteCount: sequence.notes.length, duration: sequence.duration, completed: true }
+            return { noteCount: sequence.notes.length, duration: sequence.duration, completed: true, ...(sequence.overlaps > 0 ? { retriggered: sequence.overlaps } : {}) }
           } catch (error) {
             if (replayId) dependencies.replays!.finishPerformance(replayId, operationSignal.aborted ? 'cancelled' : 'failed')
             throw error

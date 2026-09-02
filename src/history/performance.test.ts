@@ -118,9 +118,92 @@ describe('PerformanceManager', () => {
 
   it('validates bounded sequences and permits contiguous notes', () => {
     expect(validatePerformanceNotes([...notes, { ...notes[0], start: 1 }]).duration).toBe(2)
-    expect(() => validatePerformanceNotes([...notes, { ...notes[0], start: 0.5 }])).toThrow(/overlap/)
     expect(() => validatePerformanceNotes([{ ...notes[0], velocity: NaN }])).toThrow(/finite/)
     expect(() => validatePerformanceNotes([{ ...notes[0], duration: 31 }])).toThrow(/30 seconds/)
-    expect(() => validatePerformanceNotes([{ ...notes[0], extra: true }])).toThrow(/Unexpected/)
+  })
+
+  it('names the accepted note shape when a property is unexpected', () => {
+    expect(() => validatePerformanceNotes([{ ...notes[0], name: 'E4' }]))
+      .toThrow("notes[0]: unexpected property 'name'. Each note is {midi, velocity, start, duration}")
+    expect(() => validatePerformanceNotes([{ midi: 60, velocity: 0.8, start: 0 }])).toThrow(/notes\[0\]\.duration is required/)
+  })
+
+  it('accepts same-pitch overlap and reports how many were found', () => {
+    const contiguous = validatePerformanceNotes([...notes, { ...notes[0], start: 1 }])
+    expect(contiguous.overlaps).toBe(0)
+    const overlapping = validatePerformanceNotes([...notes, { ...notes[0], start: 0.5 }])
+    expect(overlapping.overlaps).toBe(1)
+    expect(overlapping.duration).toBe(1.5)
+    expect(overlapping.notes).toHaveLength(2)
+    const triple = validatePerformanceNotes([
+      { midi: 64, velocity: 0.8, start: 0, duration: 1 },
+      { midi: 64, velocity: 0.6, start: 0.5, duration: 1 },
+      { midi: 64, velocity: 0.4, start: 0.75, duration: 1 },
+      { midi: 67, velocity: 0.4, start: 0, duration: 1 }
+    ])
+    expect(triple.overlaps).toBe(2)
+  })
+})
+
+describe('performNotes same-pitch retrigger', () => {
+  function logEngine() {
+    const log: string[] = []
+    const start = Date.now()
+    return {
+      log,
+      engine: {
+        heldNotes: new Set<number>(),
+        noteOn: (midi: number, velocity: number, _owner: symbol) => { log.push(`on ${midi} ${velocity} @${Date.now() - start}`) },
+        noteOff: (midi: number, _owner: symbol) => { log.push(`off ${midi} @${Date.now() - start}`) }
+      }
+    }
+  }
+
+  it('retriggers a pitch that is still sounding and releases it once, at the later end', async () => {
+    vi.useFakeTimers()
+    const { log, engine } = logEngine()
+    const done = performNotes(engine, [
+      { midi: 64, velocity: 0.8, start: 0, duration: 1 },
+      { midi: 64, velocity: 0.5, start: 0.5, duration: 1 }
+    ], new AbortController().signal)
+    await vi.advanceTimersByTimeAsync(2000)
+    await done
+    // The retrigger is a paired off/on at the same instant; the earlier end releases nothing.
+    expect(log).toEqual(['on 64 0.8 @0', 'off 64 @500', 'on 64 0.5 @500', 'off 64 @1500'])
+    expect(log.filter(entry => entry.startsWith('on 64'))).toHaveLength(2)
+    expect(log.filter(entry => entry === 'off 64 @1000')).toHaveLength(0)
+    expect(log[log.length - 1]).toBe('off 64 @1500')
+  })
+
+  it('keeps distinct pitches independent while a pitch retriggers', async () => {
+    vi.useFakeTimers()
+    const { log, engine } = logEngine()
+    const done = performNotes(engine, [
+      { midi: 64, velocity: 0.8, start: 0, duration: 1 },
+      { midi: 67, velocity: 0.8, start: 0, duration: 0.25 },
+      { midi: 64, velocity: 0.5, start: 0.5, duration: 0.5 }
+    ], new AbortController().signal)
+    await vi.advanceTimersByTimeAsync(2000)
+    await done
+    expect(log).toEqual(['on 64 0.8 @0', 'on 67 0.8 @0', 'off 67 @250', 'off 64 @500', 'on 64 0.5 @500', 'off 64 @1000'])
+  })
+
+  it('releases every still-active pitch once when the performance is aborted mid-retrigger', async () => {
+    vi.useFakeTimers()
+    const { log, engine } = logEngine()
+    const controller = new AbortController()
+    const done = performNotes(engine, [
+      { midi: 64, velocity: 0.8, start: 0, duration: 2 },
+      { midi: 64, velocity: 0.5, start: 0.5, duration: 2 },
+      { midi: 67, velocity: 0.5, start: 0.5, duration: 2 }
+    ], controller.signal)
+    const rejected = expect(done).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.advanceTimersByTimeAsync(600)
+    controller.abort()
+    await vi.advanceTimersByTimeAsync(0)
+    await rejected
+    expect(log.slice(-2).sort()).toEqual(['off 64 @600', 'off 67 @600'])
+    expect(log.filter(entry => entry.startsWith('off 64'))).toHaveLength(2) // the retrigger release plus the cleanup release
+    expect(log.filter(entry => entry.startsWith('off 67'))).toHaveLength(1)
   })
 })

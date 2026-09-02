@@ -317,13 +317,19 @@ describe('note tools', () => {
     expect(engine.heldNotes.has(60)).toBe(false)
   })
 
-  it('rejects overlapping intervals for one MIDI note and notes already held by another owner', async () => {
+  it('retriggers overlapping intervals for one MIDI note and rejects notes already held by another owner', async () => {
+    vi.useFakeTimers()
     const first = setup()
-    await expect(first.execute('play_notes', { notes: [
+    const retriggering = first.execute('play_notes', { notes: [
       { midi: 60, velocity: 1, start: 0, duration: 1 },
       { midi: 60, velocity: 1, start: 0.5, duration: 1 }
-    ] })).rejects.toThrow(/overlap/i)
-    expect(first.engine.noteOn).not.toHaveBeenCalled()
+    ] })
+    await vi.advanceTimersByTimeAsync(2000)
+    await expect(retriggering).resolves.toMatchObject({ noteCount: 2, duration: 1.5, retriggered: 1, completed: true })
+    // Release-then-restrike at 0.5s, then a single release at the later end.
+    expect(first.engine.noteOn).toHaveBeenCalledTimes(2)
+    expect(first.engine.noteOff).toHaveBeenCalledTimes(2)
+    expect(first.engine.heldNotes.size).toBe(0)
 
     const second = setup()
     second.engine.heldNotes.add(60)
