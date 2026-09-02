@@ -786,6 +786,7 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   cursor: pointer;
 }
 .oct-label { font-size: 10px; color: var(--text-dim); width: 56px; text-align: center; }
+.kb-range { font-size: 10px; padding: 2px 4px; }
 .kb-hint { font-size: 9px; color: var(--text-dim); margin-left: auto; }
 
 .keyboard {
@@ -793,6 +794,8 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   display: flex;
   height: 84px;
   touch-action: none;
+  /* Width of one white key; set from JS so black keys scale with the octave count. */
+  --kb-white: 4.545%;
 }
 .key.white {
   flex: 1 1 0;
@@ -805,9 +808,9 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
 .key.black {
   position: absolute;
   top: 0;
-  width: 2.6%;
+  width: calc(var(--kb-white) * 0.58);
   height: 55%;
-  margin-left: -1.3%;
+  margin-left: calc(var(--kb-white) * -0.29);
   background: linear-gradient(#2b2e38, #15171d);
   border: 1px solid #000;
   border-radius: 0 0 3px 3px;

@@ -17,9 +17,18 @@ const KEYMAP_SPAN = Math.max(...Object.values(KEYMAP))
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 const noteName = (note: number) => `${NOTE_NAMES[note % 12]}${Math.floor(note / 12) - 1}`
 
+/** Selectable widths of the drawn keyboard, in octaves. */
+const OCTAVE_CHOICES = [2, 3, 4, 5, 6]
+const DEFAULT_OCTAVES = 5
+/** Top of the drawn range; extra octaves extend downwards, so the played window stays on screen. */
+const TOP_NOTE = 84 // C6
+
 export class Keyboard {
   readonly root: HTMLElement
   private octave = 4 // C4-based
+  private octaves = DEFAULT_OCTAVES
+  private readonly keys = el('div', 'keyboard')
+  private readonly octLabel = el('span', 'oct-label')
   private readonly keyEls = new Map<number, HTMLElement>()
   private readonly pointerNotes = new Map<number, number>()
   private readonly keyboardNotes = new Map<string, number>()
@@ -29,50 +38,40 @@ export class Keyboard {
     this.root = el('div', 'keyboard-wrap')
     guideTarget(this.root, 'panel.keyboard', 'Playable keyboard', 'panel')
     const octDown = el('button', 'oct-btn', '−')
-    const octLabel = el('span', 'oct-label')
     const octUp = el('button', 'oct-btn', '+')
     guideTarget(octDown, 'button.octave.down', 'Keyboard octave down', 'button')
     guideTarget(octUp, 'button.octave.up', 'Keyboard octave up', 'button')
     const setOct = (o: number) => {
       this.octave = Math.max(0, Math.min(7, o))
-      const [lo, hi] = this.playableRange()
-      octLabel.textContent = `${noteName(lo)}–${noteName(hi)}`
-      for (const [note, key] of this.keyEls) key.classList.toggle('out-of-range', note < lo || note > hi)
+      this.applyOctaveWindow()
     }
     octDown.addEventListener('click', () => setOct(this.octave - 1))
     octUp.addEventListener('click', () => setOct(this.octave + 1))
-    const bar = el('div', 'kb-bar')
-    bar.append(octDown, octLabel, octUp, el('span', 'kb-hint', 'Play: A W S E D F T G Y H U J K · octave Z / X'))
 
-    const keys = el('div', 'keyboard')
-    const startNote = 36 // C2; display 3 octaves + top C
-    const numWhite = 3 * 7 + 1
-    for (let w = 0; w < numWhite; w++) {
-      const oct = Math.floor(w / 7)
-      const inOct = w % 7
-      const note = startNote + oct * 12 + WHITE_OFFSETS[inOct]
-      const key = el('div', 'key white')
-      key.dataset.note = String(note)
-      keys.appendChild(key)
-      this.keyEls.set(note, key)
-      if (w < numWhite - 1 && inOct in BLACK_OFFSETS) {
-        const bn = startNote + oct * 12 + BLACK_OFFSETS[inOct]
-        const bk = el('div', 'key black')
-        bk.dataset.note = String(bn)
-        bk.style.left = `${((w + 1) / numWhite) * 100}%`
-        keys.appendChild(bk)
-        this.keyEls.set(bn, bk)
-      }
+    const range = el('select', 'param-select kb-range') as HTMLSelectElement
+    guideTarget(range, 'select.keyboard.range', 'Keyboard width in octaves', 'select')
+    for (const count of OCTAVE_CHOICES) {
+      const option = el('option', undefined, `${count} oct`) as HTMLOptionElement
+      option.value = String(count)
+      range.appendChild(option)
     }
+    range.value = String(this.octaves)
+    range.addEventListener('change', () => {
+      this.octaves = Number(range.value)
+      this.buildKeys()
+    })
 
-    keys.addEventListener('pointerdown', e => {
+    const bar = el('div', 'kb-bar')
+    bar.append(octDown, this.octLabel, octUp, range, el('span', 'kb-hint', 'Play: A W S E D F T G Y H U J K · octave Z / X'))
+
+    this.keys.addEventListener('pointerdown', e => {
       const note = this.noteFromEvent(e)
       if (note < 0) return
-      keys.setPointerCapture(e.pointerId)
+      this.keys.setPointerCapture(e.pointerId)
       this.pointerNotes.set(e.pointerId, note)
       engine.noteOn(note, e.pressure > 0 && e.pressure !== 0.5 ? e.pressure : 0.8)
     })
-    keys.addEventListener('pointermove', e => {
+    this.keys.addEventListener('pointermove', e => {
       if (!this.pointerNotes.has(e.pointerId)) return
       const note = this.noteFromEvent(e)
       const prev = this.pointerNotes.get(e.pointerId)!
@@ -89,8 +88,8 @@ export class Keyboard {
         this.pointerNotes.delete(e.pointerId)
       }
     }
-    keys.addEventListener('pointerup', release)
-    keys.addEventListener('pointercancel', release)
+    this.keys.addEventListener('pointerup', release)
+    this.keys.addEventListener('pointercancel', release)
 
     const keydown = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.repeat || e.metaKey || e.ctrlKey || e.altKey || isTextEditing(e.target) || e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return
@@ -118,9 +117,9 @@ export class Keyboard {
       this.keyEls.get(note)?.classList.toggle('held', on)
     }))
 
-    setOct(this.octave)
+    this.buildKeys()
 
-    this.root.append(bar, keys)
+    this.root.append(bar, this.keys)
   }
 
   dispose(): void {
@@ -129,6 +128,43 @@ export class Keyboard {
     for (const note of this.pointerNotes.values()) this.engine.noteOff(note)
     this.keyboardNotes.clear()
     this.pointerNotes.clear()
+  }
+
+  /** (Re)draws the key row for the current width, then restores window and held styling. */
+  private buildKeys(): void {
+    this.keys.replaceChildren()
+    this.keyEls.clear()
+    const startNote = TOP_NOTE - this.octaves * 12
+    const numWhite = this.octaves * 7 + 1
+    this.keys.style.setProperty('--kb-white', `${100 / numWhite}%`)
+    for (let w = 0; w < numWhite; w++) {
+      const oct = Math.floor(w / 7)
+      const inOct = w % 7
+      const note = startNote + oct * 12 + WHITE_OFFSETS[inOct]
+      const key = el('div', 'key white')
+      key.dataset.note = String(note)
+      this.keys.appendChild(key)
+      this.keyEls.set(note, key)
+      if (w < numWhite - 1 && inOct in BLACK_OFFSETS) {
+        const bn = startNote + oct * 12 + BLACK_OFFSETS[inOct]
+        const bk = el('div', 'key black')
+        bk.dataset.note = String(bn)
+        bk.style.left = `${((w + 1) / numWhite) * 100}%`
+        this.keys.appendChild(bk)
+        this.keyEls.set(bn, bk)
+      }
+    }
+    this.applyOctaveWindow()
+    for (const note of [...this.pointerNotes.values(), ...this.keyboardNotes.values()]) {
+      this.keyEls.get(note)?.classList.add('held')
+    }
+  }
+
+  /** Labels the played range and dims the keys the computer keyboard cannot reach. */
+  private applyOctaveWindow(): void {
+    const [lo, hi] = this.playableRange()
+    this.octLabel.textContent = `${noteName(lo)}–${noteName(hi)}`
+    for (const [note, key] of this.keyEls) key.classList.toggle('out-of-range', note < lo || note > hi)
   }
 
   /** MIDI range the computer keyboard currently reaches, inclusive. */
