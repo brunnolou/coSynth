@@ -62,5 +62,54 @@ describe('analyzeAudioAbortably', () => {
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(terminate).toHaveBeenCalledOnce()
   })
+
+  /**
+   * A worker is spawned per analysis and therefore per `render_audio` call, and
+   * each spawn loads its script. A worker that cannot start must not cost the
+   * caller the render it already paid for: the analysis falls back to this
+   * thread, which is the same path a browser without `Worker` takes.
+   */
+  it('analyses on this thread when the worker cannot start', async () => {
+    class FailingWorker {
+      private handlers = new Map<string, (event: { message: string }) => void>()
+      addEventListener = (type: string, handler: (event: { message: string }) => void) => {
+        this.handlers.set(type, handler)
+      }
+      postMessage = () => {
+        // A script that will not load reports a worker-level `error`, never a
+        // `message`: the worker exists, but nothing inside it ever ran.
+        setTimeout(() => this.handlers.get('error')?.({ message: 'Failed to fetch the worker script' }), 0)
+      }
+      terminate = vi.fn()
+    }
+    vi.stubGlobal('Worker', FailingWorker)
+    const channel = Float32Array.from([0, 0.5, -0.5, 0])
+    await expect(analyzeAudioAbortably([channel], 8000)).resolves.toMatchObject({
+      peakDb: expect.any(Number),
+      rmsDb: expect.any(Number)
+    })
+  })
+
+  /**
+   * The fallback is for a worker that never ran. An analysis that DID run and
+   * reported a problem must still reject: repeating it here would only
+   * reproduce the same problem, and swallowing it would turn a real failure
+   * into a silently different set of numbers.
+   */
+  it('still rejects when the analysis itself reports a failure', async () => {
+    class ReportingWorker {
+      private handlers = new Map<string, (event: { data: unknown }) => void>()
+      addEventListener = (type: string, handler: (event: { data: unknown }) => void) => {
+        this.handlers.set(type, handler)
+      }
+      postMessage = () => {
+        setTimeout(() => this.handlers.get('message')?.({ data: { ok: false, message: 'analysis blew up' } }), 0)
+      }
+      terminate = vi.fn()
+    }
+    vi.stubGlobal('Worker', ReportingWorker)
+    await expect(analyzeAudioAbortably([new Float32Array(4)], 8000))
+      .rejects.toThrow('analysis blew up')
+  })
 })
 
