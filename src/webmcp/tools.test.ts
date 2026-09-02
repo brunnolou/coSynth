@@ -930,13 +930,43 @@ describe('offline rendering', () => {
     expect(first).not.toHaveProperty('renderModeFallback')
     expect(engine.recordOutput, 'no live capture, no gesture').not.toHaveBeenCalled()
     expect(engine.noteOn).not.toHaveBeenCalled()
-    expect(renderOffline).toHaveBeenCalledWith(engine, expect.any(Array), 1.5)
+    expect(renderOffline).toHaveBeenCalledWith(engine, expect.any(Array), 1.5, { signal: expect.any(AbortSignal) })
 
     const second = await execute('render_audio', input)
     expect(second.metrics).toEqual(first.metrics)
     // A single-pitch sequence gets harmonic analysis for free (plan Task 7.4).
     expect(first.metrics.harmonics?.inharmonicity).toBeTypeOf('number')
     expect(first.metrics.decayT60Ms).toBeGreaterThan(0)
+  })
+
+  it('hands the offline renderer the cancellation signal so an in-flight render can bail', async () => {
+    const engine = new FakeEngine()
+    engine.running = false
+    let received: AbortSignal | undefined
+    // Settles only on abort: if the signal never reached the renderer, the
+    // tool call could not be cancelled at all.
+    const renderOffline = vi.fn((
+      _engine: unknown, _notes: unknown, _duration: number, options?: { signal?: AbortSignal }
+    ): Promise<RecordedAudio> => {
+      received = options?.signal
+      return new Promise<RecordedAudio>((_resolve, reject) => {
+        options!.signal!.addEventListener('abort', () => {
+          const error = new Error('Execution aborted')
+          error.name = 'AbortError'
+          reject(error)
+        }, { once: true })
+      })
+    })
+    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, { renderOffline })
+    const controller = new AbortController()
+    const pending = tools.find(tool => tool.name === 'render_audio')!.execute(
+      { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }], duration: 1.5 },
+      { signal: controller.signal }
+    ) as Promise<any>
+    await vi.waitFor(() => expect(received, 'the renderer must receive an AbortSignal').toBeInstanceOf(AbortSignal))
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(received!.aborted).toBe(true)
   })
 
   it('omits harmonics when the sequence holds more than one pitch', async () => {

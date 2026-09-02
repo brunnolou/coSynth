@@ -17,10 +17,13 @@ import type { PerformanceNote } from '../history/types'
 export type OfflineRenderer = (
   engine: SynthEngine,
   notes: readonly PerformanceNote[],
-  duration: number
+  duration: number,
+  options?: { signal?: AbortSignal }
 ) => Promise<RecordedAudio>
 
 export interface OfflineRenderOptions {
+  /** Cancels the render: see the note on `startRendering()` in `renderOffline`. */
+  signal?: AbortSignal
   /** Overrides the sample rate taken from the live engine's context. */
   sampleRate?: number
   /** Seam for tests: build the render context. */
@@ -131,6 +134,29 @@ class OfflineNotes {
   }
 }
 
+/** The repo's cancellation idiom: `register.ts` classifies this as a cancel. */
+function abortError(): Error {
+  const error = new Error('Execution aborted')
+  error.name = 'AbortError'
+  return error
+}
+
+/**
+ * A promise that never resolves and rejects with `AbortError` when `signal`
+ * aborts. `dispose()` unsubscribes; the pre-attached `catch` keeps a rejection
+ * nobody raced from surfacing as an unhandled one.
+ */
+function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose: () => void } {
+  let dispose = () => {}
+  const promise = new Promise<never>((_, reject) => {
+    const onAbort = () => reject(abortError())
+    signal.addEventListener('abort', onAbort, { once: true })
+    dispose = () => signal.removeEventListener('abort', onAbort)
+  })
+  promise.catch(() => {})
+  return { promise, dispose }
+}
+
 /**
  * Render `notes` through a throwaway copy of `engine`'s patch and return the
  * result as lossless PCM plus a WAV blob.
@@ -141,6 +167,8 @@ export async function renderOffline(
   duration: number,
   options: OfflineRenderOptions = {}
 ): Promise<RecordedAudio> {
+  const signal = options.signal
+  if (signal?.aborted) throw abortError()
   if (!Number.isFinite(duration) || duration <= 0) throw new Error('Offline render duration must be greater than zero')
   const sampleRate = options.sampleRate
     ?? (engine.context ?? engine.ctx)?.sampleRate
@@ -196,13 +224,30 @@ export async function renderOffline(
   }
   for (const [frame, bucket] of [...byFrame.entries()].sort((a, b) => a[0] - b[0])) {
     pending.push(suspendable.suspend(frame / sampleRate).then(() => {
-      for (const event of bucket) player.apply(event)
+      // Once cancelled, stop scheduling: no further note events are applied, so
+      // an abandoned render cannot keep mutating the scratch engine.
+      if (!signal?.aborted) for (const event of bucket) player.apply(event)
       // Deliberately not awaited: resuming is what lets rendering continue.
+      // Still resumed after an abort, so the orphaned render below can finish
+      // and be collected instead of sitting suspended forever.
       void suspendable.resume?.()
     }))
   }
 
-  const buffer = await suspendable.startRendering()
+  // The Web Audio API offers no way to cancel an in-flight `startRendering()`.
+  // Racing it against the signal is therefore about the CALLER, not the CPU:
+  // `stop_performance` and a cancelled invocation return promptly instead of
+  // waiting out the render, while the orphaned render still runs to completion
+  // on its own and is then collected, with nothing consuming its buffer.
+  const abort = signal ? abortRejection(signal) : null
+  let buffer: AudioBuffer
+  try {
+    buffer = abort
+      ? await Promise.race([suspendable.startRendering(), abort.promise])
+      : await suspendable.startRendering()
+  } finally {
+    abort?.dispose()
+  }
   await Promise.allSettled(pending)
 
   const channelData: Float32Array[] = []

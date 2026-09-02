@@ -29,6 +29,12 @@ class FakeOfflineContext {
   readonly audioWorklet = { addModule: vi.fn(async () => undefined) }
   readonly suspendTimes: number[] = []
   readonly resumes: number[] = []
+  /** True once `startRendering()` has actually produced its buffer. */
+  rendered = false
+  /** Awaited just before the buffer is returned, so a test can stall a render. */
+  hold: Promise<void> | null = null
+  /** Called after each suspension callback (and its `resume`) has run. */
+  afterResume: ((index: number) => void) | null = null
   private readonly waiting: { time: number; resolve: () => void }[] = []
 
   constructor(
@@ -54,13 +60,17 @@ class FakeOfflineContext {
   async startRendering() {
     // Everything posted before rendering starts belongs to frame 0.
     const marks: { frame: number; upTo: number }[] = [{ frame: 0, upTo: this.messages.length }]
-    for (const entry of [...this.waiting].sort((a, b) => a.time - b.time)) {
-      entry.resolve()
+    const order = [...this.waiting].sort((a, b) => a.time - b.time)
+    for (let index = 0; index < order.length; index++) {
+      order[index].resolve()
       // Let the suspension callback (and its `resume`) run before the next one.
       await new Promise(resolve => setTimeout(resolve, 0))
-      marks.push({ frame: Math.round(entry.time * this.sampleRate), upTo: this.messages.length })
+      marks.push({ frame: Math.round(order[index].time * this.sampleRate), upTo: this.messages.length })
+      this.afterResume?.(index)
     }
+    if (this.hold) await this.hold
     const mono = this.synthesize(marks)
+    this.rendered = true
     const channels = Array.from({ length: this.numberOfChannels }, (_, channel) =>
       channel === 0 ? mono : mono.map(sample => sample * 0.5))
     return {
@@ -151,12 +161,13 @@ function liveEngineStub(sampleRate = SAMPLE_RATE) {
 }
 
 /** A stubbed worklet plus contexts wired to it, so renders produce real samples. */
-function harness() {
+function harness(configure?: (context: FakeOfflineContext) => void) {
   const messages = stubWorkletNode()
   const contexts: FakeOfflineContext[] = []
   const createContext = (options: { numberOfChannels: number; length: number; sampleRate: number }) => {
     const context = new FakeOfflineContext(options, messages)
     contexts.push(context)
+    configure?.(context)
     return context as unknown as BaseAudioContext
   }
   const noteMessages = () => messages
@@ -392,6 +403,45 @@ describe('renderOffline', () => {
     const sample = samples[samples.length - 1]
     expect(sample.sampleRate, 'the imported sample reached the render worklet').toBe(noise.sampleRate)
     expect(Array.from(sample.data)).toEqual(Array.from(noise.data))
+  })
+
+  it('rejects with AbortError before doing any work when the signal is already aborted', async () => {
+    const { contexts, createContext } = harness()
+    const controller = new AbortController()
+    controller.abort()
+    await expect(renderOffline(liveEngineStub(), [{ midi: 60, velocity: 1, start: 0, duration: 0.1 }], 0.2, {
+      createContext,
+      signal: controller.signal
+    })).rejects.toMatchObject({ name: 'AbortError' })
+    expect(contexts, 'no render context is even created').toHaveLength(0)
+  })
+
+  it('stops scheduling and returns promptly when cancelled mid-render, without waiting for startRendering', async () => {
+    const controller = new AbortController()
+    // The render never completes: only the abort can settle the caller.
+    const { contexts, createContext, noteMessages } = harness(context => {
+      context.hold = new Promise<void>(() => {})
+      context.afterResume = index => { if (index === 0) controller.abort() }
+    })
+    const pending = renderOffline(
+      liveEngineStub(),
+      [
+        { midi: 60, velocity: 1, start: 0.25, duration: 0.1 },
+        { midi: 64, velocity: 1, start: 0.5, duration: 0.1 }
+      ],
+      1,
+      { createContext, signal: controller.signal }
+    )
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(contexts[0].rendered, 'startRendering() is still in flight — it cannot be cancelled').toBe(false)
+
+    // Let the orphaned render drive its remaining suspensions: they must be
+    // no-ops now, so a cancelled render stops feeding the scratch engine.
+    await new Promise(resolve => setTimeout(resolve, 10))
+    // Only the first suspension's events made it; the abort landed right after.
+    expect(noteMessages(), 'nothing was scheduled after the abort').toEqual(['on:60@1'])
+    expect(contexts[0].resumes.length, 'later suspensions still resume so the render can be collected')
+      .toBe(contexts[0].suspendTimes.length)
   })
 
   it('uses the default sample rate when no context exists yet, and rejects a zero duration', async () => {

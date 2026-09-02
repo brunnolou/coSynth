@@ -801,7 +801,10 @@ export function createWebMcpTools(
             // No live graph, no held-note conflict, no Start gesture: the whole
             // point of the offline path.
             throwIfAborted(operationSignal)
-            const recording = await offlineRenderer(engine, sequence.notes, duration)
+            // The signal goes *into* the renderer: an offline render burns CPU
+            // for as long as it takes, and without it a cancellation could only
+            // be reported once the whole render had finished.
+            const recording = await offlineRenderer(engine, sequence.notes, duration, { signal: operationSignal })
             throwIfAborted(operationSignal)
             const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal, analysisOptions)
             return finish(recording, metrics, 'offline')
