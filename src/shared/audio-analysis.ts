@@ -109,12 +109,19 @@ export interface AudioMetricComparisonDetail {
   similarity: number
 }
 
-/** `decayT60Ms` is absent whenever the buffer never decayed, so its detail carries nulls. */
+/**
+ * `decayT60Ms` is absent whenever the buffer never decayed, so its detail carries nulls.
+ *
+ * `similarity` is `null` - and the metric is left out of the overall mean - when exactly one
+ * side is `null`, because the pair was not measurable rather than maximally different. Both
+ * sides `null` is a match and scores 1; two measured values score normally.
+ */
 export interface NullableMetricComparisonDetail {
   reference: number | null
   candidate: number | null
   delta: number | null
-  similarity: number
+  /** `null` means "not measurable on one side", never "as wrong as it gets". */
+  similarity: number | null
 }
 
 export interface AudioMetricsComparison {
@@ -251,19 +258,31 @@ function correlation(left: readonly number[], right: readonly number[]): number 
   return covariance / Math.sqrt(leftVariance * rightVariance)
 }
 
-/** Two sounds that both never decayed match; one that decayed and one that did not do not. */
+/**
+ * Two sounds that both never decayed match. One that decayed and one that did not have no
+ * comparison at all, which is reported as `similarity: null` rather than as 0.
+ *
+ * `decayT60Ms` is `null` whenever the buffer holds no decay the T60 line describes - a
+ * sustaining patch, a short note, a beating unison - which is its most common value in the
+ * reference-matching loop. Scoring that 0 said "as different as two decays can be" about a
+ * pair that was never measured, and an agent reading the response could not tell the two
+ * apart. It also made the arithmetic perverse: with every other metric identical, a
+ * candidate whose decay was 160x too fast scored 0.9029 overall while one whose decay simply
+ * could not be measured scored 0.9000.
+ */
 function decayDetail(
   reference: number | null,
   candidate: number | null,
   logRatio: (left: number, right: number, floor: number) => number
 ): NullableMetricComparisonDetail {
-  const similarity = reference === null || candidate === null
-    ? (reference === candidate ? 1 : 0)
-    : clampSimilarity(exponentialSimilarity(logRatio(reference, candidate, 1), Math.log(4)))
+  const unmeasurable = reference === null || candidate === null
+  const similarity = unmeasurable
+    ? (reference === candidate ? 1 : null)
+    : clampSimilarity(exponentialSimilarity(logRatio(reference as number, candidate as number, 1), Math.log(4)))
   return {
     reference,
     candidate,
-    delta: reference === null || candidate === null ? null : candidate - reference,
+    delta: unmeasurable ? null : (candidate as number) - (reference as number),
     similarity
   }
 }
@@ -409,7 +428,16 @@ export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMet
     ...metricKeys.filter(key => key !== 'clippingCount'),
     'envelope' as const, 'bands' as const, 'brightness' as const
   ]
-  const similarity = overallKeys.reduce((sum, key) => sum + details[key].similarity, 0) / overallKeys.length
+  // A metric that could not be measured on one side is left out of the mean rather than
+  // averaged in as a zero: the pair carries no evidence either way, and counting it as
+  // maximal disagreement penalises a candidate for a property nothing established. The
+  // metric still appears in `details` with `similarity: null`, so the absence is legible.
+  const contributing = overallKeys
+    .map(key => details[key].similarity)
+    .filter((value): value is number => value !== null)
+  const similarity = contributing.length > 0
+    ? contributing.reduce((sum, value) => sum + value, 0) / contributing.length
+    : 1
   return { similarity: clampSimilarity(similarity), details }
 }
 

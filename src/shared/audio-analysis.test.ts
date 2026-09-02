@@ -766,8 +766,19 @@ describe('compareAudioMetrics', () => {
     }
     for (const result of [compareAudioMetrics(silence, silence), compareAudioMetrics(silence, changed)]) {
       expect(Number.isFinite(result.similarity)).toBe(true)
+      expect(result.similarity).toBeGreaterThanOrEqual(0)
+      expect(result.similarity).toBeLessThanOrEqual(1)
       for (const key of detailKeys) {
-        expect(Number.isFinite(result.details[key].similarity)).toBe(true)
+        const { similarity, reference, candidate } = result.details[key]
+        // Stricter than "finite": the only permitted non-number is the null that means
+        // "not measurable", and it is only permitted when a side is actually null.
+        if (similarity === null) {
+          expect(reference === null || candidate === null).toBe(true)
+          continue
+        }
+        expect(Number.isFinite(similarity)).toBe(true)
+        expect(similarity).toBeGreaterThanOrEqual(0)
+        expect(similarity).toBeLessThanOrEqual(1)
       }
     }
   })
@@ -789,11 +800,45 @@ describe('compareAudioMetrics', () => {
     expect(compareAudioMetrics(quiet, { ...quiet }).details.decayT60Ms).toEqual({
       reference: null, candidate: null, delta: null, similarity: 1
     })
+    // Not 0: one side unmeasurable is an absence of evidence, not maximal disagreement.
     const mismatch = compareAudioMetrics(quiet, referenceMetrics).details.decayT60Ms
-    expect(mismatch).toEqual({ reference: null, candidate: 800, delta: null, similarity: 0 })
+    expect(mismatch).toEqual({ reference: null, candidate: 800, delta: null, similarity: null })
     const shorter = compareAudioMetrics(referenceMetrics, { ...referenceMetrics, decayT60Ms: 100 })
     expect(shorter.details.decayT60Ms.delta).toBe(-700)
-    expect(shorter.details.decayT60Ms.similarity).toBeLessThan(0.7)
+    expect(shorter.details.decayT60Ms.similarity as number).toBeLessThan(0.7)
+  })
+
+  it('excludes an unmeasurable decay from the overall score but not a badly wrong one', () => {
+    // A sustaining patch against a decaying reference: the most common case in the
+    // reference-matching loop, and the one the eval saw scoring 0.
+    const unmeasurable = compareAudioMetrics(referenceMetrics, { ...referenceMetrics, decayT60Ms: null })
+    // A measured value 160x too fast: genuinely, readably wrong.
+    const wrong = compareAudioMetrics(referenceMetrics, { ...referenceMetrics, decayT60Ms: 5 })
+
+    // An agent tells them apart from the detail alone, without reading the overall figure.
+    expect(unmeasurable.details.decayT60Ms.similarity).toBeNull()
+    expect(unmeasurable.details.decayT60Ms.candidate).toBeNull()
+    expect(wrong.details.decayT60Ms.similarity as number).toBeLessThan(0.05)
+    expect(wrong.details.decayT60Ms.candidate).toBe(5)
+
+    // With every other metric identical, "not measurable" must not cost anything at all,
+    // while "wrong" must. Previously both were penalised and the wrong one scored *higher*
+    // (0.9029 against 0.9000), because a wrong value still contributes a little and a null
+    // contributed exactly nothing while occupying a slot in the mean.
+    expect(unmeasurable.similarity).toBe(1)
+    expect(wrong.similarity).toBeLessThan(0.95)
+    expect(unmeasurable.similarity).toBeGreaterThan(wrong.similarity)
+
+    // Both sides unmeasurable is still a match and still counted.
+    const neither = { ...referenceMetrics, decayT60Ms: null }
+    expect(compareAudioMetrics(neither, { ...neither }).details.decayT60Ms.similarity).toBe(1)
+    expect(compareAudioMetrics(neither, { ...neither }).similarity).toBe(1)
+
+    // The exclusion must not let a bad candidate hide: everything else still counts.
+    const alsoDark = compareAudioMetrics(referenceMetrics, {
+      ...referenceMetrics, decayT60Ms: null, spectralCentroidHz: 80
+    })
+    expect(alsoDark.similarity).toBeLessThan(0.95)
   })
 
   it('scores envelope shape by correlation, not by absolute level', () => {
