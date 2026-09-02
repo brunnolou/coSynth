@@ -72,11 +72,23 @@ try {
       running: window.coSynth.running,
       overlay: Boolean(document.getElementById('start-overlay'))
     }
+    // The default patch sustains at 80 %, so it has no exponential decay and
+    // decayT60Ms is correctly null for it. Ask for a plucked envelope first so
+    // there is a real T60 to measure - that, plus the harmonic fit, is what the
+    // plan's verification step wants an agent to be able to read.
+    const patch = await tools.get('update_parameters').execute({
+      updates: [
+        { id: 'env1.sustain', value: 0 },
+        { id: 'env1.decay', value: 0.8 },
+        { id: 'env1.release', value: 0.05 }
+      ]
+    }, { signal: new AbortController().signal })
     const render = await tools.get('render_audio').execute({
       notes: [{ midi: 60, velocity: 0.9, start: 0, duration: 1 }], duration: 2
     }, { signal: new AbortController().signal })
     return {
       before,
+      patch,
       render,
       runningAfter: window.coSynth.running,
       overlayAfter: Boolean(document.getElementById('start-overlay'))
@@ -91,7 +103,10 @@ try {
   if (coldResult.render.renderMode !== 'offline') {
     throw new Error(`Cold render did not use the offline path: ${JSON.stringify({ renderMode: coldResult.render.renderMode, renderModeFallback: coldResult.render.renderModeFallback })}`)
   }
+  if (coldResult.patch?.ok === false) throw new Error(`Cold patch failed: ${JSON.stringify(coldResult.patch)}`)
   const coldMetrics = coldResult.render.metrics ?? {}
+  // A plucked patch must yield a measurable T60. Reporting null here would mean
+  // the decay fit had stopped recognising a genuine exponential decay.
   if (!Number.isFinite(coldMetrics.decayT60Ms)) throw new Error(`Cold render has no decayT60Ms: ${JSON.stringify(coldMetrics)}`)
   if (!Number.isFinite(coldMetrics.harmonics?.inharmonicity)) {
     throw new Error(`Cold render has no harmonics.inharmonicity: ${JSON.stringify(coldMetrics.harmonics)}`)
