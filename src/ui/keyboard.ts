@@ -8,15 +8,29 @@ import { isTextEditing } from './history-bindings'
 const KEYMAP: Record<string, number> = {
   KeyA: 0, KeyW: 1, KeyS: 2, KeyE: 3, KeyD: 4, KeyF: 5, KeyT: 6,
   KeyG: 7, KeyY: 8, KeyH: 9, KeyU: 10, KeyJ: 11, KeyK: 12, KeyO: 13,
-  KeyL: 14, KeyP: 15, Semicolon: 16
+  KeyL: 14, KeyP: 15, Semicolon: 16, Quote: 17
 }
 
 const WHITE_OFFSETS = [0, 2, 4, 5, 7, 9, 11]
-const BLACK_OFFSETS: Record<number, number> = { 0: 1, 1: 3, 3: 6, 4: 8, 5: 10 }
+const KEYMAP_SPAN = Math.max(...Object.values(KEYMAP))
+const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+const noteName = (note: number) => `${NOTE_NAMES[note % 12]}${Math.floor(note / 12) - 1}`
+
+/** Selectable widths of the drawn keyboard, in octaves. */
+const OCTAVE_CHOICES = [1, 2, 3, 4, 5, 6, 7]
+const DEFAULT_OCTAVES = 5
+const BOTTOM_NOTE = 12 // C0; below this the keys are subsonic, so the range never scrolls past it
+const MIN_OCTAVE = 0
+const MAX_OCTAVE = 7
+const HIGHEST_NOTE = 127
 
 export class Keyboard {
   readonly root: HTMLElement
   private octave = 4 // C4-based
+  private octaves = DEFAULT_OCTAVES
+  private drawnStart = -1
+  private readonly keys = el('div', 'keyboard')
+  private readonly octLabel = el('span', 'oct-label')
   private readonly keyEls = new Map<number, HTMLElement>()
   private readonly pointerNotes = new Map<number, number>()
   private readonly keyboardNotes = new Map<string, number>()
@@ -26,48 +40,43 @@ export class Keyboard {
     this.root = el('div', 'keyboard-wrap')
     guideTarget(this.root, 'panel.keyboard', 'Playable keyboard', 'panel')
     const octDown = el('button', 'oct-btn', '−')
-    const octLabel = el('span', 'oct-label', 'C3–C6')
     const octUp = el('button', 'oct-btn', '+')
     guideTarget(octDown, 'button.octave.down', 'Keyboard octave down', 'button')
     guideTarget(octUp, 'button.octave.up', 'Keyboard octave up', 'button')
     const setOct = (o: number) => {
-      this.octave = Math.max(0, Math.min(7, o))
-      octLabel.textContent = `C${this.octave - 1}–C${this.octave + 2}`
+      this.octave = Math.max(MIN_OCTAVE, Math.min(MAX_OCTAVE, o))
+      octDown.disabled = this.octave === MIN_OCTAVE
+      octUp.disabled = this.octave === MAX_OCTAVE
+      this.syncKeys()
     }
     octDown.addEventListener('click', () => setOct(this.octave - 1))
     octUp.addEventListener('click', () => setOct(this.octave + 1))
-    const bar = el('div', 'kb-bar')
-    bar.append(octDown, octLabel, octUp, el('span', 'kb-hint', 'Play: A W S E D F T G Y H U J K · octave Z / X'))
 
-    const keys = el('div', 'keyboard')
-    const startNote = 36 // C2; display 3 octaves + top C
-    const numWhite = 3 * 7 + 1
-    for (let w = 0; w < numWhite; w++) {
-      const oct = Math.floor(w / 7)
-      const inOct = w % 7
-      const note = startNote + oct * 12 + WHITE_OFFSETS[inOct]
-      const key = el('div', 'key white')
-      key.dataset.note = String(note)
-      keys.appendChild(key)
-      this.keyEls.set(note, key)
-      if (w < numWhite - 1 && inOct in BLACK_OFFSETS) {
-        const bn = startNote + oct * 12 + BLACK_OFFSETS[inOct]
-        const bk = el('div', 'key black')
-        bk.dataset.note = String(bn)
-        bk.style.left = `${((w + 1) / numWhite) * 100}%`
-        keys.appendChild(bk)
-        this.keyEls.set(bn, bk)
-      }
+    const range = el('select', 'param-select kb-range') as HTMLSelectElement
+    guideTarget(range, 'select.keyboard.range', 'Keyboard width in octaves', 'select')
+    for (const count of OCTAVE_CHOICES) {
+      const option = el('option', undefined, `${count} oct`) as HTMLOptionElement
+      option.value = String(count)
+      range.appendChild(option)
     }
+    range.value = String(this.octaves)
+    range.addEventListener('change', () => {
+      this.octaves = Number(range.value)
+      this.drawnStart = -1
+      this.syncKeys(true)
+    })
 
-    keys.addEventListener('pointerdown', e => {
+    const bar = el('div', 'kb-bar')
+    bar.append(octDown, this.octLabel, octUp, range, el('span', 'kb-hint', "Play: A W S E D F T G Y H U J K O L P ; ' · octave Z / X"))
+
+    this.keys.addEventListener('pointerdown', e => {
       const note = this.noteFromEvent(e)
       if (note < 0) return
-      keys.setPointerCapture(e.pointerId)
+      this.keys.setPointerCapture(e.pointerId)
       this.pointerNotes.set(e.pointerId, note)
       engine.noteOn(note, e.pressure > 0 && e.pressure !== 0.5 ? e.pressure : 0.8)
     })
-    keys.addEventListener('pointermove', e => {
+    this.keys.addEventListener('pointermove', e => {
       if (!this.pointerNotes.has(e.pointerId)) return
       const note = this.noteFromEvent(e)
       const prev = this.pointerNotes.get(e.pointerId)!
@@ -84,8 +93,8 @@ export class Keyboard {
         this.pointerNotes.delete(e.pointerId)
       }
     }
-    keys.addEventListener('pointerup', release)
-    keys.addEventListener('pointercancel', release)
+    this.keys.addEventListener('pointerup', release)
+    this.keys.addEventListener('pointercancel', release)
 
     const keydown = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.repeat || e.metaKey || e.ctrlKey || e.altKey || isTextEditing(e.target) || e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return
@@ -93,7 +102,7 @@ export class Keyboard {
       if (e.code === 'KeyX') { setOct(this.octave + 1); return }
       const off = KEYMAP[e.code]
       if (off === undefined) return
-      const note = (this.octave + 1) * 12 + off
+      const note = this.playableRange()[0] + off
       if (this.keyboardNotes.has(e.code)) return
       this.keyboardNotes.set(e.code, note)
       engine.noteOn(note, 0.8)
@@ -113,7 +122,9 @@ export class Keyboard {
       this.keyEls.get(note)?.classList.toggle('held', on)
     }))
 
-    this.root.append(bar, keys)
+    this.syncKeys(true)
+
+    this.root.append(bar, this.keys)
   }
 
   dispose(): void {
@@ -122,6 +133,101 @@ export class Keyboard {
     for (const note of this.pointerNotes.values()) this.engine.noteOff(note)
     this.keyboardNotes.clear()
     this.pointerNotes.clear()
+  }
+
+  /**
+   * Drawn extent in semitones. A single octave is the typeable window itself — C up to the F
+   * above, matching the octave label — rather than C to C, which stopped short of the label.
+   */
+  private drawnSpan(): number {
+    return this.octaves === 1 ? KEYMAP_SPAN : this.octaves * 12
+  }
+
+  /** C-aligned range starts that keep the whole played window on screen, as [lowest, highest]. */
+  private validStarts(span: number): [number, number] {
+    const [lo, hi] = this.playableRange()
+    const ceiling = Math.floor((HIGHEST_NOTE - span) / 12) * 12
+    return [Math.max(BOTTOM_NOTE, Math.ceil((hi - span) / 12) * 12), Math.min(lo, ceiling)]
+  }
+
+  /**
+   * Lowest drawn note. The range holds still while the played window sits inside it, and when
+   * Z / X pushes the window out it pages — landing the window against the opposite edge — so
+   * the highlight travels the width of the keyboard instead of standing still. Scrolling by
+   * the minimum instead would shift the range by the same 12 semitones as the window on every
+   * step, which is what made Z / X look like it did nothing.
+   */
+  private rangeStart(): number {
+    const span = this.drawnSpan()
+    const [lowest, highest] = this.validStarts(span)
+    // Narrow widths leave under an octave of slack, so only one range can hold the window.
+    if (highest <= lowest) return highest
+    if (this.drawnStart < 0) {
+      // First draw, or a fresh width: centre the window in the view.
+      const centred = Math.round((this.playableRange()[0] - (span - KEYMAP_SPAN) / 2) / 12) * 12
+      return Math.min(highest, Math.max(lowest, centred))
+    }
+    if (this.drawnStart < lowest) return highest // window climbed out of view: page up
+    if (this.drawnStart > highest) return lowest // window dropped out of view: page down
+    return this.drawnStart
+  }
+
+  /** Rebuilds the key row only when the drawn range moves; otherwise just restyles it. */
+  private syncKeys(force = false): void {
+    const start = this.rangeStart()
+    if (!force && start === this.drawnStart) {
+      this.applyOctaveWindow()
+      return
+    }
+    this.drawnStart = start
+    this.buildKeys(start)
+  }
+
+  /** (Re)draws the key row from `startNote`, then restores window and held styling. */
+  private buildKeys(startNote: number): void {
+    this.keys.replaceChildren()
+    this.keyEls.clear()
+    const span = this.drawnSpan()
+    // startNote is always a C, so a semitone's offset doubles as its pitch class.
+    const isWhite = (semitone: number) => WHITE_OFFSETS.includes(semitone % 12)
+    let numWhite = 0
+    for (let semitone = 0; semitone <= span; semitone++) if (isWhite(semitone)) numWhite++
+    this.keys.style.setProperty('--kb-white', `${100 / numWhite}%`)
+    let whiteIndex = -1
+    for (let semitone = 0; semitone <= span; semitone++) {
+      const note = startNote + semitone
+      if (isWhite(semitone)) {
+        whiteIndex++
+        const key = el('div', 'key white')
+        key.dataset.note = String(note)
+        if (note % 12 === 0) key.appendChild(el('span', 'key-name', noteName(note)))
+        this.keys.appendChild(key)
+        this.keyEls.set(note, key)
+      } else {
+        const key = el('div', 'key black')
+        key.dataset.note = String(note)
+        key.style.left = `${((whiteIndex + 1) / numWhite) * 100}%`
+        this.keys.appendChild(key)
+        this.keyEls.set(note, key)
+      }
+    }
+    this.applyOctaveWindow()
+    // The engine's set covers every owner — MIDI and agents included — not just this widget's
+    // own notes, and onNote does not fire again for a note that is already down.
+    for (const note of this.engine.heldNotes) this.keyEls.get(note)?.classList.add('held')
+  }
+
+  /** Labels the played range and dims the keys the computer keyboard cannot reach. */
+  private applyOctaveWindow(): void {
+    const [lo, hi] = this.playableRange()
+    this.octLabel.textContent = `${noteName(lo)}–${noteName(hi)}`
+    for (const [note, key] of this.keyEls) key.classList.toggle('out-of-range', note < lo || note > hi)
+  }
+
+  /** MIDI range the computer keyboard currently reaches, inclusive. */
+  private playableRange(): [number, number] {
+    const lo = (this.octave + 1) * 12
+    return [lo, lo + KEYMAP_SPAN]
   }
 
   private noteFromEvent(e: PointerEvent): number {

@@ -169,7 +169,7 @@ describe('history interaction bindings', () => {
 describe('keyboard shortcut isolation', () => {
   it('never changes octave or plays notes for modified shortcuts, and removes listeners', () => {
     const unsubscribe = vi.fn()
-    const engine = { noteOn: vi.fn(), noteOff: vi.fn(), onNote: vi.fn(() => unsubscribe) }
+    const engine = { noteOn: vi.fn(), noteOff: vi.fn(), onNote: vi.fn(() => unsubscribe), heldNotes: new Set<number>() }
     const keyboard = new Keyboard(engine as unknown as SynthEngine)
     document.body.append(keyboard.root)
     const originalOctave = keyboard.root.querySelector('.oct-label')!.textContent

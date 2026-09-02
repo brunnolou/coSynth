@@ -800,7 +800,9 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   border-radius: 4px;
   cursor: pointer;
 }
+.oct-btn:disabled { opacity: 0.35; cursor: default; }
 .oct-label { font-size: 10px; color: var(--text-dim); width: 56px; text-align: center; }
+.kb-range { font-size: 10px; padding: 2px 4px; }
 .kb-hint { font-size: 9px; color: var(--text-dim); margin-left: auto; }
 
 .keyboard {
@@ -808,21 +810,36 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   display: flex;
   height: 84px;
   touch-action: none;
+  /* Width of one white key; set from JS so black keys scale with the octave count. */
+  --kb-white: 4.545%;
 }
 .key.white {
   flex: 1 1 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 3px;
   background: linear-gradient(#f2f3f6, #d8dbe2);
   border: 1px solid #0d0f14;
   border-radius: 0 0 4px 4px;
   cursor: pointer;
+  overflow: hidden;
+}
+/* Octave name on each C, so a range that scrolls under the played window is still readable. */
+.key-name {
+  font-size: 8px;
+  line-height: 1;
+  letter-spacing: -0.2px;
+  color: #4b5160;
+  pointer-events: none;
 }
 .key.white.held { background: var(--accent); }
 .key.black {
   position: absolute;
   top: 0;
-  width: 2.6%;
+  width: calc(var(--kb-white) * 0.58);
   height: 55%;
-  margin-left: -1.3%;
+  margin-left: calc(var(--kb-white) * -0.29);
   background: linear-gradient(#2b2e38, #15171d);
   border: 1px solid #000;
   border-radius: 0 0 3px 3px;
@@ -830,6 +847,10 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   cursor: pointer;
 }
 .key.black.held { background: var(--accent); }
+/* Keys the computer keyboard (Z / X octave window) cannot reach sit back visually. */
+.key.white.out-of-range { opacity: 0.55; filter: saturate(0.6) brightness(0.82); }
+.key.black.out-of-range { background: linear-gradient(#43464f, #2e313a); border-color: #23262d; }
+.key.out-of-range.held { opacity: 1; filter: none; background: var(--accent); }
 
 /* ------------------------------------------------ start overlay */
 #start-overlay {
