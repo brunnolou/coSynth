@@ -175,6 +175,44 @@ class OfflineNotes {
   }
 }
 
+/**
+ * Marks an error as "the audio worklet module would not load", so
+ * `render_audio` can report the one failure whose cause is neither the patch
+ * nor the request.
+ */
+export const WORKLET_LOAD_FAILURE = 'WorkletLoadFailure'
+
+/**
+ * Translate a failed `SynthEngine.start()` into something a caller can act on.
+ *
+ * `addModule()` rejects with `Unable to load a worklet's module` for every
+ * reason there is, and a caller who sees that raw string learns nothing: it
+ * does not say the module is the page's own asset, it does not say the failure
+ * will repeat, and the fallback it used to be paired with — retry in real time
+ * — cannot work, because the real-time graph loads the very same module and
+ * also needs a user gesture the offline path was chosen to avoid.
+ *
+ * The engine now serves that module from an in-memory copy after its first
+ * successful load (`src/shared/cached-script-url.ts`), so reaching this at all
+ * means the module has never loaded in this page — the asset was unreachable
+ * from the start. Reloading the page is the only thing that helps, and saying
+ * so is more use than any retry.
+ */
+function workletLoadFailure(cause: unknown): Error {
+  // A cancellation is not a load failure and must stay classified as a cancel.
+  if ((cause as Error | undefined)?.name === 'AbortError') return cause as Error
+  const detail = String((cause as Error | undefined)?.message ?? cause)
+  const error = new Error(
+    'Could not load the synth\'s audio worklet module, so this render never started — nothing here is a fact about the '
+    + `patch or the notes (${detail}). The module is one of the page's own script assets, and it is fetched once and then `
+    + 'reused, so this means it has not loaded successfully in this page at all: the asset is unreachable rather than '
+    + 'momentarily busy. Retrying will fail the same way, and mode: "realtime" cannot help — the real-time graph loads '
+    + 'the same module and also needs a user gesture. Reload the page and try again.'
+  )
+  error.name = WORKLET_LOAD_FAILURE
+  return error
+}
+
 /** The repo's cancellation idiom: `register.ts` classifies this as a cancel. */
 function abortError(): Error {
   const error = new Error('Execution aborted')
@@ -327,7 +365,18 @@ async function renderOnce(
     // before rendering. A cancel arriving inside that await must stop here, ahead
     // of any suspension being scheduled or any note event being applied, rather
     // than being left to the race further down.
-    await scratch.start()
+    //
+    // A module that will not load is translated on the way out: the raw
+    // `Unable to load a worklet's module` says nothing an agent can act on, and
+    // the advice it used to fall through to — try `mode: "realtime"` — is the one
+    // suggestion guaranteed not to help, because the real-time path loads the
+    // same module and additionally needs a user gesture. See
+    // `workletLoadFailure`.
+    try {
+      await scratch.start()
+    } catch (error) {
+      throw workletLoadFailure(error)
+    }
     if (signal?.aborted) throw abortError()
     // A snapshot, not a preset: a preset carries only parameters, modulation, LFO
     // shapes and FX order, so a round-trip through one silently swaps an imported
