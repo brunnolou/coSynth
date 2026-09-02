@@ -975,6 +975,109 @@ describe('render and analysis tools', () => {
     ]))
   })
 
+  it('carries the session best so a peak that has passed is visible in one response', async () => {
+    const { engine, execute } = setup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const compareAt = async (amplitude: number) => {
+      engine.scopeL = Float32Array.from([0, amplitude, -amplitude, 0])
+      engine.scopeR = engine.scopeL
+      return await execute('compare_audio')
+    }
+    // The eval trajectory in miniature: climb toward the reference's own
+    // amplitude, peak, then walk away from it and never get back. The real run
+    // peaked at 0.847 on comparison 14, made 13 more comparisons that never
+    // beat it, and saved the final 0.819 because `compare_audio` only ever
+    // returned the current figure.
+    const results = []
+    for (const amplitude of [0.05, 0.15, 0.3, 0.5, 0.25, 0.18, 0.12, 0.09, 0.07]) results.push(await compareAt(amplitude))
+    const similarity = results.map(result => result.comparison.similarity)
+    const peak = 3
+    // Sanity: the simulated trajectory really does climb, peak, then decline.
+    for (let index = 1; index <= peak; index++) expect(similarity[index]).toBeGreaterThan(similarity[index - 1])
+    for (let index = peak + 1; index < similarity.length; index++) expect(similarity[index]).toBeLessThan(similarity[index - 1])
+
+    expect(results.map(result => result.progress.comparisonNumber)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    expect(results.map(result => result.progress.isBest)).toEqual([true, true, true, true, false, false, false, false, false])
+    const best = Math.round(similarity[peak] * 1e4) / 1e4
+    for (let index = peak + 1; index < results.length; index++) {
+      const progress = results[index].progress
+      expect(progress.best, `comparison ${index + 1} best`).toBe(best)
+      expect(progress.bestComparisonNumber).toBe(peak + 1)
+      expect(progress.comparisonsSinceBest).toBe(index - peak)
+      expect(progress.deltaFromBest).toBeLessThan(0)
+      expect(progress.deltaFromBest).toBeCloseTo(similarity[index] - similarity[peak], 4)
+    }
+    // The comparison at the peak names itself as the patch worth keeping.
+    expect(results[peak].progress).toMatchObject({ isBest: true, deltaFromBest: 0, comparisonsSinceBest: 0 })
+    expect(results[peak].progress.note).toMatch(/best/i)
+    // And five fruitless comparisons later the response says so outright,
+    // rather than leaving the agent to infer a plateau from 27 remembered numbers.
+    const last = results[results.length - 1].progress
+    expect(last.comparisonsSinceBest).toBe(5)
+    expect(last.note).toMatch(/plateau/i)
+    expect(last.note).toContain(String(best))
+    expect(last.note).toMatch(/save_preset/)
+  })
+
+  it('points a lapsed run back at the render that scored best', async () => {
+    vi.useFakeTimers()
+    const engine = new FakeEngine()
+    let soundEntryId = 'sound-peak'
+    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, {
+      decodeAudio: vi.fn(async () => decodedReference()),
+      currentSoundEntryId: () => soundEntryId
+    })
+    const byName = new Map(tools.map(tool => [tool.name, tool]))
+    const execute = async (name: string, input: Record<string, unknown> = {}) =>
+      await byName.get(name)!.execute(input, { signal: new AbortController().signal }) as any
+    const render = async () => {
+      const rendering = execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 })
+      await vi.advanceTimersByTimeAsync(30)
+      await rendering
+    }
+
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    await render()
+    const first = await execute('compare_audio')
+    expect(first.progress).toMatchObject({ isBest: true, bestEntryId: 'sound-peak' })
+
+    // A later render scores worse; the way back is the history entry of the
+    // render that scored best, not the one in hand.
+    soundEntryId = 'sound-worse'
+    engine.recordOutput = vi.fn(async (duration: number) => {
+      const length = Math.max(32, Math.round(duration * 8000))
+      const left = Float32Array.from({ length }, (_, index) => 0.01 * Math.sin(2 * Math.PI * 50 * index / 8000) + 0.005)
+      return { blob: new Blob(['audio'], { type: 'audio/webm' }), mimeType: 'audio/webm', duration, sampleRate: 8000, channelData: [left, new Float32Array(left)] }
+    })
+    await render()
+    const second = await execute('compare_audio')
+    expect(second.comparison.similarity).toBeLessThan(first.comparison.similarity)
+    expect(second.progress).toMatchObject({ isBest: false, bestEntryId: 'sound-peak', bestComparisonNumber: 1 })
+    expect(second.progress.note).toContain('navigate_history')
+    expect(second.progress.note).toContain('sound-peak')
+  })
+
+  it('starts the best over when a new reference replaces the old matching problem', async () => {
+    const decodeAudio = vi.fn()
+      .mockResolvedValueOnce(decodedReference())
+      .mockResolvedValueOnce(decodedReference({ decodedBytes: 8, channelData: [Float32Array.from([0, 0.02, -0.02, 0])] }))
+    const { engine, execute } = setup(undefined, decodeAudio)
+    engine.scopeL = Float32Array.from([0, 0.5, -0.5, 0])
+    engine.scopeR = engine.scopeL
+
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'first.wav' })
+    const matched = await execute('compare_audio')
+    await execute('compare_audio')
+    expect(matched.progress).toMatchObject({ comparisonNumber: 1, isBest: true })
+
+    // A different target: a best earned against the previous one would be a lie.
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'second.wav' })
+    const fresh = await execute('compare_audio')
+    expect(fresh.progress).toMatchObject({ comparisonNumber: 1, isBest: true, bestComparisonNumber: 1, comparisonsSinceBest: 0, deltaFromBest: 0 })
+    expect(fresh.progress.best).toBe(Math.round(fresh.comparison.similarity * 1e4) / 1e4)
+    expect(fresh.progress.best).not.toBe(matched.progress.best)
+  })
+
   it('compares against the latest real render and retains only the latest reference analysis', async () => {
     vi.useFakeTimers()
     const first = decodedReference()

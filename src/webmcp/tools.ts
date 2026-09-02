@@ -82,11 +82,30 @@ interface ReferenceAnalysis {
   metrics: AudioMetrics
 }
 
+/**
+ * Running best-so-far for one matching problem, i.e. one reference. Held per
+ * session because `compare_audio` used to return only the current figure: in
+ * the match eval an agent peaked at 0.847 on comparison 14, spent 13 more
+ * comparisons and ~40 calls never beating it, then saved the final 0.819. It
+ * had no way to know it had already peaked without remembering 27 numbers
+ * itself. Bound to the reference object so a new `analyze_reference_audio` —
+ * a different matching problem — starts a fresh best rather than carrying a
+ * figure earned against another target.
+ */
+interface MatchProgressState {
+  reference: ReferenceAnalysis
+  comparisons: number
+  best: number
+  bestComparison: number
+  bestEntryId?: string
+}
+
 interface WebMcpSessionState {
   lastRender: { metrics: AudioMetrics; sampleRate: number; channels: number; url: string; soundEntryId?: string } | null
   lastReference: ReferenceAnalysis | null
   referenceGeneration: number
   activeReferenceController: AbortController | null
+  match: MatchProgressState | null
   performance: PerformanceManager
 }
 
@@ -100,6 +119,7 @@ function sessionFor(engine: SynthEngine): WebMcpSessionState {
       lastReference: null,
       referenceGeneration: 0,
       activeReferenceController: null,
+      match: null,
       performance: new PerformanceManager()
     }
     sessions.set(engine, session)
@@ -244,6 +264,55 @@ const SILENT_PEAK_DB = -100
 /** Refusal text for `compare_audio` with no render and a silent live scope. */
 const SILENT_CANDIDATE_REFUSAL =
   'Nothing has been rendered yet and the live scope is silent (peak below -100 dB), so there is nothing to compare the reference against; scoring it against silence would return a similarity that means nothing. Call render_audio first — it renders offline and needs no user gesture — then call compare_audio again. The scope fallback is only for comparing against a human who is actually playing.'
+
+/** Comparisons without a new best after which a run is flatly called a plateau. */
+const PLATEAU_COMPARISONS = 5
+
+const roundSimilarity = (value: number): number => Math.round(value * 1e4) / 1e4
+
+/**
+ * Fold one comparison into the session's best-so-far and describe where it
+ * stands. Returned alongside `comparison` (never inside it — `similarity` and
+ * `details` keep their shape for the UI) so a single response answers "better,
+ * worse, or done" without the agent keeping its own ledger.
+ */
+function trackMatchProgress(
+  session: WebMcpSessionState,
+  reference: ReferenceAnalysis,
+  similarity: number,
+  entryId: string | undefined
+) {
+  // Identity, not equality: a replacement reference is a different matching
+  // problem, and carrying its predecessor's best forward would be a lie.
+  if (!session.match || session.match.reference !== reference) {
+    session.match = { reference, comparisons: 0, best: Number.NEGATIVE_INFINITY, bestComparison: 0 }
+  }
+  const state = session.match
+  state.comparisons += 1
+  const isBest = similarity > state.best
+  if (isBest) {
+    state.best = similarity
+    state.bestComparison = state.comparisons
+    state.bestEntryId = entryId
+  }
+  const sinceBest = state.comparisons - state.bestComparison
+  const restore = state.bestEntryId
+    ? ` navigate_history({ action: "restore", entryId: "${state.bestEntryId}" }) goes back to the patch that scored it.`
+    : ''
+  const note = isBest
+    ? `Best of ${state.comparisons} comparison${state.comparisons === 1 ? '' : 's'} against this reference. This is the patch to beat, and the one worth save_preset if you stop now.`
+    : `Worse than comparison ${state.bestComparison} (${roundSimilarity(state.best)}), ${sinceBest} comparison${sinceBest === 1 ? '' : 's'} ago.${sinceBest >= PLATEAU_COMPARISONS ? ` Nothing has beaten it in ${sinceBest} tries — this is a plateau, so restore the best and stop rather than keep editing.` : ''}${restore} save_preset would save this patch, not the best one.`
+  return {
+    comparisonNumber: state.comparisons,
+    isBest,
+    best: roundSimilarity(state.best),
+    bestComparisonNumber: state.bestComparison,
+    ...(state.bestEntryId === undefined ? {} : { bestEntryId: state.bestEntryId }),
+    deltaFromBest: roundSimilarity(similarity - state.best),
+    comparisonsSinceBest: sinceBest,
+    note
+  }
+}
 
 /** How the Base64 preview became mono; travels with the payload it describes. */
 const DOWNMIX_NOTE = '"sum" is the plain channel average; "left"/"right" means that average cancelled and the louder channel was sent alone.'
@@ -453,6 +522,7 @@ export function createWebMcpTools(
     if (session.lastRender) URL.revokeObjectURL(session.lastRender.url)
     session.lastRender = null
     session.lastReference = null
+    session.match = null
   }
   lifecycleSignal?.addEventListener('abort', cleanup, { once: true })
 
@@ -1107,6 +1177,9 @@ export function createWebMcpTools(
           }
           assertCurrent()
           session.lastReference = analysis
+          // A new target is a new matching problem: the best-so-far starts over.
+          // Only the winning (non-superseded) invocation reaches this line.
+          session.match = null
           return analysis
         })
       }
@@ -1133,11 +1206,13 @@ export function createWebMcpTools(
         }
         if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
         const comparison = compareAudioMetrics(session.lastReference.metrics, candidate.metrics)
-        dependencies.onComparison?.(comparison, candidate.source === 'last-render' ? session.lastRender?.soundEntryId : dependencies.currentSoundEntryId?.())
+        const entryId = candidate.source === 'last-render' ? session.lastRender?.soundEntryId : dependencies.currentSoundEntryId?.()
+        dependencies.onComparison?.(comparison, entryId)
         return {
           reference: session.lastReference,
           candidate,
-          comparison
+          comparison,
+          progress: trackMatchProgress(session, session.lastReference, comparison.similarity, entryId)
         }
       }
     },
