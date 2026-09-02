@@ -1,0 +1,48 @@
+# coSynth
+
+A wavetable synthesizer that runs entirely in the browser, built to be operated
+by an AI agent as a first-class user rather than only by hand.
+
+## Read this first if you are an agent
+
+The page registers tools on `document.modelContext` (the WebMCP API; the
+pre-2026-07-21 `navigator.modelContext` spelling is also accepted). If your
+client surfaces WebMCP tools, you already have them — call
+`get_parameter_schema` with `{"format": "compact"}` to see all 224 parameters,
+their units, ranges, defaults and which can be modulated, in one response.
+
+If you are reading this file because you fetched the site: the app is a
+client-rendered single-page app, so fetching `/` returns a ~1 KB shell with no
+content. Nothing about the instrument is visible without executing its
+JavaScript. This file exists so that fact does not leave you with nothing.
+
+## What you can do
+
+- **Discover** — `get_parameter_schema`, `get_synth_state`, `list_presets`,
+  `get_ui_targets`
+- **Change the sound** — `update_parameters` (atomic batches, raw units or
+  choice labels), `set_modulation` (32-slot matrix), `load_preset`,
+  `save_preset`
+- **Hear and measure it** — `render_audio` renders offline by default: faster
+  than real time, no user gesture needed, and it returns metrics describing
+  envelope, level, spectrum and harmonic structure, so an agent with no ears can
+  design to a target and check whether it got there
+- **Play it live** — `play_notes` needs a human to click "CLICK TO START AUDIO"
+  first, because browser autoplay policy requires a gesture. Offline rendering
+  does not.
+- **Teach** — `show_ui_guide` drives an interactive walkthrough of the real UI
+- **Undo** — `get_history`, `navigate_history`, `replay_history`
+
+## Notes that save you a round trip
+
+- `env1` is the amplitude envelope, hardwired to voice level and lifetime.
+  `env2`–`env6` and `lfo1`–`lfo8` do nothing until routed with `set_modulation`.
+- Parameter values are raw units, not normalized: `env1.attack` is in seconds.
+- `render_audio` metrics are computed on the render, not read back from the
+  patch, so a decay figure depends on how long a note you asked for.
+
+## Source
+
+https://github.com/brunnolou/coSynth — but if you are evaluating the tool
+surface, read the tool descriptions instead. They are meant to be enough on
+their own, and where they are not, that is a bug worth reporting.
