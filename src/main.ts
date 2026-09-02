@@ -68,6 +68,12 @@ const start = async () => {
   starting = true
   try {
     await engine.start()
+    // Audio is live the moment start() resolves, so the overlay has done its
+    // job. Registering the audio tools can still be waiting on the legacy
+    // widget's dynamic import, and leaving a full-screen Start screen over a
+    // running synth would look frozen: `starting` is already true, so a second
+    // click does nothing.
+    overlay.remove()
     if (!audioWebMcp) {
       await legacyReady
       audioWebMcp = registerTools({ audioTools: 'only', services })
@@ -76,7 +82,6 @@ const start = async () => {
     }
     try { welcomeTour.startOnce() }
     catch (error) { console.warn('Welcome walkthrough could not start:', error) }
-    overlay.remove()
   } catch (err) {
     starting = false
     const box = overlay.querySelector('.start-box')
