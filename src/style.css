@@ -349,6 +349,7 @@ main {
   text-transform: uppercase;
 }
 .agent-param-list { display: flex; flex-wrap: wrap; gap: 4px; }
+.agent-param-list[hidden] { display: none; } /* A display rule would otherwise beat the hidden attribute. */
 .agent-param {
   padding: 3px 6px;
   color: var(--text);
