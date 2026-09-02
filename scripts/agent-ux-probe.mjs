@@ -10,7 +10,7 @@
 // outcome and wall-clock cost so "how many round trips did that cost" is a
 // measured number rather than a recollection.
 //
-//   node scripts/agent-ux-probe.mjs [url] [--port 4790] [--headed]
+//   node scripts/agent-ux-probe.mjs [url] [--port 4792] [--headed]
 //
 //   GET  /tools            the descriptors, and nothing else
 //   POST /call             {"tool":"...","input":{...}} -> {ok, result|error, ms, call}
@@ -28,7 +28,7 @@ const value = (name, fallback) => {
   return at >= 0 && args[at + 1] ? args[at + 1] : fallback
 }
 const url = args.find(arg => !arg.startsWith('--') && arg !== value('--port', null)) ?? 'http://localhost:4173/'
-const port = Number(value('--port', '4790'))
+const port = Number(value('--port', '4792'))
 
 function installShim(page) {
   return page.addInitScript(() => {
@@ -100,7 +100,81 @@ function digest(result) {
     out.modulationSources = { total: result.modulationSources.total, items: result.modulationSources.items?.length }
   }
   if (Array.isArray(result.presets)) out.presetCount = result.presets.length
+  // The reference-matching loop is only legible if convergence is in the log.
+  // `similarity` alone says "closer or not"; the per-metric similarities say
+  // *which* metric moved, which is what an agent steers by.
+  const comparison = result.comparison
+  if (comparison && typeof comparison === 'object') {
+    out.similarity = comparison.similarity
+    if (comparison.details && typeof comparison.details === 'object') {
+      out.detailSimilarities = Object.fromEntries(
+        Object.entries(comparison.details)
+          .filter(([, detail]) => detail && typeof detail === 'object' && typeof detail.similarity === 'number')
+          .map(([key, detail]) => [key, detail.similarity])
+      )
+    }
+  }
+  if (result.reference && typeof result.reference === 'object') {
+    out.reference = {
+      source: result.reference.source,
+      name: result.reference.name,
+      duration: result.reference.duration,
+      sampleRate: result.reference.sampleRate,
+      channels: result.reference.channels,
+      decodedBytes: result.reference.decodedBytes
+    }
+  }
+  if (result.candidate && typeof result.candidate === 'object') out.candidateSource = result.candidate.source
+  // analyze_reference_audio returns the analysis at the top level, not nested.
+  if (result.source === 'base64-reference') {
+    out.referenceDuration = result.duration
+    out.referenceSampleRate = result.sampleRate
+    out.referenceChannels = result.channels
+    out.referenceDecodedBytes = result.decodedBytes
+  }
   return Object.keys(out).length ? out : undefined
+}
+
+const EDIT_TOOLS = new Set(['update_parameters', 'set_modulation'])
+
+/**
+ * Convergence view of the run: the similarity trajectory in call order, and how
+ * many patch edits sat between each comparison. An agent that renders once and
+ * declares victory shows up here as a single-entry trajectory - which is a
+ * failed run no matter how high that one number is.
+ */
+function summariseMatchingLoop(calls) {
+  const comparisons = []
+  let editsSinceLastComparison = 0
+  for (const entry of calls) {
+    if (EDIT_TOOLS.has(entry.tool) && entry.ok) editsSinceLastComparison++
+    if (entry.tool !== 'compare_audio') continue
+    if (entry.ok) {
+      comparisons.push({
+        call: entry.call,
+        similarity: entry.result?.similarity ?? null,
+        editsSincePrevious: editsSinceLastComparison
+      })
+    }
+    editsSinceLastComparison = 0
+  }
+  const trajectory = comparisons.map(item => item.similarity).filter(value => typeof value === 'number')
+  const improvedMonotonically = trajectory.length < 2
+    ? null
+    : trajectory.every((value, index) => index === 0 || value >= trajectory[index - 1])
+  return {
+    // Was step 1 of the workflow ever reached at all? The whole reason this
+    // eval exists is that field evidence showed it never was.
+    analyzeReferenceAudioCalls: calls.filter(entry => entry.tool === 'analyze_reference_audio').length,
+    compareAudioCalls: calls.filter(entry => entry.tool === 'compare_audio').length,
+    similarityTrajectory: trajectory,
+    similarityImprovedMonotonically: improvedMonotonically,
+    bestSimilarity: trajectory.length ? Math.max(...trajectory) : null,
+    finalSimilarity: trajectory.length ? trajectory[trajectory.length - 1] : null,
+    similarityGain: trajectory.length > 1 ? trajectory[trajectory.length - 1] - trajectory[0] : null,
+    editsBetweenComparisons: comparisons.map(item => item.editsSincePrevious),
+    comparisons
+  }
 }
 
 const summarise = () => {
@@ -127,6 +201,7 @@ const summarise = () => {
     // Renders that came back as an all-zero buffer. This must stay at zero;
     // a nonzero count means the offline path silently produced nothing.
     silentRenders: calls.filter(entry => entry.result?.SILENT).length,
+    matchingLoop: summariseMatchingLoop(calls),
     startGestureDispatchedAtCall: gestureAt,
     pageErrors: [...pageErrors]
   }
