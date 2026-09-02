@@ -209,6 +209,33 @@ function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose
 }
 
 /**
+ * `SynthEngine.awaitWorkletSync`, made cancellable.
+ *
+ * The wait itself cannot see the signal — it is a message round trip with a
+ * timeout — so without this a `stop_performance` arriving while a barrier is
+ * open sits behind the acknowledgement, or behind the whole timeout, before the
+ * render's own abort checks can fire. Rejecting with the repo's `AbortError`
+ * keeps `registeredTool` classifying it as a cancellation.
+ *
+ * The abandoned `awaitWorkletSync` promise is left to settle on its own: it
+ * clears its own timer and closes its own port, and nothing reads its answer.
+ */
+async function awaitSync(
+  engine: SynthEngine,
+  timeoutMs: number,
+  signal: AbortSignal | undefined
+): Promise<boolean> {
+  const wait = engine.awaitWorkletSync(timeoutMs)
+  if (!signal) return await wait
+  const abort = abortRejection(signal)
+  try {
+    return await Promise.race([wait, abort.promise])
+  } finally {
+    abort.dispose()
+  }
+}
+
+/**
  * Render `notes` through a throwaway copy of `engine`'s patch and return the
  * result as lossless PCM plus a WAV blob.
  *
@@ -338,22 +365,30 @@ async function renderOnce(
   }
   for (const [frame, bucket] of [...byFrame.entries()].sort((a, b) => a[0] - b[0])) {
     pending.push(suspendable.suspend(frame / sampleRate).then(async () => {
-      // Once cancelled, stop scheduling: no further note events are applied, so
-      // an abandoned render cannot keep mutating the scratch engine.
-      if (!signal?.aborted) {
-        for (const event of bucket) player.apply(event)
-        // Held suspended until the processor confirms it has these events, for
-        // the same reason as the barrier before `startRendering()`: resuming
-        // first would let the render outrun them and place the event late by
-        // however many quanta the queue took to drain. On its own budget,
-        // because this barrier only improves placement: see
-        // `MID_RENDER_SYNC_TIMEOUT_MS`.
-        if (!await scratch.awaitWorkletSync(midRenderSyncTimeout)) synced = false
+      try {
+        // Once cancelled, stop scheduling: no further note events are applied,
+        // so an abandoned render cannot keep mutating the scratch engine.
+        if (!signal?.aborted) {
+          for (const event of bucket) player.apply(event)
+          // Held suspended until the processor confirms it has these events, for
+          // the same reason as the barrier before `startRendering()`: resuming
+          // first would let the render outrun them and place the event late by
+          // however many quanta the queue took to drain. On its own budget,
+          // because this barrier only improves placement: see
+          // `MID_RENDER_SYNC_TIMEOUT_MS`.
+          //
+          // An abort here resolves the wait instead of rejecting it: this
+          // callback belongs to a render nobody is waiting for any more, and
+          // the one thing it still owes that render is the `resume()` below.
+          const acknowledged = await awaitSync(scratch, midRenderSyncTimeout, signal).catch(() => false)
+          if (!acknowledged) synced = false
+        }
+      } finally {
+        // Deliberately not awaited: resuming is what lets rendering continue.
+        // Still resumed after an abort, so the orphaned render below can finish
+        // and be collected instead of sitting suspended forever.
+        void suspendable.resume?.()
       }
-      // Deliberately not awaited: resuming is what lets rendering continue.
-      // Still resumed after an abort, so the orphaned render below can finish
-      // and be collected instead of sitting suspended forever.
-      void suspendable.resume?.()
     }))
   }
 
@@ -361,7 +396,9 @@ async function renderOnce(
   // above — the patch, the modulation, the wavetables, the frame-0 note-ons —
   // reached the processor as port messages, and `startRendering()` does not
   // wait for them. See `SynthEngine.awaitWorkletSync`.
-  if (!await scratch.awaitWorkletSync(syncTimeout)) synced = false
+  // Cancellable: a `stop_performance` arriving while this barrier is open must
+  // not have to wait out the acknowledgement, or the whole timeout, first.
+  if (!await awaitSync(scratch, syncTimeout, signal)) synced = false
   if (signal?.aborted) throw abortError()
 
   // The Web Audio API offers no way to cancel an in-flight `startRendering()`.

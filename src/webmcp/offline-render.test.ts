@@ -693,6 +693,31 @@ describe('renderOffline worklet barrier and silence guard', () => {
     expect(recording.channelData[0].some(sample => sample !== 0), 'the render still sounds').toBe(true)
   })
 
+  it('abandons an open pre-render barrier the moment the signal aborts, instead of waiting out its timeout', async () => {
+    const { messages, held } = heldWorkletNode()
+    const controller = new AbortController()
+    let context: FakeOfflineContext | null = null
+    const started = Date.now()
+    const pending = renderOffline(liveEngineStub(), NOTES, 0.3, {
+      createContext: options => {
+        context = new FakeOfflineContext(options, messages)
+        return context as unknown as BaseAudioContext
+      },
+      signal: controller.signal,
+      // Long enough that waiting it out would be plainly visible: a
+      // `stop_performance` must not sit behind it.
+      syncTimeoutMs: 2000
+    })
+    await settle()
+    expect(held.length, 'the pre-render barrier is open').toBe(1)
+    expect(context!.startedRendering, 'and rendering is waiting behind it').toBe(false)
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    const elapsed = Date.now() - started
+    expect(elapsed, `the cancel must not wait out the barrier (took ${elapsed}ms)`).toBeLessThan(500)
+    expect(context!.startedRendering, 'and the render never began').toBe(false)
+  })
+
   it('reports an unavailable barrier instead of waiting on an engine with no worklet', async () => {
     // No `start()` has run, so there is no node to ask and no guarantee to give.
     expect(await new SynthEngine().awaitWorkletSync(5)).toBe(false)
