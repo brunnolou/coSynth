@@ -3,7 +3,13 @@ import { registerWebMcpTools, type WebMcpRegistration, type WebMcpRegistrationOp
 
 /** The API exposed by the legacy WebMCP widget from webmcp.dev. */
 export interface LegacyWebMcp {
-  registerTool(name: string, description: string, schema: object, execute: (input: Record<string, unknown>) => unknown | Promise<unknown>): void
+  /**
+   * Widget builds differ: most return void, some return a promise that settles
+   * once the tool reaches the bridge. Either way the return value is the only
+   * channel a failure can travel on besides a synchronous throw, so the adapter
+   * awaits whatever comes back.
+   */
+  registerTool(name: string, description: string, schema: object, execute: (input: Record<string, unknown>) => unknown | Promise<unknown>): void | Promise<void>
   /**
    * The widget's own registry of accepted tools. `registerTool` returns void and
    * only `console.error`s on failure, so this map is the one honest signal that
@@ -28,15 +34,20 @@ export function registerLegacyWebMcpTools(
     registerTool(tool: WebMCP.ModelContextTool, registrationOptions?: WebMCP.ModelContextRegisterToolOptions) {
       const signal = registrationOptions?.signal ?? new AbortController().signal
       if (signal?.aborted) throw abortError()
-      legacy.registerTool(tool.name, tool.description, tool.inputSchema ?? { type: 'object', properties: {} }, input => {
+      const accepted = legacy.registerTool(tool.name, tool.description, tool.inputSchema ?? { type: 'object', properties: {} }, input => {
         if (signal?.aborted) throw abortError()
         return tool.execute(input, { signal })
       })
       // The widget swallows its own failures, so count a tool as registered only
-      // once its name shows up in the widget's registry.
-      if (legacy.availableTools && !legacy.availableTools.has(tool.name)) {
-        throw new Error(`The legacy WebMCP widget did not accept the tool ${tool.name}`)
+      // once its name shows up in the widget's registry. An async build settles
+      // that registry after it resolves, so check only once the call is done.
+      const verify = () => {
+        if (legacy.availableTools && !legacy.availableTools.has(tool.name)) {
+          throw new Error(`The legacy WebMCP widget did not accept the tool ${tool.name}`)
+        }
       }
+      if (accepted && typeof (accepted as PromiseLike<void>).then === 'function') return Promise.resolve(accepted).then(verify)
+      verify()
     }
   } as unknown as WebMCP.ModelContext
   const registration = registerWebMcpTools(engine, modelContext, options)

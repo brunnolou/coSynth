@@ -60,6 +60,37 @@ describe('registerLegacyWebMcpTools', () => {
     expect(registration.errors[0].tool).toBe('update_parameters')
     expect(registration.errors[0].message).toContain('update_parameters')
   })
+
+  it('does not count a tool an async widget build rejects', async () => {
+    // Some widget builds return a promise from registerTool. Dropping that
+    // return value would count a rejected tool as registered and leak an
+    // unhandled rejection, so the adapter has to hand it back to the caller.
+    const legacy: LegacyWebMcp = {
+      availableTools: new Map<string, unknown>(),
+      registerTool(name) {
+        if (name === 'get_synth_state') return Promise.reject(new Error('widget refused the tool'))
+        legacy.availableTools!.set(name, {})
+        return Promise.resolve()
+      }
+    }
+    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
+    await registration.ready
+    expect(registration.registeredCount).toBe(8)
+    expect(registration.errors).toEqual([{ tool: 'get_synth_state', message: 'widget refused the tool' }])
+  })
+
+  it('waits for an async widget to populate availableTools before counting', async () => {
+    const legacy: LegacyWebMcp = {
+      availableTools: new Map<string, unknown>(),
+      registerTool(name) {
+        return Promise.resolve().then(() => { legacy.availableTools!.set(name, {}) })
+      }
+    }
+    const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
+    await registration.ready
+    expect(registration.errors).toEqual([])
+    expect(registration.registeredCount).toBe(9)
+  })
 })
 
 describe('resolveModelContext', () => {
