@@ -75,7 +75,7 @@ describe('registerLegacyWebMcpTools', () => {
     }
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
     await registration.ready
-    expect(registration.registeredCount).toBe(8)
+    expect(registration.registeredCount).toBe(9)
     expect(registration.errors).toEqual([{ tool: 'get_synth_state', message: 'widget refused the tool' }])
   })
 
@@ -89,7 +89,7 @@ describe('registerLegacyWebMcpTools', () => {
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
     await registration.ready
     expect(registration.errors).toEqual([])
-    expect(registration.registeredCount).toBe(9)
+    expect(registration.registeredCount).toBe(10)
   })
 })
 
