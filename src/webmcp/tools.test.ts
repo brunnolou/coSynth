@@ -448,6 +448,46 @@ describe('modulation tool', () => {
     await expect(setup().execute('set_modulation', input)).rejects.toThrow(error)
   })
 
+  it('addresses an existing route by the source and destination it was added with', async () => {
+    const { execute, byName } = setup()
+    // An agent that added a route by name naturally updates it by name; being
+    // told to find a slot number first cost an evaluated agent a round trip.
+    await execute('set_modulation', { action: 'add', source: 'velocity', destination: 'osc1.level', depth: 0.5 })
+    const updated = await execute('set_modulation', { action: 'update', source: 'velocity', destination: 'osc1.level', depth: 0.3 })
+    expect(updated.route).toMatchObject({ slot: 0, source: 'velocity', destination: 'osc1.level', depth: 0.3, enabled: true })
+    const disabled = await execute('set_modulation', { action: 'update', source: 'velocity', destination: 'osc1.level', enabled: false })
+    expect(disabled.route).toMatchObject({ slot: 0, depth: 0.3, enabled: false })
+    expect(await execute('set_modulation', { action: 'remove', source: 'velocity', destination: 'osc1.level' })).toMatchObject({ removed: 0, count: 0 })
+    // The description has to state both addressing modes, and must keep the
+    // source vocabulary and the bipolar depth note from earlier findings.
+    const description = byName.get('set_modulation')!.description
+    expect(description).toMatch(/slot/)
+    expect(description).toMatch(/source/)
+    expect(description).toMatch(/destination/)
+    expect(description).toMatch(/bipolar/)
+  })
+
+  it.each([
+    [{ action: 'update', source: 'velocity', destination: 'osc1.level', depth: 0.3 }, /No modulation route from 'velocity' to 'osc1\.level'/],
+    [{ action: 'remove', source: 'velocity', destination: 'osc1.level' }, /No modulation route from 'velocity' to 'osc1\.level'/],
+    [{ action: 'update', slot: 0, source: 'velocity', destination: 'osc1.level', depth: 0.3 }, /ambiguous/i],
+    [{ action: 'remove', slot: 0, source: 'velocity', destination: 'osc1.level' }, /ambiguous/i],
+    [{ action: 'update', source: 'velocity', depth: 0.3 }, /both source and destination/i],
+    [{ action: 'update', depth: 0.3 }, /slot/i],
+    [{ action: 'update', source: 'vel', destination: 'osc1.level', depth: 0.3 }, /Did you mean velocity\?/],
+    [{ action: 'remove', source: 'velocity', destination: 'osc1.levl' }, /Did you mean osc1\.level[,?]/]
+  ])('rejects an unresolvable or ambiguous route address %o', async (input, error) => {
+    await expect(setup().execute('set_modulation', input)).rejects.toThrow(error)
+  })
+
+  it('never creates a route from an update that names no existing pair', async () => {
+    const { engine, execute } = setup()
+    await expect(execute('set_modulation', { action: 'update', source: 'lfo1', destination: 'filter1.cutoff', depth: 0.4 }))
+      .rejects.toThrow(/No modulation route/)
+    expect(engine.setModSlot).not.toHaveBeenCalled()
+    expect(engine.modSlots.filter(Boolean)).toHaveLength(0)
+  })
+
   it('reports slot exhaustion', async () => {
     const { engine, execute } = setup()
     engine.modSlots.fill({ source: 0, dest: paramIndex('osc1.level'), depth: 0, enabled: true })

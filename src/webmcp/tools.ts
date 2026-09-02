@@ -148,6 +148,35 @@ function didYouMean(id: string, candidates: readonly string[]): string {
   return matches.length === 0 ? '' : ` Did you mean ${matches.join(', ')}?`
 }
 
+/** How `update`/`remove` may name a route; repeated in every addressing error. */
+const ROUTE_ADDRESSING = 'Address an existing route either by `slot`, or by the same `source`+`destination` pair you added it with.'
+
+/** A modulation source id to its index, with suggestions on any action. */
+function assertModSource(value: unknown): number {
+  if (typeof value !== 'string') throw new Error('source must be a string')
+  try { return modSourceIndex(value) } catch {
+    throw new Error(`Unknown modulation source '${value}'.${didYouMean(value, MOD_SOURCE_IDS)} Valid: ${MOD_SOURCE_IDS.join(', ')}`)
+  }
+}
+
+/** A destination parameter id to its index; only moddable ids are routable. */
+function assertModDestination(value: unknown): number {
+  if (typeof value !== 'string') throw new Error('destination must be a string')
+  const def = PARAMS.find(candidate => candidate.id === value)
+  if (!def) {
+    const moddable = PARAMS.filter(candidate => candidate.moddable).map(candidate => candidate.id)
+    throw new Error(`Unknown modulation destination '${value}'.${didYouMean(value, moddable)} Destinations are moddable parameter ids; groups: ${PARAMETER_GROUPS.join(', ')}`)
+  }
+  if (!def.moddable) throw new Error(`Destination is not moddable: ${def.id}`)
+  return paramIndex(def.id)
+}
+
+function assertModSlot(value: unknown): number {
+  const slot = finite(value, 'slot')
+  if (!Number.isInteger(slot) || slot < 0 || slot >= MAX_MOD_SLOTS) throw new Error(`slot must be an integer in range 0..${MAX_MOD_SLOTS - 1}`)
+  return slot
+}
+
 function finite(value: unknown, label: string): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${label} must be a finite number`)
   return value
@@ -673,14 +702,25 @@ export function createWebMcpTools(
     },
     {
       name: 'set_modulation',
-      description: `Add, update, remove, or clear validated modulation routes in the shared 32-slot matrix. \`depth\` is bipolar (-1..1): it is added to the destination parameter's normalized 0..1 value and the sum is clamped, so depth 0.5 on a parameter sitting at 0.5 sweeps it up to 1.0. \`source\` is one of ${MOD_SOURCE_IDS.join(', ')}; \`destination\` is any moddable parameter id. Example: {"action":"add","source":"lfo1","destination":"filter1.cutoff","depth":0.4}`,
+      description: `Add, update, remove, or clear validated modulation routes in the shared 32-slot matrix. \`add\` takes \`source\`+\`destination\`, and replaces any route already on that pair. \`update\` and \`remove\` address a route either by \`slot\` or by that same \`source\`+\`destination\` pair — one form or the other, never both, and a pair with no route on it is an error rather than a new route. \`depth\` is bipolar (-1..1): it is added to the destination parameter's normalized 0..1 value and the sum is clamped, so depth 0.5 on a parameter sitting at 0.5 sweeps it up to 1.0. \`source\` is one of ${MOD_SOURCE_IDS.join(', ')}; \`destination\` is any moddable parameter id. Examples: {"action":"add","source":"lfo1","destination":"filter1.cutoff","depth":0.4} then {"action":"update","source":"lfo1","destination":"filter1.cutoff","depth":0.2}`,
       inputSchema: {
         type: 'object',
         properties: {
           action: { type: 'string', enum: ['add', 'update', 'remove', 'clear'] },
-          source: { type: 'string' }, destination: { type: 'string' },
+          source: {
+            type: 'string',
+            description: 'Modulation source id. Required by `add`; on `update`/`remove` it addresses a route together with `destination`, instead of `slot`.'
+          },
+          destination: {
+            type: 'string',
+            description: 'Moddable parameter id. Required by `add`; on `update`/`remove` it addresses a route together with `source`, instead of `slot`.'
+          },
           depth: { type: 'number', minimum: -1, maximum: 1 },
-          enabled: { type: 'boolean' }, slot: { type: 'integer', minimum: 0, maximum: 31 }
+          enabled: { type: 'boolean' },
+          slot: {
+            type: 'integer', minimum: 0, maximum: MAX_MOD_SLOTS - 1,
+            description: 'Matrix slot, as returned in `route.slot`. The alternative to a `source`+`destination` pair on `update`/`remove`; passing both is rejected as ambiguous.'
+          }
         },
         required: ['action'], additionalProperties: false
       },
@@ -696,18 +736,39 @@ export function createWebMcpTools(
           engine.modSlots.forEach((route, slot) => { if (route) engine.setModSlot(slot, null, 'ai') })
           return { cleared: true, count: count() }
         }
+        /**
+         * The slot an `update`/`remove` means. A `source`+`destination` pair
+         * resolves the way `add` resolves it, so both actions mean exactly the
+         * route `add` would have replaced; naming both forms is ambiguous
+         * rather than merely redundant, and a pair that names nothing is an
+         * error instead of a new route.
+         */
+        const addressedSlot = (): number => {
+          const byPair = value.source !== undefined || value.destination !== undefined
+          if (!byPair) {
+            if (value.slot === undefined) throw new Error(`Modulation route address missing. ${ROUTE_ADDRESSING}`)
+            return assertModSlot(value.slot)
+          }
+          if (value.slot !== undefined) throw new Error(`Ambiguous route address: pass either 'slot' or 'source'+'destination', not both. ${ROUTE_ADDRESSING}`)
+          if (value.source === undefined || value.destination === undefined) {
+            throw new Error(`Addressing a route by name needs both source and destination. ${ROUTE_ADDRESSING}`)
+          }
+          const source = assertModSource(value.source)
+          const dest = assertModDestination(value.destination)
+          const slot = engine.modSlots.findIndex(route => route?.source === source && route.dest === dest)
+          if (slot < 0) throw new Error(`No modulation route from '${value.source}' to '${value.destination}'. Create it with action 'add'. ${ROUTE_ADDRESSING}`)
+          return slot
+        }
         if (action === 'remove') {
-          assertObject(input, 'input', ['action', 'slot'], ['action', 'slot'])
-          const slot = finite(value.slot, 'slot')
-          if (!Number.isInteger(slot) || slot < 0 || slot >= MAX_MOD_SLOTS) throw new Error('slot must be an integer in range 0..31')
+          assertObject(input, 'input', ['action', 'slot', 'source', 'destination'], ['action'])
+          const slot = addressedSlot()
           if (!engine.modSlots[slot]) throw new Error(`Modulation slot ${slot} is empty`)
           engine.setModSlot(slot, null, 'ai')
           return { removed: slot, count: count() }
         }
         if (action === 'update') {
-          assertObject(input, 'input', ['action', 'slot', 'depth', 'enabled'], ['action', 'slot'])
-          const slot = finite(value.slot, 'slot')
-          if (!Number.isInteger(slot) || slot < 0 || slot >= MAX_MOD_SLOTS) throw new Error('slot must be an integer in range 0..31')
+          assertObject(input, 'input', ['action', 'slot', 'source', 'destination', 'depth', 'enabled'], ['action'])
+          const slot = addressedSlot()
           const current = engine.modSlots[slot]
           if (!current) throw new Error(`Modulation slot ${slot} is empty`)
           if (value.depth === undefined && value.enabled === undefined) throw new Error('update requires depth and/or enabled')
@@ -719,22 +780,11 @@ export function createWebMcpTools(
           return { route: routeValue(slot, route), count: count() }
         }
         assertObject(input, 'input', ['action', 'source', 'destination', 'depth', 'enabled'], ['action', 'source', 'destination', 'depth'])
-        if (typeof value.source !== 'string') throw new Error('source must be a string')
-        let source: number
-        try { source = modSourceIndex(value.source) } catch {
-          throw new Error(`Unknown modulation source '${value.source}'.${didYouMean(value.source, MOD_SOURCE_IDS)} Valid: ${MOD_SOURCE_IDS.join(', ')}`)
-        }
-        if (typeof value.destination !== 'string') throw new Error('destination must be a string')
-        const def = PARAMS.find(candidate => candidate.id === value.destination)
-        if (!def) {
-          const moddable = PARAMS.filter(candidate => candidate.moddable).map(candidate => candidate.id)
-          throw new Error(`Unknown modulation destination '${value.destination}'.${didYouMean(value.destination, moddable)} Destinations are moddable parameter ids; groups: ${PARAMETER_GROUPS.join(', ')}`)
-        }
-        if (!def.moddable) throw new Error(`Destination is not moddable: ${def.id}`)
+        const source = assertModSource(value.source)
+        const dest = assertModDestination(value.destination)
         const depth = finite(value.depth, 'depth')
         if (depth < -1 || depth > 1) throw new Error('depth must be in range -1..1')
         if (value.enabled !== undefined && typeof value.enabled !== 'boolean') throw new Error('enabled must be boolean')
-        const dest = paramIndex(def.id)
         const existingSlot = engine.modSlots.findIndex(route => route?.source === source && route.dest === dest)
         let slot = existingSlot
         if (slot < 0) slot = engine.modSlots.findIndex(route => route === null)
