@@ -96,33 +96,47 @@ export async function performNotes(engine: NoteEngine, notes: readonly Performan
     { time: note.start, on: true, note },
     { time: note.start + note.duration, on: false, note }
   ]).sort((a, b) => a.time - b.time || Number(a.on) - Number(b.on))
-  const started = new Set<number>()
+  // Active instances per pitch. A repeated pitch retriggers the voice the way MIDI does:
+  // release then restrike, and only the last instance's end releases the note.
+  const active = new Map<number, number>()
   let elapsed = 0
   try {
     for (const event of events) {
       await wait(event.time - elapsed, signal)
       if (signal.aborted) throw performanceAbortError()
+      const midi = event.note.midi
+      const count = active.get(midi) ?? 0
       if (event.on) {
-        engine.noteOn(event.note.midi, event.note.velocity, owner)
-        started.add(event.note.midi)
-      } else if (started.delete(event.note.midi)) {
-        engine.noteOff(event.note.midi, owner)
+        if (count > 0) engine.noteOff(midi, owner)
+        engine.noteOn(midi, event.note.velocity, owner)
+        active.set(midi, count + 1)
+      } else if (count > 0) {
+        if (count === 1) {
+          active.delete(midi)
+          engine.noteOff(midi, owner)
+        } else {
+          active.set(midi, count - 1)
+        }
       }
       elapsed = event.time
     }
   } finally {
-    for (const midi of started) engine.noteOff(midi, owner)
+    for (const midi of active.keys()) engine.noteOff(midi, owner)
+    active.clear()
   }
 }
 
-export function validatePerformanceNotes(value: unknown, maxSeconds = 30): { notes: PerformanceNote[]; duration: number } {
+const NOTE_KEYS = ['midi', 'velocity', 'start', 'duration']
+const NOTE_SHAPE = `Each note is {${NOTE_KEYS.join(', ')}}`
+
+export function validatePerformanceNotes(value: unknown, maxSeconds = 30): { notes: PerformanceNote[]; duration: number; overlaps: number } {
   if (!Array.isArray(value) || value.length === 0) throw new Error('notes must be a non-empty array')
   if (value.length > 128) throw new Error('notes is limited to 128 entries')
   const notes = value.map((item, index) => {
     const label = `notes[${index}]`
     if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error(`${label} must be an object`)
     for (const key of Object.keys(item)) {
-      if (!['midi', 'velocity', 'start', 'duration'].includes(key)) throw new Error(`Unexpected ${label} property: ${key}`)
+      if (!NOTE_KEYS.includes(key)) throw new Error(`${label}: unexpected property '${key}'. ${NOTE_SHAPE}`)
     }
     const numeric = (key: string): number => {
       if (!(key in item)) throw new Error(`${label}.${key} is required`)
@@ -138,11 +152,13 @@ export function validatePerformanceNotes(value: unknown, maxSeconds = 30): { not
   })
   const duration = Math.round(Math.max(...notes.map(note => note.start + note.duration)) * 1e8) / 1e8
   if (duration > maxSeconds) throw new Error(`Note sequence is limited to ${maxSeconds} seconds`)
+  // Overlapping instances of one pitch retrigger the voice (see performNotes); they are counted, not rejected.
   const lastEnd = new Map<number, number>()
+  let overlaps = 0
   for (const note of [...notes].sort((a, b) => a.start - b.start)) {
     const previous = lastEnd.get(note.midi)
-    if (previous !== undefined && note.start < previous) throw new Error(`Note intervals overlap for MIDI ${note.midi}`)
-    lastEnd.set(note.midi, note.start + note.duration)
+    if (previous !== undefined && note.start < previous) overlaps++
+    lastEnd.set(note.midi, Math.max(previous ?? 0, note.start + note.duration))
   }
-  return { notes, duration }
+  return { notes, duration, overlaps }
 }

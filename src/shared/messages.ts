@@ -69,6 +69,13 @@ export type ToWorklet =
   | { type: 'sample'; data: Float32Array; sampleRate: number }
   | { type: 'fxOrder'; order: number[] }
   | { type: 'allNotesOff' }
+  // A round-trip barrier. `port.postMessage` to an AudioWorkletProcessor is
+  // asynchronous and unordered with respect to rendering, so posting a note-on
+  // gives no guarantee the processor has seen it. Because a MessagePort
+  // delivers in order, a `ping` answered on its own transferred port proves
+  // every earlier message has already been handled: see
+  // `SynthEngine.awaitWorkletSync`.
+  | { type: 'ping'; port: MessagePort }
 
 // -------------------------------------------------- worklet -> main thread
 export type FromWorklet =

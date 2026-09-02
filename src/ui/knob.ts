@@ -75,7 +75,10 @@ export class Knob {
       engine.setParam(paramIndex, knobWheelValue(def, engine.getParam(paramIndex), e))
       this.showValue()
     }, { passive: false })
-    this.canvas.addEventListener('contextmenu', e => {
+    // On the root, not the canvas: gating (`.is-gated`) makes the canvas stack inert
+    // so the value cannot be dragged, but the mod menu has to stay reachable -- a
+    // synced LFO rate or delay time is exactly where an existing route lives.
+    this.root.addEventListener('contextmenu', e => {
       e.preventDefault()
       if (def.moddable) this.openModMenu(e.clientX, e.clientY)
     })

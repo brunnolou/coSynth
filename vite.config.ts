@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   // The DSP worklet is imported with `?worker&url` so Vite bundles it as a
@@ -6,5 +6,26 @@ export default defineConfig({
   // global scope supports ES module imports, so the worker bundle must stay ESM.
   worker: { format: 'es' },
   build: { target: 'es2022', sourcemap: true },
-  server: { port: 5173 }
+  // Dev-only. The legacy webmcp.dev widget dials the bridge at
+  // ws://localhost:4797 directly, which fails in browsers that refuse
+  // cross-origin loopback requests - and the bridge binds IPv6 only, so IPv4
+  // clients cannot reach it either. Proxying its two endpoints keeps them
+  // same-origin with the page and lets Node do the IPv6 hop. Point the widget
+  // at ws://localhost:5173 instead of ws://localhost:4797 to use this.
+  // Tests assert on style.css (see ui/knob.test.ts: gating must not take the whole
+  // knob root out of pointer reach). Vitest blanks CSS imports unless told otherwise.
+  // Agent worktrees live under .claude/worktrees/, so they hold a second copy of
+  // the whole suite at some other commit. Collecting those doubles the reported
+  // test count and runs stale code, which reads as a bigger green than it is.
+  test: {
+    css: { include: [/style\.css/] },
+    exclude: ['**/node_modules/**', '**/dist/**', '.claude/**']
+  },
+  server: {
+    port: 5173,
+    proxy: {
+      '/register': { target: 'ws://[::1]:4797', ws: true },
+      '/localhost_5173': { target: 'ws://[::1]:4797', ws: true }
+    }
+  }
 })

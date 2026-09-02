@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SynthEngine } from '../audio/engine'
+import { MOD_SOURCES } from '../shared/messages'
 import { defaultNorm, normToValue, PARAMS, paramIndex } from '../shared/params'
-import { Knob } from './knob'
-import { ACCENT_COLOR } from './common'
+import { Knob, sourceBadge } from './knob'
+import { setControlGated } from './controls'
+import { ACCENT_COLOR, closePopup } from './common'
+import styleCss from '../style.css?raw'
 
 const context = {
   clearRect: vi.fn(), beginPath: vi.fn(), arc: vi.fn(), stroke: vi.fn(), fill: vi.fn(),
@@ -84,4 +87,65 @@ describe('Knob', () => {
     expect(strokes).toContain(ACCENT_COLOR)
   })
 
+  // A SYNC pair gates the bypassed half by putting `.is-gated` on the whole knob root.
+  // lfoN.rate and delay.time are the two knobs people actually modulate, so gating one
+  // must not strand the route that lives on it.
+  describe('gated by a SYNC toggle', () => {
+    const env2 = MOD_SOURCES.findIndex(s => s.id === 'env2')
+    let index: number
+    let time: Knob
+
+    beforeEach(() => {
+      index = paramIndex('delay.time')
+      time = new Knob(engine, index)
+      document.body.append(time.root)
+      engine.addModRoute(env2, index)
+      setControlGated(time.root, true)
+    })
+
+    it('still opens the mod menu, so an existing route can be inspected and removed', () => {
+      vi.useFakeTimers()  // showPopup defers wiring its outside-click closer
+      try {
+        expect(engine.routesForDest(index)).toHaveLength(1)
+        time.root.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
+        vi.runAllTimers()
+        const menu = document.querySelector('.mod-menu')
+        expect(menu).not.toBeNull()
+        const chips = [...menu!.querySelectorAll('.mod-chip')].map(c => c.textContent)
+        expect(chips).toEqual([MOD_SOURCES[env2].name])
+        ;(menu!.querySelector('.mod-del') as HTMLButtonElement).click()
+        expect(engine.routesForDest(index)).toHaveLength(0)
+      } finally {
+        closePopup()
+        vi.useRealTimers()
+      }
+    })
+
+    it('makes only the canvas stack inert, leaving the knob root live', () => {
+      // jsdom does not apply the stylesheet, so pin the rules the behaviour rests on:
+      // a blanket `.is-gated { pointer-events: none }` reaching the root would kill the
+      // mod menu and the drag-to-assign drop target along with the value drag.
+      const css = styleCss.replace(/\s+/g, ' ')
+      expect(css).toContain('.knob.is-gated { pointer-events: auto; }')
+      expect(css).toContain('.knob.is-gated .knob-canvases { pointer-events: none; }')
+      // Value editing is bound to the canvas (inside the inert stack); the mod menu to the root.
+      const stack = time.root.querySelector('.knob-canvases')!
+      expect(stack.contains(time.root.querySelector('canvas'))).toBe(true)
+      expect(stack.contains(time.root)).toBe(false)
+    })
+
+    it('is still a drag-to-assign drop target', () => {
+      engine.setModSlot(engine.routesForDest(index)[0].slot, null)
+      // The drop resolves its target with elementFromPoint(...).closest('.knob'), which
+      // only reaches a knob whose root keeps its pointer events.
+      const label = time.root.querySelector('.knob-label') as Element
+      document.elementFromPoint = vi.fn(() => label)
+      const badge = sourceBadge(engine, 'env2')
+      document.body.append(badge)
+      badge.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
+      window.dispatchEvent(new PointerEvent('pointerup', { clientX: 5, clientY: 5 }))
+      expect(engine.routesForDest(index)).toHaveLength(1)
+      expect(engine.routesForDest(index)[0].state.source).toBe(env2)
+    })
+  })
 })

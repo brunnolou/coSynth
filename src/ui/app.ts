@@ -1,11 +1,11 @@
 // Assembles the full synth UI.
 
-import { FILTER_TYPE_LABELS, paramIndex } from '../shared/params'
+import { FILTER_TYPE_LABELS, paramIndex, SYNC_DIVISION_ORDER } from '../shared/params'
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
 import { Knob, sourceBadge, animatedKnobs } from './knob'
 import { cancelKnobDrag } from './knob-drag'
-import { bindEnabledState, paramSelect, paramToggle, knobRow } from './controls'
+import { bindEnabledState, bindSyncGating, paramSelect, paramToggle, knobRow } from './controls'
 import { EnvDisplay } from './enveditor'
 import { LfoEditor } from './lfoeditor'
 import { ModMatrix } from './matrix'
@@ -243,16 +243,21 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   lfoEditor.root.dataset.aiTarget = 'lfo.0'
   const lfoKnobArea = el('div')
   let currentLfo = 1
+  let disposeLfoGating: (() => void) | undefined
   const renderLfoKnobs = () => {
+    disposeLfoGating?.()
     lfoKnobArea.textContent = ''
     const row = el('div', 'knob-row lfo-controls')
-    row.appendChild(new Knob(engine, paramIndex(`lfo${currentLfo}.rate`), 42).root)
+    const rate = new Knob(engine, paramIndex(`lfo${currentLfo}.rate`), 42).root
+    const division = paramSelect(engine, `lfo${currentLfo}.division`, { choiceOrder: SYNC_DIVISION_ORDER })
+    row.appendChild(rate)
     row.appendChild(paramToggle(engine, `lfo${currentLfo}.sync`, 'SYNC'))
-    row.appendChild(paramSelect(engine, `lfo${currentLfo}.division`))
+    row.appendChild(division)
     row.appendChild(paramSelect(engine, `lfo${currentLfo}.mode`))
     row.appendChild(new Knob(engine, paramIndex(`lfo${currentLfo}.phase`), 42).root)
     row.appendChild(new Knob(engine, paramIndex(`lfo${currentLfo}.smooth`), 42).root)
     lfoKnobArea.appendChild(row)
+    disposeLfoGating = bindSyncGating(engine, `lfo${currentLfo}.sync`, { free: rate, division })
   }
   const lfoBtns: HTMLButtonElement[] = []
   for (let l = 1; l <= 8; l++) {

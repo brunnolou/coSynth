@@ -1,5 +1,5 @@
 import type { PresetData } from '../audio/engine'
-import { PARAMS } from './params'
+import { PARAMS, SYNC_DIVISIONS } from './params'
 import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, type LfoPoint } from './messages'
 
 export const PRESET_STORAGE_KEY = 'cosynth.presets.v1'
@@ -8,9 +8,40 @@ export const MAX_PRESETS = 100
 export const MAX_PRESET_STORAGE_BYTES = 5 * 1024 * 1024
 const MAX_NAME_LENGTH = 80
 
+/** Current preset format. Version 1 is still read, and upgraded on load. */
+export const PRESET_VERSION = 2
+/** Highest index of the 13-entry division list format 1 normalized against. */
+const V1_SYNC_DIVISION_MAX = 12
+
 const paramById = new Map(PARAMS.map(param => [param.id, param]))
 const sourceIds = new Set(MOD_SOURCES.map(source => source.id))
 const fxIds = new Set<string>(FX_IDS)
+
+/**
+ * Rescale the LFO divisions of a format 1 preset.
+ *
+ * A choices parameter is stored as `index / (choices.length - 1)`, and the slow
+ * 2/1..31/1 multiples grew SYNC_DIVISIONS from 13 entries to 43. So the same
+ * division has two different normalized forms - format 1 wrote 1/4 as 4/12,
+ * format 2 writes it as 4/42 - and nothing but the version tag tells them
+ * apart. Hence the version bump: an unconditional remap would corrupt every
+ * newly saved preset. Recover the index on the old scale, then renormalize.
+ *
+ * `delay.division` is deliberately excluded: it stayed on the original
+ * 13-entry DELAY_DIVISIONS, so its scale never moved and remapping it would
+ * corrupt it. Selecting on the choices array rather than on the parameter id
+ * keeps that true if either list changes again.
+ */
+function upgradeSyncDivisionScale(params: Record<string, number>): Record<string, number> {
+  const max = SYNC_DIVISIONS.length - 1
+  const upgraded: Record<string, number> = {}
+  for (const [id, value] of Object.entries(params)) {
+    upgraded[id] = paramById.get(id)?.choices === SYNC_DIVISIONS
+      ? Math.round(value * V1_SYNC_DIVISION_MAX) / max
+      : value
+  }
+  return upgraded
+}
 
 export function validatePresetName(value: unknown): string {
   if (typeof value !== 'string') throw new Error('Preset name must be a string')
@@ -35,18 +66,27 @@ function boundedFinite(value: unknown, minimum: number, maximum: number, field: 
   return value
 }
 
-/** Validate all semantic preset fields and return a detached canonical object. */
+/**
+ * Validate all semantic preset fields and return a detached canonical object,
+ * upgraded to the current format version. Upgrading here rather than at the
+ * point of use keeps storage reads, file imports and the agent tools on one
+ * code path, and is idempotent: the result is already at PRESET_VERSION, so
+ * re-validating it (as savePreset does) never rescales anything twice.
+ */
 export function validatePresetData(value: unknown): PresetData {
   const input = record(value, 'data')
   const name = validatePresetName(input.name)
-  if (input.version !== 1) throw new Error('Invalid preset: version must be 1')
+  if (input.version !== 1 && input.version !== PRESET_VERSION) {
+    throw new Error(`Invalid preset: version must be 1 or ${PRESET_VERSION}`)
+  }
 
   const rawParams = record(input.params, 'params')
-  const params: Record<string, number> = {}
+  let params: Record<string, number> = {}
   for (const [id, rawValue] of Object.entries(rawParams)) {
     if (!paramById.has(id)) throw new Error(`Invalid preset: unknown parameter ID ${id}`)
     params[id] = boundedFinite(rawValue, 0, 1, `params.${id}`)
   }
+  if (input.version !== PRESET_VERSION) params = upgradeSyncDivisionScale(params)
 
   if (!Array.isArray(input.mods)) throw new Error('Invalid preset: mods must be an array')
   if (input.mods.length > MAX_MOD_SLOTS) throw new Error(`Invalid preset: mods is limited to ${MAX_MOD_SLOTS} entries`)
@@ -90,7 +130,7 @@ export function validatePresetData(value: unknown): PresetData {
   }
   const fxOrder = input.fxOrder.map(id => id as string)
 
-  return { name, version: 1, params, mods, lfoShapes, fxOrder }
+  return { name, version: PRESET_VERSION, params, mods, lfoShapes, fxOrder }
 }
 
 function browserStorage(): Storage {

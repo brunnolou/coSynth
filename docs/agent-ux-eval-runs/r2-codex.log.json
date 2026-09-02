@@ -1,0 +1,459 @@
+{
+  "summary": {
+    "totalCalls": 19,
+    "failedCalls": 0,
+    "callsToFirstSuccessfulUpdateParameters": 5,
+    "discoveryCalls": 4,
+    "perTool": {
+      "get_parameter_schema": {
+        "calls": 4,
+        "failed": 0,
+        "totalMs": 26
+      },
+      "list_presets": {
+        "calls": 1,
+        "failed": 0,
+        "totalMs": 3
+      },
+      "play_notes": {
+        "calls": 1,
+        "failed": 0,
+        "totalMs": 1110
+      },
+      "render_audio": {
+        "calls": 7,
+        "failed": 0,
+        "totalMs": 1494
+      },
+      "save_preset": {
+        "calls": 1,
+        "failed": 0,
+        "totalMs": 3
+      },
+      "set_modulation": {
+        "calls": 2,
+        "failed": 0,
+        "totalMs": 18
+      },
+      "update_parameters": {
+        "calls": 3,
+        "failed": 0,
+        "totalMs": 29
+      }
+    },
+    "startGestureDispatchedAtCall": 18,
+    "pageErrors": []
+  },
+  "log": [
+    {
+      "kind": "call",
+      "call": 1,
+      "at": "2026-09-02T14:50:55.067Z",
+      "tool": "get_parameter_schema",
+      "input": {
+        "format": "compact",
+        "limit": 60,
+        "sourceLimit": 60
+      },
+      "ok": true,
+      "ms": 6
+    },
+    {
+      "kind": "call",
+      "call": 2,
+      "at": "2026-09-02T14:51:02.052Z",
+      "tool": "get_parameter_schema",
+      "input": {
+        "format": "compact",
+        "offset": 60,
+        "limit": 60
+      },
+      "ok": true,
+      "ms": 4
+    },
+    {
+      "kind": "call",
+      "call": 3,
+      "at": "2026-09-02T14:51:09.348Z",
+      "tool": "get_parameter_schema",
+      "input": {
+        "format": "compact",
+        "offset": 120,
+        "limit": 60
+      },
+      "ok": true,
+      "ms": 6
+    },
+    {
+      "kind": "call",
+      "call": 4,
+      "at": "2026-09-02T14:51:15.576Z",
+      "tool": "get_parameter_schema",
+      "input": {
+        "format": "compact",
+        "offset": 180,
+        "limit": 60
+      },
+      "ok": true,
+      "ms": 10
+    },
+    {
+      "kind": "call",
+      "call": 5,
+      "at": "2026-09-02T14:51:29.153Z",
+      "tool": "update_parameters",
+      "input": {
+        "updates": [
+          {
+            "id": "osc1.wavetable",
+            "value": "FM Bell"
+          },
+          {
+            "id": "osc1.level",
+            "value": 0.8
+          },
+          {
+            "id": "osc1.unison",
+            "value": 2
+          },
+          {
+            "id": "env1.attack",
+            "value": 0.002
+          },
+          {
+            "id": "env1.decay",
+            "value": 3.5
+          },
+          {
+            "id": "env1.sustain",
+            "value": 0
+          },
+          {
+            "id": "env1.release",
+            "value": 1.2
+          },
+          {
+            "id": "env1.dec_curve",
+            "value": -0.7
+          },
+          {
+            "id": "filter1.cutoff",
+            "value": 7500
+          },
+          {
+            "id": "filter1.resonance",
+            "value": 0.12
+          },
+          {
+            "id": "noise.enabled",
+            "value": 1
+          },
+          {
+            "id": "noise.type",
+            "value": "Pink"
+          },
+          {
+            "id": "noise.level",
+            "value": 0.05
+          }
+        ]
+      },
+      "ok": true,
+      "ms": 14
+    },
+    {
+      "kind": "call",
+      "call": 6,
+      "at": "2026-09-02T14:51:40.499Z",
+      "tool": "update_parameters",
+      "input": {
+        "updates": [
+          {
+            "id": "env2.attack",
+            "value": 0.002
+          },
+          {
+            "id": "env2.decay",
+            "value": 2
+          },
+          {
+            "id": "env2.sustain",
+            "value": 0
+          },
+          {
+            "id": "env2.release",
+            "value": 0.1
+          }
+        ]
+      },
+      "ok": true,
+      "ms": 8
+    },
+    {
+      "kind": "call",
+      "call": 7,
+      "at": "2026-09-02T14:51:48.540Z",
+      "tool": "set_modulation",
+      "input": {
+        "action": "add",
+        "source": "env2",
+        "destination": "filter1.cutoff",
+        "depth": 0.35
+      },
+      "ok": true,
+      "ms": 8
+    },
+    {
+      "kind": "call",
+      "call": 8,
+      "at": "2026-09-02T14:51:55.942Z",
+      "tool": "set_modulation",
+      "input": {
+        "action": "add",
+        "source": "velocity",
+        "destination": "osc1.level",
+        "depth": 0.3
+      },
+      "ok": true,
+      "ms": 10
+    },
+    {
+      "kind": "call",
+      "call": 9,
+      "at": "2026-09-02T14:52:04.090Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.7,
+            "start": 0,
+            "duration": 0.2
+          }
+        ],
+        "duration": 6,
+        "mode": "offline",
+        "format": "metrics"
+      },
+      "ok": true,
+      "ms": 224
+    },
+    {
+      "kind": "call",
+      "call": 10,
+      "at": "2026-09-02T14:52:22.173Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.2,
+            "start": 0,
+            "duration": 0.2
+          }
+        ],
+        "duration": 4,
+        "mode": "offline",
+        "format": "metrics"
+      },
+      "ok": true,
+      "ms": 217
+    },
+    {
+      "kind": "call",
+      "call": 11,
+      "at": "2026-09-02T14:52:29.641Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.4,
+            "start": 0,
+            "duration": 0.2
+          }
+        ],
+        "duration": 4,
+        "mode": "offline",
+        "format": "metrics"
+      },
+      "ok": true,
+      "ms": 215
+    },
+    {
+      "kind": "call",
+      "call": 12,
+      "at": "2026-09-02T14:52:36.731Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.7,
+            "start": 0,
+            "duration": 0.2
+          }
+        ],
+        "duration": 4,
+        "mode": "offline",
+        "format": "metrics"
+      },
+      "ok": true,
+      "ms": 204
+    },
+    {
+      "kind": "call",
+      "call": 13,
+      "at": "2026-09-02T14:52:44.142Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 1,
+            "start": 0,
+            "duration": 0.2
+          }
+        ],
+        "duration": 4,
+        "mode": "offline",
+        "format": "metrics"
+      },
+      "ok": true,
+      "ms": 194
+    },
+    {
+      "kind": "call",
+      "call": 14,
+      "at": "2026-09-02T14:52:56.006Z",
+      "tool": "update_parameters",
+      "input": {
+        "updates": [
+          {
+            "id": "osc1.detune",
+            "value": 7
+          }
+        ]
+      },
+      "ok": true,
+      "ms": 7
+    },
+    {
+      "kind": "call",
+      "call": 15,
+      "at": "2026-09-02T14:53:04.381Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.7,
+            "start": 0,
+            "duration": 0.2
+          }
+        ],
+        "duration": 6,
+        "mode": "offline",
+        "format": "metrics"
+      },
+      "ok": true,
+      "ms": 206
+    },
+    {
+      "kind": "call",
+      "call": 16,
+      "at": "2026-09-02T14:53:17.925Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 64,
+            "velocity": 0.7,
+            "start": 0,
+            "duration": 3
+          },
+          {
+            "midi": 60,
+            "velocity": 0.65,
+            "start": 1,
+            "duration": 1.2
+          },
+          {
+            "midi": 64,
+            "velocity": 0.65,
+            "start": 1,
+            "duration": 1.2
+          },
+          {
+            "midi": 67,
+            "velocity": 0.65,
+            "start": 1,
+            "duration": 1.2
+          }
+        ],
+        "duration": 5,
+        "mode": "offline",
+        "format": "metrics"
+      },
+      "ok": true,
+      "ms": 234
+    },
+    {
+      "kind": "call",
+      "call": 17,
+      "at": "2026-09-02T14:53:25.874Z",
+      "tool": "save_preset",
+      "input": {
+        "name": "Evaluation Piano Pluck"
+      },
+      "ok": true,
+      "ms": 3
+    },
+    {
+      "kind": "call",
+      "call": 18,
+      "at": "2026-09-02T14:53:33.013Z",
+      "tool": "list_presets",
+      "input": {},
+      "ok": true,
+      "ms": 3
+    },
+    {
+      "kind": "gesture",
+      "at": "2026-09-02T14:53:43.196Z",
+      "before": {
+        "running": false
+      }
+    },
+    {
+      "kind": "call",
+      "call": 19,
+      "at": "2026-09-02T14:53:53.372Z",
+      "tool": "play_notes",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.7,
+            "start": 0,
+            "duration": 0.3
+          },
+          {
+            "midi": 64,
+            "velocity": 0.7,
+            "start": 0.3,
+            "duration": 0.3
+          },
+          {
+            "midi": 67,
+            "velocity": 0.7,
+            "start": 0.6,
+            "duration": 0.5
+          }
+        ]
+      },
+      "ok": true,
+      "ms": 1110
+    }
+  ]
+}

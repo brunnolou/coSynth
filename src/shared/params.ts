@@ -37,16 +37,46 @@ export const NOISE_TYPES = ['White', 'Pink', 'Sample']
 export const DIST_TYPES = ['Soft Clip', 'Hard Clip', 'Wavefold', 'Bitcrush']
 export const FILTER_ROUTINGS = ['Series', 'Parallel']
 export const LFO_MODES = ['Trigger', 'Free', 'Sync']
-export const SYNC_DIVISIONS = ['1/1', '1/2', '1/2T', '1/4.', '1/4', '1/4T', '1/8.', '1/8', '1/8T', '1/16.', '1/16', '1/16T', '1/32']
+// Original one-bar-and-faster set. Presets store a division as its position in
+// the array, so these thirteen entries are frozen: new divisions are appended,
+// never inserted. The delay reuses this set on its own (see DELAY_DIVISIONS).
+const BEAT_DIVISIONS = ['1/1', '1/2', '1/2T', '1/4.', '1/4', '1/4T', '1/8.', '1/8', '1/8T', '1/16.', '1/16', '1/16T', '1/32']
+/** Whole note multiples 2/1..31/1 (N/1 = N whole notes = 4N beats), for slow LFO sweeps. */
+const SLOW_DIVISIONS = Array.from({ length: 30 }, (_, i) => `${i + 2}/1`)
+export const SYNC_DIVISIONS = [...BEAT_DIVISIONS, ...SLOW_DIVISIONS]
+// The delay keeps the fast set. That is damage control, not a guarantee: a synced
+// delay asks for divisionToBeats(div) * 60 / bpm seconds (worklet/processor.ts) and
+// the delay line clamps at sr * 2.4 (worklet/effects.ts), so with master.bpm going
+// down to 20 the fast set is ALREADY silently clamped -- `1/1` overruns 2.4 s below
+// 100 BPM, `1/2` below 50, `1/4` below 25, and the echo drifts off the beat. Adding
+// the slow set would widen an existing hole rather than open a new one (`2/1` clamps
+// below 200 BPM), so it stays out. The real fix -- a longer buffer or a BPM-aware
+// menu -- is not done here.
+export const DELAY_DIVISIONS = BEAT_DIVISIONS
+/** SYNC_DIVISIONS indices in menu order: slowest cycle first. */
+/**
+ * Menu order for `SYNC_DIVISIONS`: the slow multiples first, longest to
+ * shortest, then the original thirteen in the grouped order they have always
+ * been shown in. Sorting the whole list strictly by duration would interleave
+ * dotted and triplet values (1/2, 1/4., 1/2T, 1/4, ...) and bury the 1/4
+ * default thirty entries down, and it would disagree with the delay's menu,
+ * which shows the same thirteen labels. Values stay the choice index, so this
+ * changes presentation only.
+ */
+export const SYNC_DIVISION_ORDER = [
+  ...SLOW_DIVISIONS.map((_, i) => BEAT_DIVISIONS.length + i).reverse(),
+  ...BEAT_DIVISIONS.map((_, i) => i)
+]
 export const WAVETABLE_NAMES = ['Basic Shapes', 'Harmonic Sweep', 'PWM', 'Vocal', 'FM Bell', 'Digital', 'Custom']
 
-/** Beats per whole note division. */
+/** Beats per cycle for a sync division: `n/d` is 4n/d beats, `.` dotted, `T` triplet. */
 export function divisionToBeats(divIndex: number): number {
-  const base = [4, 2, 2, 1, 1, 1, 0.5, 0.5, 0.5, 0.25, 0.25, 0.25, 0.125]
   const name = SYNC_DIVISIONS[divIndex] ?? '1/4'
-  let b = base[divIndex] ?? 1
-  if (name.endsWith('.')) b *= 1.5
-  if (name.endsWith('T')) b *= 2 / 3
+  const m = /^(\d+)\/(\d+)([.T]?)$/.exec(name)
+  if (!m) return 1
+  let b = (4 * Number(m[1])) / Number(m[2])
+  if (m[3] === '.') b *= 1.5
+  if (m[3] === 'T') b *= 2 / 3
   return b
 }
 
@@ -74,9 +104,9 @@ const db = (v: number) => `${v.toFixed(1)} dB`
 
 // ---------------------------------------------------------------- global
 p({ id: 'master.volume', name: 'Master', group: 'global', min: 0, max: 1.5, def: 0.7, moddable: true, fmt: pct })
-p({ id: 'master.bpm', name: 'BPM', group: 'global', min: 20, max: 300, def: 120, step: 1 })
-p({ id: 'master.polyphony', name: 'Voices', group: 'global', min: 1, max: 16, def: 16, step: 1 })
-p({ id: 'master.bend_range', name: 'Bend Rng', group: 'global', min: 1, max: 48, def: 2, step: 1 })
+p({ id: 'master.bpm', name: 'BPM', group: 'global', min: 20, max: 300, def: 120, step: 1, unit: 'BPM' })
+p({ id: 'master.polyphony', name: 'Voices', group: 'global', min: 1, max: 16, def: 16, step: 1, unit: 'voices' })
+p({ id: 'master.bend_range', name: 'Bend Rng', group: 'global', min: 1, max: 48, def: 2, step: 1, unit: 'st' })
 
 // ---------------------------------------------------------------- oscillators
 for (let o = 1; o <= 3; o++) {
@@ -121,7 +151,9 @@ for (let f = 1; f <= 2; f++) {
   p({ id: `${g}.keytrack`, name: 'Key Trk', group: g, min: 0, max: 1, def: 0, moddable: true, fmt: pct })
   p({ id: `${g}.mix`, name: 'Mix', group: g, min: 0, max: 1, def: 1, moddable: true, fmt: pct })
 }
-p({ id: 'filter.routing', name: 'Routing', group: 'filterRouting', min: 0, max: 1, def: 0, choices: FILTER_ROUTINGS })
+// Grouped as `filter` to match the id prefix: presets persist the id, never the
+// group, and a `filterRouting` group had agents filtering on a name no id carries.
+p({ id: 'filter.routing', name: 'Routing', group: 'filter', min: 0, max: 1, def: 0, choices: FILTER_ROUTINGS })
 
 // ---------------------------------------------------------------- distortion section (per-voice)
 p({ id: 'dist.enabled', name: 'On', group: 'dist', min: 0, max: 1, def: 0, step: 1 })
@@ -129,7 +161,27 @@ p({ id: 'dist.type', name: 'Type', group: 'dist', min: 0, max: DIST_TYPES.length
 p({ id: 'dist.drive', name: 'Drive', group: 'dist', min: 0, max: 1, def: 0.3, moddable: true, fmt: pct })
 p({ id: 'dist.mix', name: 'Mix', group: 'dist', min: 0, max: 1, def: 1, moddable: true, fmt: pct })
 p({ id: 'dist.bits', name: 'Bits', group: 'dist', min: 1, max: 16, def: 8, moddable: true, fmt: v => `${v.toFixed(1)} bit` })
-p({ id: 'dist.downsample', name: 'Rate', group: 'dist', min: 1, max: 64, def: 1, curve: 'exp', moddable: true, fmt: v => `÷${v.toFixed(1)}` })
+p({ id: 'dist.downsample', name: 'Rate', group: 'dist', min: 1, max: 64, def: 1, curve: 'exp', moddable: true, unit: 'x', fmt: v => `÷${v.toFixed(1)}` })
+
+/**
+ * Facts about a group that its parameter definitions cannot express, surfaced
+ * by `get_parameter_schema`. Two kinds live here: hardwired routing - env1 is
+ * the VCA (`voice.ts` multiplies the voice by `sources[SRC_ENV0]` and takes
+ * voice lifetime from it), while env2..env6 and every LFO reach the sound only
+ * through the mod matrix - and the curve sign convention, which is a bare
+ * `-1..1` in the definitions and so a coin flip without it.
+ *
+ * The curve wording is measured, not guessed: `curveShape(t, c) = t^(2^(3c))`
+ * in `worklet/dsp.ts`, applied as `curveShape(t, atkCurve)` for the attack and
+ * as `1 - curveShape(t, -decCurve)` for decay and release, which is why the
+ * sign reads opposite between them. `worklet/dsp.test.ts` pins both directions.
+ */
+const ENVELOPE_CURVE_NOTE = 'atk_curve, dec_curve, and rel_curve shape a stage, they do not lengthen it: 0 is linear. Positive atk_curve starts the attack slowly and rises steeply at its end; negative atk_curve jumps up and eases into the peak. dec_curve and rel_curve read the opposite way: positive falls fast and trails off into a long low tail (the usual exponential-sounding decay), negative holds near the level it started from and drops steeply only at the end of the stage - the default -0.4 is still at 96% of its starting level a quarter of the way through decay, which sounds like a delay before the decay rather than a slow one.'
+
+export const PARAM_GROUP_NOTES: Readonly<Record<string, string>> = {
+  env1: 'env1 is the amplitude envelope (VCA), hardwired to voice level and voice lifetime: a note stops sounding when env1 finishes its release. env2..env6 and lfo1..lfo8 have no hardwired destination and do nothing until routed with set_modulation. ' + ENVELOPE_CURVE_NOTE,
+  ...Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`env${i + 2}`, ENVELOPE_CURVE_NOTE]))
+}
 
 // ---------------------------------------------------------------- envelopes (env1 = amp)
 for (let e = 1; e <= 6; e++) {
@@ -181,7 +233,7 @@ p({ id: 'flanger.mix', name: 'Mix', group: 'flanger', min: 0, max: 1, def: 0.5, 
 
 p({ id: 'delay.enabled', name: 'On', group: 'delay', min: 0, max: 1, def: 0, step: 1 })
 p({ id: 'delay.sync', name: 'Sync', group: 'delay', min: 0, max: 1, def: 1, step: 1 })
-p({ id: 'delay.division', name: 'Div', group: 'delay', min: 0, max: SYNC_DIVISIONS.length - 1, def: 7, choices: SYNC_DIVISIONS })
+p({ id: 'delay.division', name: 'Div', group: 'delay', min: 0, max: DELAY_DIVISIONS.length - 1, def: 7, choices: DELAY_DIVISIONS })
 p({ id: 'delay.time', name: 'Time', group: 'delay', min: 0.01, max: 2, def: 0.35, curve: 'exp', moddable: true, fmt: ms })
 p({ id: 'delay.feedback', name: 'Fdbk', group: 'delay', min: 0, max: 0.98, def: 0.4, moddable: true, fmt: pct })
 p({ id: 'delay.pingpong', name: 'PingPong', group: 'delay', min: 0, max: 1, def: 0, step: 1 })
@@ -210,6 +262,48 @@ p({ id: 'fxdist.enabled', name: 'On', group: 'fxdist', min: 0, max: 1, def: 0, s
 p({ id: 'fxdist.drive', name: 'Drive', group: 'fxdist', min: 0, max: 1, def: 0.4, moddable: true, fmt: pct })
 p({ id: 'fxdist.tone', name: 'Tone', group: 'fxdist', min: 200, max: 18000, def: 8000, curve: 'exp', moddable: true, fmt: hz })
 p({ id: 'fxdist.mix', name: 'Mix', group: 'fxdist', min: 0, max: 1, def: 1, moddable: true, fmt: pct })
+
+// ---------------------------------------------------------------- units
+// `unit` is a short machine-readable hint for agents reading the parameter
+// schema, and it must describe the RAW scale that `min`/`max`/`def` and the
+// update API speak. `fmt` is a display concern that is free to rescale, so the
+// rendered suffix is only a clue to the raw unit, never the unit itself:
+// `ms` renders "5 ms" off a raw 0.005 SECONDS, so its hint is `s`. Formatters
+// whose rendered unit has no honest raw counterpart contribute no hint at all
+// (`pct` renders "70%" off a raw 0.7, the degree formatter "252°" off 0.7) —
+// advertising `%` or `°` there would invite values a hundredfold too large.
+// Where a raw unit exists but cannot be inferred, declare `unit` on the param.
+const UNIT_RULES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/k?Hz$/, 'Hz'],
+  [/\bct$/, 'ct'],
+  [/\bst$/, 'st'],
+  [/\bdB$/, 'dB'],
+  [/\bbit$/, 'bit'],
+  [/\boct$/, 'oct'],
+  [/\b(?:s|ms)$/, 's'],
+  [/:1$/, ':1'],
+  [/\dv$/, 'voices'],
+  [/\dx$/, 'x']
+]
+
+function deriveUnit(d: ParamDef): string | undefined {
+  if (d.choices || !d.fmt) return undefined
+  let unit: string | undefined
+  for (const value of [d.min, d.def, d.max]) {
+    const formatted = d.fmt(value)
+    const match = UNIT_RULES.find(([pattern]) => pattern.test(formatted))?.[1]
+    if (!match || (unit !== undefined && unit !== match)) return undefined
+    unit = match
+  }
+  return unit
+}
+
+for (const d of defs) {
+  if (d.unit === undefined) {
+    const unit = deriveUnit(d)
+    if (unit) d.unit = unit
+  }
+}
 
 export const PARAMS: readonly ParamDef[] = defs
 export const NUM_PARAMS = PARAMS.length

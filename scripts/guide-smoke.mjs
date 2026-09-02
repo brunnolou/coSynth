@@ -3,6 +3,11 @@
 import assert from 'node:assert/strict'
 import { chromium } from 'playwright'
 
+// Only play_notes waits for the audio gesture; render_audio registers at load
+// because it renders offline.
+const TOOLS_AT_LOAD = 17
+const TOOLS_AFTER_AUDIO = 18
+
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined })
 try {
   const page = await browser.newPage({ viewport: { width: 1280, height: 1000 }, reducedMotion: 'reduce' })
@@ -29,8 +34,8 @@ try {
   const next = () => page.locator('.driver-popover-next-btn').click()
   const previous = () => page.locator('.driver-popover-prev-btn').click()
 
-  await page.waitForFunction(() => window.__guideTestTools.size === 15)
-  assert.equal(await page.locator('.agent-feed-line').textContent(), '15 tools ready · Start audio to unlock 2')
+  await page.waitForFunction(count => window.__guideTestTools.size === count, TOOLS_AT_LOAD)
+  assert.equal(await page.locator('.agent-feed-line').textContent(), `${TOOLS_AT_LOAD} tools ready · Start audio to unlock 1`)
   await show([{ markdown: 'Introduction' }, { target: { id: 'button.audio.start' }, markdown: 'Start audio yourself when ready.' }])
   await page.keyboard.press('ArrowRight')
   await highlighted('button.audio.start')
@@ -40,7 +45,7 @@ try {
   const replaysBeforeWelcome = await call('get_history', { view: 'replays', limit: 20 })
   await page.locator('#start-btn').click()
   await page.locator('#start-overlay').waitFor({ state: 'detached' })
-  await page.waitForFunction(() => window.__guideTestTools.size === 17)
+  await page.waitForFunction(count => window.__guideTestTools.size === count, TOOLS_AFTER_AUDIO)
 
   // The built-in tour starts once after audio and stays separate from AI replay history.
   await page.locator('.driver-popover-title', { hasText: 'Create sounds with AI' }).waitFor()
@@ -198,7 +203,7 @@ try {
   }
   await page.locator('.driver-popover').waitFor({ state: 'detached' })
   assert.deepEqual(errors, [])
-  console.log('Guide smoke passed: 17 tools; discovery, interactive tours, safe Markdown, dynamic targets, dialogs, mobile, and unchanged sound history verified.')
+  console.log(`Guide smoke passed: ${TOOLS_AFTER_AUDIO} tools; discovery, interactive tours, safe Markdown, dynamic targets, dialogs, mobile, and unchanged sound history verified.`)
 } finally {
   await browser.close()
 }

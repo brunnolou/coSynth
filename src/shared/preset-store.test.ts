@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { PresetData } from '../audio/engine'
 import { FX_IDS, MAX_MOD_SLOTS, defaultLfoShape } from './messages'
-import { loadPreset, listPresets, PRESET_STORAGE_KEY, savePreset, validatePresetData, validatePresetName } from './preset-store'
+import { loadPreset, listPresets, PRESET_STORAGE_KEY, PRESET_VERSION, savePreset, validatePresetData, validatePresetName } from './preset-store'
+import { normToValue, paramDef, SYNC_DIVISIONS } from './params'
 
 class MemoryStorage implements Storage {
   private data = new Map<string, string>()
@@ -77,7 +78,10 @@ describe('preset store', () => {
     expect(original.lfoShapes[0][0].x).toBe(0)
 
     const invalid: unknown[] = [
-      { ...preset('x'), version: 2 },
+      { ...preset('x'), version: 3 },
+      { ...preset('x'), version: 0 },
+      { ...preset('x'), version: '2' },
+      { ...preset('x'), version: undefined },
       { ...preset('x'), params: { missing: 0.5 } },
       { ...preset('x'), params: { 'osc1.level': NaN } },
       { ...preset('x'), params: { 'osc1.level': 1.1 } },
@@ -120,5 +124,80 @@ describe('preset store', () => {
     expect(listPresets(throwing)).toEqual([])
     expect(() => savePreset(preset('Blocked'), throwing)).toThrow(/storage/i)
     expect(() => loadPreset('Blocked', throwing)).toThrow(/storage/i)
+  })
+})
+
+// The slow 2/1..31/1 multiples grew SYNC_DIVISIONS from 13 entries to 43, which
+// moved the normalized form of every LFO division. Format 1 presets predate the
+// move; format 2 presets do not, and only the version tag separates them.
+describe('preset format upgrade', () => {
+  const V1_MAX = 12
+  const V2_MAX = SYNC_DIVISIONS.length - 1
+  const divisionOf = (value: number) => SYNC_DIVISIONS[normToValue(paramDef('lfo1.division'), value)]
+  const withParams = (version: 1 | 2, params: Record<string, number>): PresetData =>
+    ({ ...preset('Divisions'), version, params })
+
+  it('stamps the current format version on everything it returns', () => {
+    expect(PRESET_VERSION).toBe(2)
+    expect(validatePresetData(preset('Old')).version).toBe(PRESET_VERSION)
+    expect(validatePresetData({ ...preset('New'), version: PRESET_VERSION }).version).toBe(PRESET_VERSION)
+  })
+
+  it('rescales every format 1 LFO division back onto the same division', () => {
+    for (let index = 0; index <= V1_MAX; index++) {
+      const upgraded = validatePresetData(withParams(1, { 'lfo1.division': index / V1_MAX }))
+      expect(upgraded.params['lfo1.division']).toBeCloseTo(index / V2_MAX, 10)
+      expect(divisionOf(upgraded.params['lfo1.division'])).toBe(SYNC_DIVISIONS[index])
+    }
+  })
+
+  it('keeps the endpoints and the LFO default intact across the upgrade', () => {
+    const upgraded = validatePresetData(withParams(1, {
+      'lfo1.division': 0 / V1_MAX,   // 1/1
+      'lfo2.division': 4 / V1_MAX,   // 1/4, the parameter default
+      'lfo3.division': V1_MAX / V1_MAX // 1/32
+    })).params
+    expect(divisionOf(upgraded['lfo1.division'])).toBe('1/1')
+    expect(divisionOf(upgraded['lfo2.division'])).toBe('1/4')
+    expect(divisionOf(upgraded['lfo3.division'])).toBe('1/32')
+    expect(upgraded['lfo2.division']).toBe(paramDef('lfo2.division').def / V2_MAX)
+  })
+
+  it('leaves delay.division alone: it never left the 13-entry scale', () => {
+    const upgraded = validatePresetData(withParams(1, { 'delay.division': 7 / V1_MAX })).params
+    expect(upgraded['delay.division']).toBe(7 / V1_MAX)
+    expect(normToValue(paramDef('delay.division'), upgraded['delay.division'])).toBe(7)
+  })
+
+  it('leaves ordinary parameters alone', () => {
+    const upgraded = validatePresetData(withParams(1, { 'osc1.level': 0.3333, 'master.bpm': 0.5 })).params
+    expect(upgraded).toEqual({ 'osc1.level': 0.3333, 'master.bpm': 0.5 })
+  })
+
+  it('is a fixed point on format 2: validating twice never rescales twice', () => {
+    const once = validatePresetData(withParams(1, { 'lfo1.division': 4 / V1_MAX }))
+    const twice = validatePresetData(once)
+    expect(twice).toEqual(once)
+    expect(divisionOf(twice.params['lfo1.division'])).toBe('1/4')
+    // The slow end is only reachable in format 2 and must survive untouched.
+    const slow = withParams(2, { 'lfo1.division': SYNC_DIVISIONS.indexOf('31/1') / V2_MAX })
+    expect(validatePresetData(validatePresetData(slow)).params['lfo1.division'])
+      .toBe(slow.params['lfo1.division'])
+    expect(divisionOf(slow.params['lfo1.division'])).toBe('31/1')
+  })
+
+  it('survives a save/load round trip without drifting', () => {
+    const storage = new MemoryStorage()
+    // savePreset validates on the way in and on the way out, so a v1 preset
+    // meets the upgrade twice in one call.
+    const saved = savePreset(withParams(1, { 'lfo1.division': 4 / V1_MAX }), storage)
+    expect(divisionOf(saved.params['lfo1.division'])).toBe('1/4')
+    const loaded = loadPreset('Divisions', storage)!
+    expect(loaded.version).toBe(PRESET_VERSION)
+    expect(loaded.params['lfo1.division']).toBe(saved.params['lfo1.division'])
+    // Re-saving the upgraded preset is idempotent: storage is now format 2.
+    const resaved = savePreset(loaded, storage)
+    expect(resaved.params['lfo1.division']).toBe(saved.params['lfo1.division'])
+    expect(divisionOf(listPresets(storage)[0].params['lfo1.division'])).toBe('1/4')
   })
 })

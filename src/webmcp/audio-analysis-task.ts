@@ -1,4 +1,4 @@
-import { analyzeAudio, type AudioMetrics } from '../shared/audio-analysis'
+import { analyzeAudio, type AnalyzeAudioOptions, type AudioMetrics } from '../shared/audio-analysis'
 
 function abortError(): Error {
   const error = new Error('Execution aborted')
@@ -10,14 +10,15 @@ function abortError(): Error {
 export function analyzeAudioAbortably(
   channels: Float32Array[],
   sampleRate: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options: AnalyzeAudioOptions = {}
 ): Promise<AudioMetrics> {
   if (signal?.aborted) return Promise.reject(abortError())
 
   if (typeof Worker === 'undefined') {
     return Promise.resolve().then(() => {
       if (signal?.aborted) throw abortError()
-      const metrics = analyzeAudio(channels, sampleRate)
+      const metrics = analyzeAudio(channels, sampleRate, options)
       if (signal?.aborted) throw abortError()
       return metrics
     })
@@ -46,7 +47,7 @@ export function analyzeAudioAbortably(
     }, { once: true })
 
     const buffers = channels.map(channel => channel.slice().buffer)
-    worker.postMessage({ channels: buffers, sampleRate }, buffers)
+    worker.postMessage({ channels: buffers, sampleRate, options }, buffers)
   })
 }
 

@@ -1,6 +1,8 @@
-// Main-thread synth engine: owns the AudioContext + worklet node, the
+// Main-thread synth engine: owns an audio context + worklet node, the
 // authoritative parameter/mod-matrix/LFO-shape state, wavetable generation
-// and transfer, and preset (de)serialization.
+// and transfer, and preset (de)serialization. The context may be live (the
+// default) or an injected OfflineAudioContext for headless rendering; the
+// worklet-facing state transfer is identical in both modes.
 
 import processorUrl from '../worklet/processor.ts?worker&url'
 import {
@@ -12,10 +14,12 @@ import {
 } from '../shared/messages'
 import { generateWavetable, buildMips, wavToWavetable, decodeWav, type Wavetable } from '../shared/wavetable-gen'
 import { samePatchValue, type MutationOrigin, type PatchChange, type PatchMutation } from '../shared/patch-change'
+import { PRESET_VERSION } from '../shared/preset-store'
 
 export interface PresetData {
   name: string
-  version: 1
+  /** Format version. 1 is still accepted on load and upgraded by validatePresetData. */
+  version: 1 | 2
   params: Record<string, number> // param id -> normalized value
   mods: { source: string; dest: string; depth: number; enabled: boolean }[]
   lfoShapes: LfoPoint[][]
@@ -96,6 +100,36 @@ function migrateLegacyDistortionParams(params: Record<string, number>): Record<s
 
 type ParamListener = (value: number) => void
 
+export interface SynthEngineOptions {
+  /**
+   * Render into an existing context instead of creating one. Pass an
+   * `OfflineAudioContext` to build the same worklet graph, wavetables and
+   * parameter state without touching the live audio device.
+   */
+  context?: BaseAudioContext
+  /**
+   * Factory for the context `start()` creates when no `context` is given.
+   * Defaults to `new AudioContext({ latencyHint: 'interactive' })`.
+   */
+  createContext?: () => BaseAudioContext
+}
+
+function defaultLiveContext(): BaseAudioContext {
+  return new AudioContext({ latencyHint: 'interactive' })
+}
+
+/**
+ * `instanceof AudioContext` is unreliable outside a real browser (jsdom defines
+ * no Web Audio constructors at all), so the live path is detected by
+ * capability: only a live context hands out a MediaStream destination, and only
+ * an offline one can be told to render.
+ */
+function isLiveContext(context: BaseAudioContext): context is AudioContext {
+  const candidate = context as Partial<AudioContext> & Partial<OfflineAudioContext>
+  return typeof candidate.createMediaStreamDestination === 'function'
+    && typeof candidate.startRendering !== 'function'
+}
+
 export class SynthEngine {
   readonly values = defaultValues()
   readonly modSlots: (ModSlotState | null)[] = new Array(MAX_MOD_SLOTS).fill(null)
@@ -110,8 +144,12 @@ export class SynthEngine {
   peakL = 0
   peakR = 0
 
-  ctx: AudioContext | null = null
+  /** The context the graph is running on; null until `start()` resolves. */
+  ctx: BaseAudioContext | null = null
   private node: AudioWorkletNode | null = null
+  private readonly providedContext: BaseAudioContext | null
+  private readonly createContext: () => BaseAudioContext
+  private readonly offlineMode: boolean
   private readonly paramListeners: (Set<ParamListener> | undefined)[] = new Array(NUM_PARAMS)
   private readonly matrixListeners = new Set<() => void>()
   private readonly patchListeners = new Set<(mutation: PatchMutation) => void>()
@@ -130,29 +168,101 @@ export class SynthEngine {
   private readonly noteOwners = new Map<number, Set<NoteOwner>>()
   private noteListeners = new Set<(note: number, on: boolean) => void>()
 
+  constructor(options: SynthEngineOptions = {}) {
+    this.providedContext = options.context ?? null
+    this.createContext = options.createContext ?? defaultLiveContext
+    // Fixed at construction: a default engine is always a live engine, so tests
+    // and callers that assign `ctx` directly keep the historical semantics.
+    this.offlineMode = this.providedContext !== null && !isLiveContext(this.providedContext)
+  }
+
+  /** True when this engine renders into an offline context. */
+  get offline(): boolean {
+    return this.offlineMode
+  }
+
+  /** The context this engine will use (or is using), before `start()` too. */
+  get context(): BaseAudioContext | null {
+    return this.ctx ?? this.providedContext
+  }
+
+  /** The worklet graph exists, in either mode. */
+  get started(): boolean {
+    return this.node !== null
+  }
+
+  /**
+   * The live, audible graph is up - i.e. the user gesture happened. Offline
+   * engines are never "running": they render, they do not play.
+   */
   get running(): boolean {
-    return this.ctx !== null
+    return this.ctx !== null && !this.offlineMode
   }
 
   async start(): Promise<void> {
     if (this.ctx) return
-    const ctx = new AudioContext({ latencyHint: 'interactive' })
+    const ctx = this.providedContext ?? this.createContext()
     await ctx.audioWorklet.addModule(processorUrl)
     const node = new AudioWorkletNode(ctx, 'cosynth', {
       numberOfInputs: 0,
       numberOfOutputs: 1,
       outputChannelCount: [2]
     })
-    node.port.onmessage = e => this.onWorkletMessage(e.data as FromWorklet)
+    // Scope/status frames only feed live meters; an offline render would pay for
+    // them every block and read them never.
+    if (!this.offlineMode) node.port.onmessage = e => this.onWorkletMessage(e.data as FromWorklet)
     node.connect(ctx.destination)
     this.ctx = ctx
     this.node = node
-    await ctx.resume()
+    if (!this.offlineMode) await (ctx as AudioContext).resume()
     this.syncAll()
   }
 
   private post(msg: ToWorklet, transfer?: Transferable[]): void {
     this.node?.port.postMessage(msg, transfer ?? [])
+  }
+
+  /**
+   * Resolve once the worklet processor has handled every message posted so far,
+   * reporting whether that was actually confirmed.
+   *
+   * `AudioWorkletNode.port.postMessage` hands work to the audio thread
+   * asynchronously and with no ordering against rendering. That is invisible in
+   * a live context, which renders in real time and has whole milliseconds to
+   * drain the queue, but an `OfflineAudioContext` starts rendering the moment
+   * `startRendering()` is called and can outrun its own message queue: a
+   * note-on posted just before it may not reach the processor until the render
+   * next idles, by which point the note's whole envelope is already behind it.
+   *
+   * The barrier is the standard fix. A `MessagePort` delivers in order and the
+   * processor answers `ping` from inside the same handler that applies every
+   * other message, so an acknowledgement is proof the queue has drained. The
+   * reply comes back over a transferred channel of its own rather than the
+   * node's port, so an offline engine — which deliberately leaves
+   * `port.onmessage` unset to avoid paying for scope and status frames it would
+   * never read — does not have to start that port to hear it.
+   *
+   * Resolves `false` rather than hanging when the acknowledgement does not
+   * arrive inside `timeoutMs`, or when there is no worklet or no
+   * `MessageChannel` to ask over. Callers must stay correct without the
+   * guarantee: a barrier that could stall is worse than the race it closes.
+   */
+  async awaitWorkletSync(timeoutMs = 2000): Promise<boolean> {
+    const node = this.node
+    if (!node || typeof MessageChannel !== 'function') return false
+    const channel = new MessageChannel()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await new Promise<boolean>(resolve => {
+        channel.port1.onmessage = () => resolve(true)
+        timer = setTimeout(() => resolve(false), timeoutMs)
+        this.post({ type: 'ping', port: channel.port2 }, [channel.port2])
+      })
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      channel.port1.onmessage = null
+      channel.port1.close()
+    }
   }
 
   /** Push the complete current state to the worklet (startup / preset load). */
@@ -465,6 +575,9 @@ export class SynthEngine {
     const ctx = this.ctx
     const node = this.node
     if (!ctx || !node) throw new Error('Start audio before recording output')
+    // Split so the capability check narrows `ctx` to AudioContext below.
+    if (this.offlineMode) throw new Error('recordOutput requires a live audio context; render offline instead')
+    if (!isLiveContext(ctx)) throw new Error('recordOutput requires a live audio context; render offline instead')
     if (signal?.aborted) throw abortRecordingError()
 
     const destination = ctx.createMediaStreamDestination()
@@ -569,7 +682,7 @@ export class SynthEngine {
       }))
     return {
       name,
-      version: 1,
+      version: PRESET_VERSION,
       params,
       mods,
       lfoShapes: this.lfoShapes.map(pts => pts.map(p => ({ ...p }))),

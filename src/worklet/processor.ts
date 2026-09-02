@@ -137,6 +137,11 @@ class SynthProcessor extends AudioWorkletProcessor {
       case 'allNotesOff':
         for (const v of this.voices) if (v.active) v.noteOff()
         break
+      // Answered last, from inside the same handler, so the acknowledgement can
+      // only leave after every message queued ahead of it has been applied.
+      case 'ping':
+        msg.port.postMessage(true)
+        break
     }
   }
 

@@ -21,7 +21,10 @@ export interface WebMcpRegistrationOptions {
   services?: AppHistoryServices
 }
 
-const AUDIO_TOOL_NAMES = new Set(['play_notes', 'render_audio'])
+// Only play_notes needs the human's Start gesture: it drives the live graph.
+// render_audio defaults to an offline render, which needs no gesture, so it
+// registers at page load - an agent that cannot see the tool cannot use it.
+const AUDIO_TOOL_NAMES = new Set(['play_notes'])
 
 function registeredTool(tool: WebMCP.ModelContextTool, activity: AgentActivityStore, services?: AppHistoryServices): WebMCP.ModelContextTool {
   const execute = tool.execute
