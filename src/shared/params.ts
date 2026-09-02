@@ -50,6 +50,16 @@ export function divisionToBeats(divIndex: number): number {
   return b
 }
 
+/**
+ * Beats per cycle of a free-running LFO at `freq` Hz under a `bpm` transport.
+ * A cycle lasts `1 / freq` seconds and a beat lasts `60 / bpm` seconds, so the
+ * cycle spans `(1 / freq) / (60 / bpm)` beats. Mirrors `divisionToBeats` for the
+ * synced case, letting both feed the same beat-phase accumulator.
+ */
+export function freqToBeatsPerCycle(freq: number, bpm: number): number {
+  return bpm / (60 * Math.max(freq, 1e-4))
+}
+
 const defs: ParamDef[] = []
 function p(d: ParamDef): number {
   defs.push(d)

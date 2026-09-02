@@ -1,7 +1,7 @@
 // The synthesizer AudioWorkletProcessor: voice management, global modulation,
 // the effects rack, and the message protocol endpoint.
 
-import { PARAMS, NUM_PARAMS, paramIndex, normToValue, defaultValues, divisionToBeats } from '../shared/params'
+import { PARAMS, NUM_PARAMS, paramIndex, normToValue, defaultValues, divisionToBeats, freqToBeatsPerCycle } from '../shared/params'
 import {
   MAX_MOD_SLOTS, MAX_VOICES, NUM_MOD_SOURCES, defaultLfoShape,
   type ToWorklet, type ModSlotState, type LfoPoint
@@ -208,7 +208,7 @@ class SynthProcessor extends AudioWorkletProcessor {
       this.lfoGlobalPhases[l] = (this.lfoGlobalPhases[l] + freq * dt) % 1
       const beatsPerCycle = synced
         ? divisionToBeats(Math.round(normToValue(PARAMS[ix.division], this.base[ix.division])))
-        : Math.max(60 / (freq * bpm), 1e-4)
+        : freqToBeatsPerCycle(freq, bpm)
       const phase0 = this.base[ix.phase]
       this.lfoBeatPhases[l] = (this.beatCounter / beatsPerCycle + phase0) % 1
     }
