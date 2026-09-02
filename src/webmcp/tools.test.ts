@@ -279,6 +279,40 @@ describe('single-round-trip discovery', () => {
     expect(state.properties.parameterOffset.description).toMatch(/compact/i)
   })
 
+  it('makes "one unfiltered compact call" impossible to miss at the point an agent filters', async () => {
+    const { byName, execute } = setup()
+    // An evaluated agent made FIVE get_parameter_schema calls -
+    // {format:'compact', group:'Filter'}, then filter1, env1, osc1, env2 -
+    // where one unfiltered compact call returns all 224. The `group` and
+    // `search` property descriptions are where it decides to filter.
+    const schema = byName.get('get_parameter_schema')!.inputSchema as any
+    for (const property of ['group', 'search']) {
+      expect(schema.properties[property].description, property).toMatch(/omit/i)
+      expect(schema.properties[property].description, property).toContain(String(PARAMS.length))
+      expect(schema.properties[property].description, property).toMatch(/one call/i)
+    }
+
+    // `group: 'Filter'` with a capital F matches the `filter` routing group
+    // case-insensitively: one parameter, not the filter section the agent
+    // meant. That answer must be obvious rather than a silent near-empty page.
+    const filter = await execute('get_parameter_schema', { format: 'compact', group: 'Filter' })
+    expect(filter.parameters.total).toBe(1)
+    expect(filter.groupFilter.group).toBe('filter')
+    expect(filter.groupFilter.relatedGroups).toEqual(['filter1', 'filter2'])
+    expect(filter.groupFilter.note).toContain(String(PARAMS.length))
+    expect(filter.groupFilter.note).toMatch(/one call/i)
+    // A group that matches everything it should carries no misleading note.
+    const filter1 = await execute('get_parameter_schema', { group: 'FILTER1' })
+    expect(filter1.groupFilter).toMatchObject({ group: 'filter1' })
+    expect(filter1.groupFilter).not.toHaveProperty('relatedGroups')
+
+    // An unknown group is an error that names the groups, not an empty page.
+    for (const tool of ['get_parameter_schema', 'get_synth_state']) {
+      await expect(execute(tool, { group: 'Fliter' }), tool).rejects.toThrow(/unknown group/i)
+      await expect(execute(tool, { group: 'Fliter' }), tool).rejects.toThrow(/filter1/)
+    }
+  })
+
   it('lists only non-default parameters when synth state is compact', async () => {
     const { engine, execute } = setup()
     await execute('update_parameters', { updates: [{ id: 'filter1.cutoff', value: 1200 }] })

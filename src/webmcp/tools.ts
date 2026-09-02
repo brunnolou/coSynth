@@ -42,8 +42,16 @@ const PARAMETER_GROUPS = [...new Set(PARAMS.map(def => def.group))]
 const MOD_SOURCE_IDS = MOD_SOURCES.map(source => source.id)
 
 /** Filtering advice belongs on the property an agent is filling in, not in the prose. */
-const GROUP_PROPERTY_DESCRIPTION = 'Exact group id, matched case-insensitively; one of the ids returned in `groups`.'
+const GROUP_PROPERTY_DESCRIPTION = 'Exact group id from `groups`, case-insensitive; an unknown name is an error.'
 const SEARCH_PROPERTY_DESCRIPTION = 'Case-insensitive substring over parameter id, name, and group.'
+/**
+ * The discovery tool's own filters, where an evaluated agent decided to call
+ * five times - one group per call - for what one unfiltered compact call
+ * returns. `format: 'compact'` reads as a formatting flag, so the "one call
+ * gets everything" property has to be stated here, not only in the prose.
+ */
+const GROUP_FILTER_DESCRIPTION = `Exact group id from \`groups\`, case-insensitive; an unknown name is an error, not an empty page. Groups are per instance (\`filter1\`, \`filter2\`, \`env1\`..\`env6\`), so \`filter\` is only the routing group. Usually skip it: omit \`group\` and \`search\`, and one call with \`format: "compact"\` returns all ${PARAMS.length} parameters.`
+const SEARCH_FILTER_DESCRIPTION = `Case-insensitive substring over parameter id, name, and group; unlike \`group\` it spans instances (\`filter\` matches every filter1/filter2 parameter). Omit it too and one call with \`format: "compact"\` returns all ${PARAMS.length}.`
 
 type Input = Record<string, unknown>
 type DecodeAudio = typeof decodeBase64Audio
@@ -328,6 +336,28 @@ function boundedInteger(value: unknown, label: string, fallback: number, min: nu
   return number
 }
 
+/** Groups whose id extends this one: `filter` -> `filter1`, `filter2`. */
+function relatedGroups(group: string): string[] {
+  return PARAMETER_GROUPS.filter(candidate => candidate !== group && candidate.toLowerCase().startsWith(group.toLowerCase()))
+}
+
+/**
+ * The canonical group id for a case-insensitively matched name. A name that
+ * matches nothing used to return an empty page that looked like an answer;
+ * `{ group: 'Filter' }` still resolves - to the one-parameter routing group,
+ * which `groupFilter` in the response then says out loud.
+ */
+function assertGroup(value: string): string {
+  const match = PARAMETER_GROUPS.find(candidate => candidate.toLowerCase() === value.toLowerCase())
+  if (!match) {
+    throw new Error(
+      `Unknown group '${value}'.${didYouMean(value, PARAMETER_GROUPS)} Groups: ${PARAMETER_GROUPS.join(', ')}. ` +
+      `One call with {"format":"compact"} and no group returns all ${PARAMS.length} parameters.`
+    )
+  }
+  return match
+}
+
 function filteredParameters(group?: string, search?: string): ParamDef[] {
   const normalizedGroup = group?.toLowerCase()
   const normalizedSearch = search?.toLowerCase()
@@ -547,9 +577,10 @@ export function createWebMcpTools(
         const format = assertFormat(value.format)
         if (value.group !== undefined && typeof value.group !== 'string') throw new Error('group must be a string')
         if (value.search !== undefined && typeof value.search !== 'string') throw new Error('search must be a string')
-        const group = value.group as string | undefined
+        const requestedGroup = value.group as string | undefined
         const search = value.search as string | undefined
-        if (group && group.length > MAX_QUERY_LENGTH) throw new Error(`group is limited to ${MAX_QUERY_LENGTH} characters`)
+        if (requestedGroup && requestedGroup.length > MAX_QUERY_LENGTH) throw new Error(`group is limited to ${MAX_QUERY_LENGTH} characters`)
+        const group = requestedGroup ? assertGroup(requestedGroup) : requestedGroup
         if (search && search.length > MAX_QUERY_LENGTH) throw new Error(`search is limited to ${MAX_QUERY_LENGTH} characters`)
         const offset = boundedInteger(value.parameterOffset, 'parameterOffset', 0, 0, PARAMS.length)
         const limit = boundedInteger(value.parameterLimit, 'parameterLimit', format === 'compact' ? COMPACT_PAGE_SIZE : DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
@@ -622,11 +653,11 @@ export function createWebMcpTools(
           format: { type: 'string', enum: ['full', 'compact'] },
           group: {
             type: 'string', maxLength: MAX_QUERY_LENGTH,
-            description: GROUP_PROPERTY_DESCRIPTION
+            description: GROUP_FILTER_DESCRIPTION
           },
           search: {
             type: 'string', maxLength: MAX_QUERY_LENGTH,
-            description: SEARCH_PROPERTY_DESCRIPTION
+            description: SEARCH_FILTER_DESCRIPTION
           },
           offset: {
             type: 'integer', minimum: 0,
@@ -648,7 +679,10 @@ export function createWebMcpTools(
         if (value.search !== undefined && typeof value.search !== 'string') throw new Error('search must be a string')
         if ((value.group as string | undefined)?.length && (value.group as string).length > MAX_QUERY_LENGTH) throw new Error(`group is limited to ${MAX_QUERY_LENGTH} characters`)
         if ((value.search as string | undefined)?.length && (value.search as string).length > MAX_QUERY_LENGTH) throw new Error(`search is limited to ${MAX_QUERY_LENGTH} characters`)
-        const matches = filteredParameters(value.group as string | undefined, value.search as string | undefined)
+        const requestedGroup = value.group as string | undefined
+        const group = requestedGroup ? assertGroup(requestedGroup) : undefined
+        const matches = filteredParameters(group, value.search as string | undefined)
+        const related = group === undefined ? [] : relatedGroups(group)
         const offset = boundedInteger(value.offset, 'offset', 0, 0, PARAMS.length)
         // An explicit limit is bounded by what the schema advertises; only the
         // compact default reaches past it, to hand over the whole space at once.
@@ -683,6 +717,20 @@ export function createWebMcpTools(
         )
         return {
           groups: [...PARAMETER_GROUPS],
+          // Says out loud what a group filter actually narrowed to, and that
+          // the unfiltered compact call would have been one round trip. An
+          // evaluated agent spent five calls, one group at a time, on what
+          // `{ format: 'compact' }` alone returns.
+          ...(group === undefined ? {} : {
+            groupFilter: {
+              group,
+              total: matches.length,
+              ...(related.length === 0 ? {} : { relatedGroups: related }),
+              note: `group "${group}" is ${matches.length} of ${PARAMS.length} parameters` +
+                (related.length === 0 ? '' : `, and ${related.join(', ')} ${related.length === 1 ? 'is a separate group' : 'are separate groups'}`) +
+                `. One call with {"format":"compact"} and no group returns all ${PARAMS.length}.`
+            }
+          }),
           ...(Object.keys(groupNotes).length === 0 ? {} : { groupNotes }),
           parameters: format === 'compact'
             ? {
