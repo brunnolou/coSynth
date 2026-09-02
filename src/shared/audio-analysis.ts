@@ -49,6 +49,8 @@ export interface HarmonicMetrics {
   /**
    * B fitted from `f_n = n·f0·√(1 + B·n²)`. 0 is perfectly harmonic (an organ);
    * a piano string is roughly 1e-4 … 1e-3; stiffer, more bell-like partials are higher.
+   * Measurable to about 2e-2, above which the second partial lands outside the search
+   * window that seeds the fit and B reads far too low.
    */
   inharmonicity: number
 }
@@ -123,6 +125,8 @@ const HARMONIC_COUNT = 12
 /** Partials quieter than this relative to the loudest are not real peaks; they do not constrain B. */
 const HARMONIC_FIT_FLOOR_DB = -60
 const HARMONIC_AMPLITUDE_FLOOR_DB = -120
+/** Half-width of the peak search around each predicted partial, as a fraction of it. */
+const HARMONIC_SEARCH_FRACTION = 0.03
 
 function assertNumberArray(label: string, field: string, values: unknown, expected: number): number[] {
   if (!Array.isArray(values) || values.length !== expected) {
@@ -560,8 +564,9 @@ function measureBands(spectrum: Float64Array, binHz: number, totalPower: number)
 }
 
 /**
- * Locate the first 12 partials by peak-picking ±3 % around n·f0 and fit the stiffness
- * coefficient B of `f_n = n·f0·√(1 + B·n²)`.
+ * Locate the first 12 partials by peak-picking ±3 % around the predicted partial and fit
+ * the stiffness coefficient B of `f_n = n·f0·√(1 + B·n²)`. The prediction carries the B
+ * implied by the partials already found, so the window tracks the series as it stretches.
  *
  * The window is taken at the envelope peak and is as long as the buffer allows (up to
  * 32768 samples), because a decaying note only holds its partials near the onset and
@@ -594,10 +599,17 @@ function analyzeHarmonics(
   const logFloor = Math.log(Math.max(strongest * 1e-12, Number.MIN_VALUE))
   const logMagnitude = (bin: number) => magnitude[bin] > 0 ? Math.max(logFloor, Math.log(magnitude[bin])) : logFloor
   const partials: { frequency: number; amplitude: number }[] = []
+  // B is tracked as partials are found and steers the search for the next one. A fixed
+  // window around n·f0 caps the measurable B at about 4e-4: beyond it the high partials
+  // fall outside, the picked bin sits at the window edge, and because the fit weights by
+  // n² those edge bins drag B to zero - reporting a bell as a perfect harmonic series.
+  let stiffness = 0
+  let fitNumerator = 0
+  let fitDenominator = 0
   for (let n = 1; n <= HARMONIC_COUNT; n++) {
-    const centreBin = n * f0Hz * binsPerHz
-    const low = Math.max(1, Math.floor(centreBin * 0.97))
-    const high = Math.min(half - 1, Math.ceil(centreBin * 1.03))
+    const centreBin = n * f0Hz * Math.sqrt(1 + stiffness * n * n) * binsPerHz
+    const low = Math.max(1, Math.floor(centreBin * (1 - HARMONIC_SEARCH_FRACTION)))
+    const high = Math.min(half - 1, Math.ceil(centreBin * (1 + HARMONIC_SEARCH_FRACTION)))
     if (high < low) {
       partials.push({ frequency: 0, amplitude: 0 })
       continue
@@ -613,10 +625,24 @@ function analyzeHarmonics(
     const denominator = a - 2 * b + c
     const shift = denominator < 0 ? Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / denominator)) : 0
     const amplitude = Math.exp(b - 0.25 * (a - c) * shift)
+    const frequency = (bestBin + shift) * sampleRate / size
     partials.push({
-      frequency: (bestBin + shift) * sampleRate / size,
+      frequency,
       amplitude: Number.isFinite(amplitude) ? amplitude : magnitude[bestBin]
     })
+
+    // Refit B through the origin on everything found so far, so the window for partial
+    // n + 1 already knows how far the series has stretched. Only partials well clear of
+    // the noise steer it; a bin picked out of noise would send the search off the rails.
+    if (n > 1 && amplitude > strongest * 10 ** (HARMONIC_FIT_FLOOR_DB / 20)) {
+      const ratio = frequency / (n * f0Hz)
+      fitNumerator += n * n * (ratio * ratio - 1)
+      fitDenominator += n * n * n * n
+      if (fitDenominator > 0) {
+        const fitted = fitNumerator / fitDenominator
+        if (Number.isFinite(fitted) && fitted > 0) stiffness = fitted
+      }
+    }
   }
 
   const loudest = partials.reduce((best, partial) => Math.max(best, partial.amplitude), 0)

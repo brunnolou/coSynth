@@ -368,6 +368,34 @@ describe('analyzeAudio', () => {
     expect(harmonics!.inharmonicity).toBeLessThan(0.0004 * 1.2)
   })
 
+  it('fits B across the documented range and beyond, not just its bottom half', () => {
+    const sampleRate = 48000
+    // A fixed ±3 % window around n·f0 caps B at about 4e-4: past that the high partials fall
+    // outside it, the picked bin sits at the window edge, and the n²-weighted fit drags B to
+    // zero - so a bell reported as a perfect harmonic series. Measured before:
+    // 1e-3 -> 1.09e-5, 2e-3 -> 2.95e-5, 5e-3 -> -4.7e-6.
+    for (const inharmonicity of [1e-4, 6e-4, 1e-3, 2e-3, 5e-3]) {
+      const { harmonics } = analyzeAudio(
+        [stretchedPartials(220, inharmonicity, sampleRate, 2.5)],
+        sampleRate,
+        { f0Hz: 220 }
+      )
+      expect(harmonics!.inharmonicity).toBeGreaterThan(inharmonicity * 0.9)
+      expect(harmonics!.inharmonicity).toBeLessThan(inharmonicity * 1.1)
+    }
+  })
+
+  it('fits a high B through an attack and an exponential decay', () => {
+    const sampleRate = 48000
+    const { harmonics } = analyzeAudio(
+      [stretchedPartials(440, 0.005, sampleRate, 2.5, { decayT60Seconds: 3 })],
+      sampleRate,
+      { f0Hz: 440 }
+    )
+    expect(harmonics!.inharmonicity).toBeGreaterThan(0.005 * 0.9)
+    expect(harmonics!.inharmonicity).toBeLessThan(0.005 * 1.1)
+  })
+
   it('fits the same B through an attack and an exponential decay', () => {
     const sampleRate = 48000
     const { harmonics } = analyzeAudio(
