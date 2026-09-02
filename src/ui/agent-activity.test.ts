@@ -175,7 +175,7 @@ it('replaces the checkbox with a Bot toggle and allows empty activity review', (
   expect(review.disabled).toBe(false)
   review.click()
   expect((panel.root.querySelector('[data-guide-id="dialog.agent-changes"]') as HTMLDialogElement).open).toBe(true)
-  expect(panel.root.querySelector('.agent-feed')?.textContent).toBe('15 tools ready · Start audio to unlock 2')
+  expect(panel.root.querySelector('.agent-feed')?.textContent).toBe('15 tools ready · Start audio to unlock 1')
 })
 
 it('uses a 2s minimum activity burst, a 600ms settle, and BPM playback priority', async () => {

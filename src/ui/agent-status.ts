@@ -32,7 +32,7 @@ export function readinessSentence(state: AgentActivitySnapshot): string {
   if (state.toolAvailability === 'checking') return 'Checking AI tools…'
   const ready = `${state.readyTools} tools ready`
   if (state.registrationErrors.length) return `${ready} · ${state.registrationErrors.length} registration failures`
-  return `${ready}${state.audioToolsLocked ? ' · Start audio to unlock 2' : ''}`
+  return `${ready}${state.audioToolsLocked ? ' · Start audio to unlock 1' : ''}`
 }
 
 /** Status presentation is separate from tool ownership, history and control markers. */

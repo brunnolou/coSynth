@@ -42,17 +42,20 @@ describe('registerWebMcpTools', () => {
     expect(calls[0].signal?.aborted).toBe(true)
   })
 
-  it('can expose safe tools before audio and audio tools only after startup', async () => {
+  it('exposes render_audio before audio starts and gates only play_notes', async () => {
     const names: string[] = []
     const modelContext = context(tool => { names.push(tool.name) })
     await registerWebMcpTools(engine, modelContext, { audioTools: 'exclude' }).ready
+    // render_audio defaults to an offline render, which needs no user gesture.
+    // Withholding it until Start would hide the one tool an agent needs to
+    // hear what it is designing.
+    expect(names).toContain('render_audio')
     expect(names).not.toContain('play_notes')
-    expect(names).not.toContain('render_audio')
-    expect(names).toHaveLength(10)
+    expect(names).toHaveLength(11)
 
     names.length = 0
     await registerWebMcpTools(engine, modelContext, { audioTools: 'only' }).ready
-    expect(names).toEqual(['play_notes', 'render_audio'])
+    expect(names).toEqual(['play_notes'])
   })
 
   it('returns actionable expected errors while preserving cancellation semantics', async () => {
@@ -103,7 +106,7 @@ describe('registerWebMcpTools', () => {
     const guide = { show: vi.fn(() => ({ shown: true, stepCount: 1, warnings: [] })), listTargets: vi.fn(() => ({ items: [], total: 0, offset: 0, limit: 5 })) }
     const registration = registerWebMcpTools(engine, context(tool => { calls.push(tool) }), { audioTools: 'exclude', guide })
     await registration.ready
-    expect(registration.registeredCount).toBe(12)
+    expect(registration.registeredCount).toBe(13)
     const show = calls.find(t => t.name === 'show_ui_guide')!
     const get = calls.find(t => t.name === 'get_ui_targets')!
     expect(show.annotations?.readOnlyHint).toBe(false)
