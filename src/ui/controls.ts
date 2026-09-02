@@ -83,7 +83,16 @@ export function syncGating(syncOn: boolean): SyncGating {
   return { free: syncOn, division: !syncOn }
 }
 
-/** Mute a control and take it out of pointer, keyboard and AT reach. Never writes the param. */
+/**
+ * Mute a control and stop its value from being edited. Never writes the param.
+ *
+ * How far that reaches depends on the control. A `<select>` genuinely leaves pointer,
+ * keyboard and AT reach, because `disabled` lands on it. A knob is a role-less `<div>`
+ * that binds pointer events only, so it has no keyboard or AT reach to lose and its
+ * `aria-disabled` is not announced; there, gating is purely a pointer affair --
+ * `.knob.is-gated` (style.css) makes the canvas stack inert while leaving the root
+ * live, so an existing modulation route can still be inspected and removed.
+ */
 export function setControlGated(target: HTMLElement, gated: boolean): void {
   target.classList.toggle('is-gated', gated)
   target.setAttribute('aria-disabled', String(gated))

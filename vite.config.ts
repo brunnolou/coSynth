@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   // The DSP worklet is imported with `?worker&url` so Vite bundles it as a
@@ -12,6 +12,9 @@ export default defineConfig({
   // clients cannot reach it either. Proxying its two endpoints keeps them
   // same-origin with the page and lets Node do the IPv6 hop. Point the widget
   // at ws://localhost:5173 instead of ws://localhost:4797 to use this.
+  // Tests assert on style.css (see ui/knob.test.ts: gating must not take the whole
+  // knob root out of pointer reach). Vitest blanks CSS imports unless told otherwise.
+  test: { css: { include: [/style\.css/] } },
   server: {
     port: 5173,
     proxy: {

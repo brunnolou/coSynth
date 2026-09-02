@@ -44,8 +44,14 @@ const BEAT_DIVISIONS = ['1/1', '1/2', '1/2T', '1/4.', '1/4', '1/4T', '1/8.', '1/
 /** Whole note multiples 2/1..31/1 (N/1 = N whole notes = 4N beats), for slow LFO sweeps. */
 const SLOW_DIVISIONS = Array.from({ length: 30 }, (_, i) => `${i + 2}/1`)
 export const SYNC_DIVISIONS = [...BEAT_DIVISIONS, ...SLOW_DIVISIONS]
-// The stereo delay line only buffers 2.5 s, so a multi-bar division would be
-// silently clamped. The delay keeps the fast set instead of offering a lie.
+// The delay keeps the fast set. That is damage control, not a guarantee: a synced
+// delay asks for divisionToBeats(div) * 60 / bpm seconds (worklet/processor.ts) and
+// the delay line clamps at sr * 2.4 (worklet/effects.ts), so with master.bpm going
+// down to 20 the fast set is ALREADY silently clamped -- `1/1` overruns 2.4 s below
+// 100 BPM, `1/2` below 50, `1/4` below 25, and the echo drifts off the beat. Adding
+// the slow set would widen an existing hole rather than open a new one (`2/1` clamps
+// below 200 BPM), so it stays out. The real fix -- a longer buffer or a BPM-aware
+// menu -- is not done here.
 export const DELAY_DIVISIONS = BEAT_DIVISIONS
 /** SYNC_DIVISIONS indices in menu order: slowest cycle first. */
 export const SYNC_DIVISION_ORDER = SYNC_DIVISIONS

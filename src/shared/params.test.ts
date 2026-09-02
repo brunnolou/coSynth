@@ -111,12 +111,23 @@ describe('sync divisions', () => {
     expect([...SYNC_DIVISION_ORDER].sort((a, b) => a - b)).toEqual(SYNC_DIVISIONS.map((_, i) => i))
   })
 
-  it('keeps the delay on the fast set the 2.5 s delay line can reach', () => {
+  it('keeps the delay on the fast set, which limits but does not remove the buffer clamp', () => {
     expect(DELAY_DIVISIONS).toEqual(ORIGINAL)
     const def = paramDef('delay.division')
     expect(def.choices).toBe(DELAY_DIVISIONS)
     expect(def.max).toBe(ORIGINAL.length - 1)
     expect(def.def).toBe(7)
+
+    // Not a clamp-free set: worklet/effects.ts caps the delay line at 2.4 s while
+    // worklet/processor.ts asks for divisionToBeats(div) * 60 / bpm, so the fast set
+    // already overruns the buffer at the low end of master.bpm (20..300). Excluding
+    // the slow set narrows that hole; it does not close it.
+    const seconds = (name: string, bpm: number) => divisionToBeats(SYNC_DIVISIONS.indexOf(name)) * 60 / bpm
+    expect(seconds('1/1', 90)).toBeGreaterThan(2.4)   // already clamped today
+    expect(seconds('1/1', 100)).toBeCloseTo(2.4, 10)  // exactly at the cap
+    expect(seconds('1/2', 40)).toBeGreaterThan(2.4)
+    expect(seconds('2/1', 190)).toBeGreaterThan(2.4)  // why the slow set stays out
+    expect(seconds('1/8', 20)).toBeLessThan(2.4)      // the default is safe everywhere
   })
 
   it('offers the full set to the LFOs', () => {

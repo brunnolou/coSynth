@@ -389,12 +389,20 @@ main {
   opacity: 0.48;
 }
 /* A control the current mode bypasses (rate while synced, division while free):
-   muted and inert for pointer and keyboard, value left untouched. */
+   muted, with its value no longer editable by pointer. The value itself is never
+   written, and nothing but value editing is taken away. */
 .is-gated {
   opacity: 0.35;
   pointer-events: none;
   transition: opacity 160ms ease;
 }
+/* A gated knob loses only its value-control surface (drag / wheel / double-click).
+   Its root stays live so modulation stays reachable: right-click still opens the
+   mod menu to inspect or remove a route, and the knob is still a drag-to-assign
+   drop target. Gating must never strand an existing route on lfoN.rate or
+   delay.time -- the two parameters people modulate most. */
+.knob.is-gated { pointer-events: auto; }
+.knob.is-gated .knob-canvases { pointer-events: none; }
 
 .panel-head {
   display: flex;
