@@ -274,6 +274,36 @@ describe('analyzeAudio', () => {
     expect(loudness[2] - loudness[1]).toBeCloseTo(6.02, 1)
   })
 
+  it('moves loudnessDb by exactly the gain applied to a decaying note', () => {
+    const sampleRate = 48000
+    // An absolute -60 dBFS gate drops windows as the buffer is attenuated and inflates the
+    // mean of the rest, so this gained only 5.4 dB for a real 6 dB.
+    const note = (gain: number) => {
+      const decay = Math.log(1000)
+      return analyzeAudio([Float32Array.from({ length: sampleRate * 3 }, (_, i) => {
+        const t = i / sampleRate
+        return gain * 0.8 * Math.exp(-decay * t) * Math.sin(2 * Math.PI * 440 * t)
+      })], sampleRate).loudnessDb
+    }
+    expect(note(1) - note(0.5)).toBeCloseTo(6.02, 2)
+    expect(note(0.5) - note(0.25)).toBeCloseTo(6.02, 2)
+  })
+
+  it('does not let a long quiet tail invert loudnessDb against gain', () => {
+    const sampleRate = 48000
+    // 0.2 s of body, then 4 s at an amplitude that straddles the old absolute gate. At gain
+    // 0.5 the tail fell below -60 dBFS and was dropped; at gain 1.0 it passed and dragged the
+    // mean down, so doubling the amplitude *lowered* reported loudness by 7 dB.
+    const bodyPlusTail = (gain: number) =>
+      analyzeAudio([Float32Array.from({ length: Math.round(sampleRate * 4.2) }, (_, i) => {
+        const t = i / sampleRate
+        return gain * (t < 0.2 ? 0.5 : 0.0016) * Math.sin(2 * Math.PI * 440 * t)
+      })], sampleRate).loudnessDb
+    expect(bodyPlusTail(1) - bodyPlusTail(0.5)).toBeCloseTo(6.02, 2)
+    // The tail is 50 dB down; the relative gate must exclude it at either gain.
+    expect(bodyPlusTail(1)).toBeGreaterThan(-11)
+  })
+
   it('reports octave bands that fall steadily above the fundamental for a 220 Hz sawtooth', () => {
     const sampleRate = 48000
     const { bandsDb } = analyzeAudio([sawtooth(220, sampleRate, 1)], sampleRate)

@@ -21,7 +21,11 @@ export interface AudioMetrics {
   sustainDb: number
   /** 64 evenly spaced envelope samples, dB relative to the peak, rounded to 0.1. */
   envelopeDb: number[]
-  /** Gated RMS: envelope windows below -60 dBFS are dropped, so reverb tails and silence do not dilute it. */
+  /**
+   * Gated RMS: envelope windows more than 10 dB below the ungated level are dropped, so
+   * reverb tails and silence do not dilute it. The gate is relative, as in EBU R128, so a
+   * gain change moves this by exactly that gain instead of also changing which windows count.
+   */
   loudnessDb: number
   /**
    * Ten octave-band levels centred 31.25 Hz, 62.5 Hz … 16 kHz, in dB relative to the
@@ -297,8 +301,14 @@ const DECAY_FIT_END_DB = -25
  * from a decaying one.
  */
 const DECAY_CURVATURE_LIMIT = 4
-/** Envelope windows quieter than this are excluded from the gated loudness figure. */
-const LOUDNESS_GATE = 10 ** (-60 / 20)
+/**
+ * Loudness gating, EBU R128 style. The first pass drops windows that are silence relative
+ * to the envelope peak; the second drops windows this far below the ungated level. Both
+ * thresholds scale with the signal, so the measurement set does not change when the whole
+ * buffer is attenuated - which is what makes the figure monotonic in gain.
+ */
+const LOUDNESS_SILENCE_FLOOR_DB = -100
+const LOUDNESS_RELATIVE_GATE_DB = -10
 const ENVELOPE_FLOOR_DB = -100
 
 interface Envelope {
@@ -690,14 +700,22 @@ export function analyzeAudio(
       return roundDb(relativeToPeakDb(envelopeValues[index], envelopePeak, ENVELOPE_FLOOR_DB))
     })
 
-    let gatedPower = 0
-    let gatedCount = 0
-    for (const value of envelopeValues) {
-      if (value < LOUDNESS_GATE) continue
-      gatedPower += value * value
-      gatedCount++
+    const silenceFloor = envelopePeak * 10 ** (LOUDNESS_SILENCE_FLOOR_DB / 20)
+    const meanPower = (threshold: number): number => {
+      let power = 0
+      let windows = 0
+      for (const value of envelopeValues) {
+        if (value < threshold) continue
+        power += value * value
+        windows++
+      }
+      return windows > 0 ? power / windows : 0
     }
-    if (gatedCount > 0) loudnessDb = toDb(Math.sqrt(gatedPower / gatedCount))
+    const ungated = meanPower(silenceFloor)
+    if (ungated > 0) {
+      const relativeGate = Math.sqrt(ungated) * 10 ** (LOUDNESS_RELATIVE_GATE_DB / 20)
+      loudnessDb = toDb(Math.sqrt(meanPower(Math.max(silenceFloor, relativeGate))))
+    }
   }
 
   let fftSize = 1
