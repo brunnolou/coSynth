@@ -1,7 +1,7 @@
 import type { RecordedAudio, SynthEngine } from '../audio/engine'
 import { agentActivityFor } from './activity'
 import {
-  PARAMS, defaultNorm, formatValue, normToValue, paramIndex, valueToNorm,
+  PARAMS, PARAM_GROUP_NOTES, defaultNorm, formatValue, normToValue, paramIndex, valueToNorm,
   type ParamDef
 } from '../shared/params'
 import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type ModSlotState, type ModSourceDef } from '../shared/messages'
@@ -534,7 +534,7 @@ export function createWebMcpTools(
     },
     {
       name: 'get_parameter_schema',
-      description: 'Discover parameter units, ranges, defaults, curves, choices, and modulation capabilities. Call once with `format: "compact"` to see every parameter as one line each (`filter1.cutoff Hz 20..20000 exp =8000 mod`); use group/search/offset for detail in the full format. Add `sourceLimit` to the same call to list every modulation source id `set_modulation` accepts.',
+      description: 'Discover parameter units, ranges, defaults, curves, choices, and modulation capabilities. Call once with `format: "compact"` to see every parameter as one line each (`filter1.cutoff Hz 20..20000 exp =8000 mod`); use group/search/offset for detail in the full format. Add `sourceLimit` to the same call to list every modulation source id `set_modulation` accepts. env1 is the amplitude envelope (VCA) and the only hardwired modulator: env2-env6 and lfo1-lfo8 do nothing until routed with `set_modulation`. `groupNotes` repeats such facts for the groups on the page.',
       inputSchema: {
         type: 'object', properties: {
           format: { type: 'string', enum: ['full', 'compact'] },
@@ -581,8 +581,15 @@ export function createWebMcpTools(
         const nextSourceOffset = sourceOffset + sources.length < MOD_SOURCES.length
           ? { nextOffset: sourceOffset + sources.length }
           : {}
+        // Only the notes for groups actually on this page, so the default
+        // response stays inside the discovery output budget.
+        const groupNotes = Object.fromEntries(
+          [...new Set(page.map(def => def.group))]
+            .flatMap(group => PARAM_GROUP_NOTES[group] ? [[group, PARAM_GROUP_NOTES[group]]] : [])
+        )
         return {
           groups: [...PARAMETER_GROUPS],
+          ...(Object.keys(groupNotes).length === 0 ? {} : { groupNotes }),
           parameters: format === 'compact'
             ? {
               items: page.map(compactParameter), total: matches.length, format: 'compact' as const,

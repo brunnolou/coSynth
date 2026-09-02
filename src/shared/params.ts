@@ -153,6 +153,17 @@ p({ id: 'dist.mix', name: 'Mix', group: 'dist', min: 0, max: 1, def: 1, moddable
 p({ id: 'dist.bits', name: 'Bits', group: 'dist', min: 1, max: 16, def: 8, moddable: true, fmt: v => `${v.toFixed(1)} bit` })
 p({ id: 'dist.downsample', name: 'Rate', group: 'dist', min: 1, max: 64, def: 1, curve: 'exp', moddable: true, unit: 'x', fmt: v => `÷${v.toFixed(1)}` })
 
+/**
+ * Facts about a group that its parameter definitions cannot express, surfaced
+ * by `get_parameter_schema`. Only hardwired routing belongs here: env1 is the
+ * VCA (`voice.ts` multiplies the voice by `sources[SRC_ENV0]` and takes voice
+ * lifetime from it), while env2..env6 and every LFO reach the sound only
+ * through the mod matrix, so they get no note.
+ */
+export const PARAM_GROUP_NOTES: Readonly<Record<string, string>> = {
+  env1: 'env1 is the amplitude envelope (VCA), hardwired to voice level and voice lifetime: a note stops sounding when env1 finishes its release. env2..env6 and lfo1..lfo8 have no hardwired destination and do nothing until routed with set_modulation.'
+}
+
 // ---------------------------------------------------------------- envelopes (env1 = amp)
 for (let e = 1; e <= 6; e++) {
   const g = `env${e}`

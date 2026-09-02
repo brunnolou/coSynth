@@ -323,6 +323,19 @@ describe('state and parameter tools', () => {
     await expect(execute('get_parameter_schema', { nope: true })).rejects.toThrow(/unexpected/i)
   })
 
+  it('says which envelope drives amplitude', async () => {
+    const { execute, byName } = setup()
+    // env1..env6 are otherwise presented identically, and both evaluating
+    // agents had to infer the VCA from env1's defaults alone.
+    expect(byName.get('get_parameter_schema')!.description).toMatch(/env1[^.]*amplitude/i)
+    const env1 = await execute('get_parameter_schema', { group: 'env1' })
+    expect(env1.groupNotes.env1).toMatch(/amplitude/i)
+    const env2 = await execute('get_parameter_schema', { group: 'env2' })
+    // Only env1 is hardwired; nothing must be claimed for the others.
+    expect(env2.groupNotes).toBeUndefined()
+    expect(JSON.stringify(await execute('get_parameter_schema'))).not.toContain('groupNotes')
+  })
+
   it('lists modulation sources from a bare sourceLimit and in compact format', async () => {
     const { execute } = setup()
     // A limit without an offset used to return nothing at all, which cost two
