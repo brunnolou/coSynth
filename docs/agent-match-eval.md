@@ -101,6 +101,52 @@ One extra rule specific to this eval:
   meaningless across different targets. If a second target is wanted, it is a
   second column, not a replacement.
 
+## Runs
+
+| | run 1 | run 2 |
+|---|---|---|
+| Total calls / failed | 87 / 0 | 78 / 7 |
+| Comparisons | 27 | 20 |
+| Similarity, first -> best | 0.520 -> 0.847 | 0.513 -> 0.837 |
+| Comparisons spent after the peak | **13** | **3** |
+| Returned to the best patch | no | **yes**, via `navigate_history` restore |
+| Saved which patch | the final (0.819) | **the best** (`ref-match-best-0.8368`) |
+
+Both runs found the loop without the prompt naming a single tool, which is the
+thing this eval was built to check: the field evidence that started this work
+recorded `analyze_reference_audio` and `compare_audio` as never used.
+
+Run 1 showed the loop converging and then wasting half its calls: it peaked at
+comparison 14 and spent thirteen more oscillating without beating it, because
+`compare_audio` returned only the current figure. Remembering 27 numbers across
+87 calls is not a reasonable thing to ask of the caller. `compare_audio` now
+returns a `progress` block naming the best, the delta from it, how many
+comparisons have passed since, and the history entry that produced it.
+
+Run 2 is that fix measured: three comparisons after the peak instead of
+thirteen, then `get_history`, a `navigate_history` restore of the best render,
+and a `save_preset` whose name carries the best score. Nothing in the prompt
+mentions `navigate_history`.
+
+Run 2 also exposed a bug no unit test could reach: `render_audio` failed six
+times with `Unable to load a worklet's module` and never recovered, leaving the
+agent unable to render at all — and the error's own advice pointed at
+`mode: "realtime"`, which loads the same module and additionally needs a
+gesture. The cause was not resource exhaustion (400 retained contexts and 200
+consecutive renders both pass): `addModule()` is a network fetch, the assets are
+served `no-cache`, and one scratch context per render meant **one HTTP round
+trip per render**. Every offline render was a live dependency on the page's own
+asset server still answering. Killing that server mid-loop reproduces the
+message verbatim, six times, with no recovery. Both scripts are now fetched once
+and reused from memory, which also took mean render time from ~230 ms to
+~179 ms.
+
+A caveat on run 2's evidence: the harness and the preview server were being
+restarted around that run, so the server may have died from the orchestration
+rather than from the workload. The bug is real either way — a render should not
+need the network every time — but the run is not clean proof of spontaneous
+failure.
+
 ## Results
 
 | | C r1 | X r1 |
