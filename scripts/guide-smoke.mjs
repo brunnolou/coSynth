@@ -200,9 +200,19 @@ try {
   assert.ok(closeBounds, 'A text-only step must offer a close button')
   assert.ok(closeBounds.x >= 0 && closeBounds.x + closeBounds.width <= 391, 'The close button must stay on screen')
   assert.ok(closeBounds.y >= 0 && closeBounds.y + closeBounds.height <= 844, 'The close button must stay on screen')
+  // The question here is whether anything covers the close button, so the hit
+  // element only has to be the button or a descendant of it. Comparing
+  // `className` to the exact class instead required the point to land on the
+  // button element itself: Driver.js renders the X as an inline SVG in other
+  // versions, and an `<svg>`'s `className` is an SVGAnimatedString that equals
+  // no string at all, so the assertion would fail on a perfectly reachable
+  // control.
   assert.equal(
-    await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.className, [closeBounds.x + closeBounds.width / 2, closeBounds.y + closeBounds.height / 2]),
-    'driver-popover-close-btn',
+    await page.evaluate(
+      ([x, y]) => Boolean(document.elementFromPoint(x, y)?.closest('.driver-popover-close-btn')),
+      [closeBounds.x + closeBounds.width / 2, closeBounds.y + closeBounds.height / 2]
+    ),
+    true,
     'Nothing may cover the close button'
   )
   await page.keyboard.press('Escape')
