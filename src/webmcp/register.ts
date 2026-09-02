@@ -15,16 +15,16 @@ export interface WebMcpRegistration {
   dispose(): void
 }
 
+// Every tool registers at page load, so `GET /tools` returns the same set
+// before and after the human's Start gesture. Splitting the set used to hide
+// play_notes until Start; an agent that listed once saw no playback tool,
+// concluded there was none, and drove the DOM keyboard instead. play_notes
+// still needs the gesture to run - it says so in its description, and its
+// error names render_audio, which renders offline with no gesture.
 export interface WebMcpRegistrationOptions {
-  audioTools?: 'include' | 'exclude' | 'only'
   guide?: GuideService
   services?: AppHistoryServices
 }
-
-// Only play_notes needs the human's Start gesture: it drives the live graph.
-// render_audio defaults to an offline render, which needs no gesture, so it
-// registers at page load - an agent that cannot see the tool cannot use it.
-const AUDIO_TOOL_NAMES = new Set(['play_notes'])
 
 function registeredTool(tool: WebMCP.ModelContextTool, activity: AgentActivityStore, services?: AppHistoryServices): WebMCP.ModelContextTool {
   const execute = tool.execute
@@ -71,7 +71,6 @@ export function registerWebMcpTools(
     return { ready: Promise.resolve(), registeredCount: 0, available: false, pending: false, errors: [], dispose: () => controller.abort() }
   }
 
-  const audioTools = options.audioTools ?? 'include'
   const activity = agentActivityFor(engine)
   let registeredCount = 0
   let pending = true
@@ -88,7 +87,6 @@ export function registerWebMcpTools(
     onComparison: (comparison, entryId) => services.history.attachComparison(comparison, entryId)
   } : {}), ...(options.guide ? createGuideTools(options.guide, controller.signal) : []),
     ...(services ? createHistoryTools(services, controller.signal) : [])]
-    .filter(tool => audioTools === 'include' || (audioTools === 'only') === AUDIO_TOOL_NAMES.has(tool.name))
     .map(tool => registeredTool(tool, activity, services))
   const registrations = tools.map(tool => {
     try {

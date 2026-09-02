@@ -133,6 +133,30 @@ describe('WebMCP tool metadata', () => {
     })
     expect((tools[7].inputSchema as any).properties.mimeType.pattern).toBe('^[aA][uU][dD][iI][oO]/')
   })
+
+  it('keeps the whole tool listing small enough to survive a client that truncates it', () => {
+    const { tools } = setup()
+    const listing = tools.map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }))
+    const bytes = (value: string) => new TextEncoder().encode(value).length
+    // In the discoverability eval Codex truncated the 17-tool listing and lost
+    // `play_notes` entirely, then drove the page through <select> elements
+    // instead. These 12 tools were 10751 B of that listing (5019 B of prose,
+    // 4958 B of schema) after four rounds of per-tool clarity fixes.
+    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(9900)
+    // The prose half — what a truncating client renders first — must stay well
+    // under what those four rounds had grown it to.
+    const prose = listing.reduce((total, tool) => total + bytes(tool.description), 0)
+    expect(prose).toBeLessThanOrEqual(3400)
+    for (const tool of listing) {
+      // No single tool may dominate the read: render_audio's description alone
+      // was 1273 B, a tenth of the whole listing.
+      expect(bytes(tool.description), `${tool.name} description`).toBeLessThanOrEqual(600)
+      // Essential sentence first, so a truncated read still gets the useful
+      // half: nothing may open with a 200-byte run-on.
+      const lead = tool.description.split(/(?<=\.)\s/)[0] ?? ''
+      expect(bytes(lead), `${tool.name} lead sentence`).toBeLessThanOrEqual(200)
+    }
+  })
 })
 
 describe('validation errors that carry the schema', () => {
@@ -253,6 +277,40 @@ describe('single-round-trip discovery', () => {
     expect(state.properties.parameterLimit.description).toMatch(/compact/i)
     expect(state.properties.parameterLimit.description).toMatch(/omit/i)
     expect(state.properties.parameterOffset.description).toMatch(/compact/i)
+  })
+
+  it('makes "one unfiltered compact call" impossible to miss at the point an agent filters', async () => {
+    const { byName, execute } = setup()
+    // An evaluated agent made FIVE get_parameter_schema calls -
+    // {format:'compact', group:'Filter'}, then filter1, env1, osc1, env2 -
+    // where one unfiltered compact call returns all 224. The `group` and
+    // `search` property descriptions are where it decides to filter.
+    const schema = byName.get('get_parameter_schema')!.inputSchema as any
+    for (const property of ['group', 'search']) {
+      expect(schema.properties[property].description, property).toMatch(/omit/i)
+      expect(schema.properties[property].description, property).toContain(String(PARAMS.length))
+      expect(schema.properties[property].description, property).toMatch(/one call/i)
+    }
+
+    // `group: 'Filter'` with a capital F matches the `filter` routing group
+    // case-insensitively: one parameter, not the filter section the agent
+    // meant. That answer must be obvious rather than a silent near-empty page.
+    const filter = await execute('get_parameter_schema', { format: 'compact', group: 'Filter' })
+    expect(filter.parameters.total).toBe(1)
+    expect(filter.groupFilter.group).toBe('filter')
+    expect(filter.groupFilter.relatedGroups).toEqual(['filter1', 'filter2'])
+    expect(filter.groupFilter.note).toContain(String(PARAMS.length))
+    expect(filter.groupFilter.note).toMatch(/one call/i)
+    // A group that matches everything it should carries no misleading note.
+    const filter1 = await execute('get_parameter_schema', { group: 'FILTER1' })
+    expect(filter1.groupFilter).toMatchObject({ group: 'filter1' })
+    expect(filter1.groupFilter).not.toHaveProperty('relatedGroups')
+
+    // An unknown group is an error that names the groups, not an empty page.
+    for (const tool of ['get_parameter_schema', 'get_synth_state']) {
+      await expect(execute(tool, { group: 'Fliter' }), tool).rejects.toThrow(/unknown group/i)
+      await expect(execute(tool, { group: 'Fliter' }), tool).rejects.toThrow(/filter1/)
+    }
   })
 
   it('lists only non-default parameters when synth state is compact', async () => {
@@ -387,25 +445,38 @@ describe('state and parameter tools', () => {
   })
 
   it('says decayT60Ms is measured from the rendered tail, not read back from env1.decay', async () => {
-    const { byName } = setup()
+    vi.useFakeTimers()
+    const { byName, execute } = setup()
     const description = byName.get('render_audio')!.description
+    const schema = byName.get('render_audio')!.inputSchema as any
     // An agent read decayT60Ms as a readback of env1.decay, then spent a
-    // render discovering the note's own length moves it.
-    expect(description).toContain('decayT60Ms')
-    expect(description).toMatch(/decayT60Ms[^.]*(tail|rendered)/i)
-    expect(description).toContain('env1.release')
-    expect(description).toMatch(/null/i)
-    // The sentences earlier findings put here must survive.
-    expect(description).toContain('`peakDb` is an instantaneous peak')
-    expect(description).toContain('mode: "realtime"')
+    // render discovering the note's own length moves it. The sentence now
+    // travels with the number, in the response's `metricNotes`, because in the
+    // description it was a tenth of the whole tool listing.
+    const rendering = execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 })
+    await vi.advanceTimersByTimeAsync(30)
+    const notes = (await rendering).metricNotes
+    expect(notes.decayT60Ms).toMatch(/decayT60Ms|tail/i)
+    expect(notes.decayT60Ms).toMatch(/tail|rendered/i)
+    expect(notes.decayT60Ms).toContain('env1.decay')
+    expect(notes.decayT60Ms).toContain('env1.release')
+    expect(notes.decayT60Ms).toMatch(/null/i)
+    // The facts earlier findings bought must survive, each where a client reads
+    // it: the response for how to read a metric, the schema for how to call.
+    expect(notes.peakDb).toContain('instantaneous peak')
+    expect(schema.properties.mode.description).toContain('"realtime"')
+    expect(schema.properties.mode.description).toContain('renderModeFallback')
     expect(description).toContain('metrics.harmonics')
-    expect(description).toContain('renderModeFallback')
+    expect(description).toMatch(/metricNotes/)
   })
 
-  it('names the valid modulation sources in the set_modulation description', async () => {
+  it('names the valid modulation sources on the set_modulation source property', async () => {
     const { byName } = setup()
-    const description = byName.get('set_modulation')!.description
-    for (const source of MOD_SOURCES) expect(description).toContain(source.id)
+    // The 24-id vocabulary an agent guessed twice in round 1 now sits on the
+    // property it fills in rather than in the prose, which a truncating client
+    // reads first and which had grown past what that client would show.
+    const schema = byName.get('set_modulation')!.inputSchema as any
+    for (const source of MOD_SOURCES) expect(schema.properties.source.description).toContain(source.id)
   })
 
   it('returns modulation routes by default, as get_synth_state promises', async () => {
@@ -702,7 +773,10 @@ describe('note tools', () => {
 
   it('requires started audio and bounds the sequence', async () => {
     const first = setup(); first.engine.running = false
-    await expect(first.execute('play_notes', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }] })).rejects.toThrow(/start audio/i)
+    // play_notes is now registered at page load, so an agent meets this error
+    // rather than an absent tool. It has to name the thing to do instead.
+    await expect(first.execute('play_notes', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }] }))
+      .rejects.toThrow(/start audio.*render_audio/is)
     await expect(setup().execute('play_notes', { notes: [{ midi: 60, velocity: 1, start: 30, duration: 1 }] })).rejects.toThrow(/30 seconds/i)
     await expect(setup().execute('play_notes', { notes: Array.from({ length: 129 }, () => ({ midi: 60, velocity: 1, start: 0, duration: 1 })) })).rejects.toThrow(/128/i)
   })
@@ -764,12 +838,21 @@ describe('render and analysis tools', () => {
     await expect(execute('analyze_audio', { source: 'nope' })).rejects.toThrow(/source/i)
   })
 
-  it('documents the reference workflow as ordered steps and peakDb as instantaneous', () => {
-    const { byName } = setup()
+  it('documents the reference workflow as ordered steps and peakDb as instantaneous', async () => {
+    vi.useFakeTimers()
+    const { byName, execute } = setup()
     expect(byName.get('analyze_reference_audio')!.description).toMatch(/^Step 1 /)
     expect(byName.get('compare_audio')!.description).toMatch(/^Step 2/)
+    // Both tools that report peakDb still say it is a peak — now in the
+    // `metricNotes` that ship with the number instead of in the tool listing.
+    const rendering = execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 })
+    await vi.advanceTimersByTimeAsync(30)
+    await rendering
     for (const name of ['render_audio', 'analyze_audio']) {
-      expect(byName.get(name)!.description).toContain('instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels')
+      const again = name === 'render_audio' ? execute(name, { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 }) : execute(name)
+      await vi.advanceTimersByTimeAsync(30)
+      const result = await again
+      expect(result.metricNotes.peakDb, name).toContain('instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels')
     }
     expect(byName.get('play_notes')!.description).toContain('{"notes":[{"midi":60,"velocity":0.8,"start":0,"duration":0.5}]}')
     expect(byName.get('update_parameters')!.description).toContain('{"id":"filter1.cutoff","value":1200}')
@@ -851,6 +934,29 @@ describe('render and analysis tools', () => {
     })).rejects.toThrow(/mimeType.*conflict/i)
   })
 
+  it('refuses to score a reference against a silent scope instead of returning a baseline-looking number', async () => {
+    const { engine, execute } = setup()
+    // Before the audio gesture the scope is guaranteed digital silence. An
+    // agent following the descriptions' own "Step 1 ... Step 2" ordering used
+    // to get ok with similarity 0.209 against it — the only tells were
+    // `candidate.source === "scope"` and a peakDb similarity of exactly 0.
+    engine.running = false
+    engine.scopeL = new Float32Array(256)
+    engine.scopeR = new Float32Array(256)
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const rejection = expect(execute('compare_audio')).rejects
+    await rejection.toThrow(/silent/i)
+    await rejection.toThrow(/render_audio/)
+    // Explicitly asking for the silent scope still works: -160 dB is legible.
+    await expect(execute('analyze_audio', { source: 'scope' })).resolves.toMatchObject({ source: 'scope' })
+
+    // The documented purpose of the fallback is untouched: a human IS playing,
+    // so the scope carries real audio and the comparison is meaningful.
+    const playing = setup()
+    await playing.execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    await expect(playing.execute('compare_audio')).resolves.toMatchObject({ candidate: { source: 'scope' } })
+  })
+
   it('requires a reference then compares against exactly the analyze_audio scope candidate', async () => {
     const { execute } = setup()
     await expect(execute('compare_audio')).rejects.toThrow(/analyze_reference_audio.*first/i)
@@ -867,6 +973,109 @@ describe('render and analysis tools', () => {
       'peakDb', 'rmsDb', 'clippingCount', 'dcOffset',
       'spectralCentroidHz', 'attackMs', 'stereoWidth'
     ]))
+  })
+
+  it('carries the session best so a peak that has passed is visible in one response', async () => {
+    const { engine, execute } = setup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const compareAt = async (amplitude: number) => {
+      engine.scopeL = Float32Array.from([0, amplitude, -amplitude, 0])
+      engine.scopeR = engine.scopeL
+      return await execute('compare_audio')
+    }
+    // The eval trajectory in miniature: climb toward the reference's own
+    // amplitude, peak, then walk away from it and never get back. The real run
+    // peaked at 0.847 on comparison 14, made 13 more comparisons that never
+    // beat it, and saved the final 0.819 because `compare_audio` only ever
+    // returned the current figure.
+    const results = []
+    for (const amplitude of [0.05, 0.15, 0.3, 0.5, 0.25, 0.18, 0.12, 0.09, 0.07]) results.push(await compareAt(amplitude))
+    const similarity = results.map(result => result.comparison.similarity)
+    const peak = 3
+    // Sanity: the simulated trajectory really does climb, peak, then decline.
+    for (let index = 1; index <= peak; index++) expect(similarity[index]).toBeGreaterThan(similarity[index - 1])
+    for (let index = peak + 1; index < similarity.length; index++) expect(similarity[index]).toBeLessThan(similarity[index - 1])
+
+    expect(results.map(result => result.progress.comparisonNumber)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    expect(results.map(result => result.progress.isBest)).toEqual([true, true, true, true, false, false, false, false, false])
+    const best = Math.round(similarity[peak] * 1e4) / 1e4
+    for (let index = peak + 1; index < results.length; index++) {
+      const progress = results[index].progress
+      expect(progress.best, `comparison ${index + 1} best`).toBe(best)
+      expect(progress.bestComparisonNumber).toBe(peak + 1)
+      expect(progress.comparisonsSinceBest).toBe(index - peak)
+      expect(progress.deltaFromBest).toBeLessThan(0)
+      expect(progress.deltaFromBest).toBeCloseTo(similarity[index] - similarity[peak], 4)
+    }
+    // The comparison at the peak names itself as the patch worth keeping.
+    expect(results[peak].progress).toMatchObject({ isBest: true, deltaFromBest: 0, comparisonsSinceBest: 0 })
+    expect(results[peak].progress.note).toMatch(/best/i)
+    // And five fruitless comparisons later the response says so outright,
+    // rather than leaving the agent to infer a plateau from 27 remembered numbers.
+    const last = results[results.length - 1].progress
+    expect(last.comparisonsSinceBest).toBe(5)
+    expect(last.note).toMatch(/plateau/i)
+    expect(last.note).toContain(String(best))
+    expect(last.note).toMatch(/save_preset/)
+  })
+
+  it('points a lapsed run back at the render that scored best', async () => {
+    vi.useFakeTimers()
+    const engine = new FakeEngine()
+    let soundEntryId = 'sound-peak'
+    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, {
+      decodeAudio: vi.fn(async () => decodedReference()),
+      currentSoundEntryId: () => soundEntryId
+    })
+    const byName = new Map(tools.map(tool => [tool.name, tool]))
+    const execute = async (name: string, input: Record<string, unknown> = {}) =>
+      await byName.get(name)!.execute(input, { signal: new AbortController().signal }) as any
+    const render = async () => {
+      const rendering = execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 })
+      await vi.advanceTimersByTimeAsync(30)
+      await rendering
+    }
+
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    await render()
+    const first = await execute('compare_audio')
+    expect(first.progress).toMatchObject({ isBest: true, bestEntryId: 'sound-peak' })
+
+    // A later render scores worse; the way back is the history entry of the
+    // render that scored best, not the one in hand.
+    soundEntryId = 'sound-worse'
+    engine.recordOutput = vi.fn(async (duration: number) => {
+      const length = Math.max(32, Math.round(duration * 8000))
+      const left = Float32Array.from({ length }, (_, index) => 0.01 * Math.sin(2 * Math.PI * 50 * index / 8000) + 0.005)
+      return { blob: new Blob(['audio'], { type: 'audio/webm' }), mimeType: 'audio/webm', duration, sampleRate: 8000, channelData: [left, new Float32Array(left)] }
+    })
+    await render()
+    const second = await execute('compare_audio')
+    expect(second.comparison.similarity).toBeLessThan(first.comparison.similarity)
+    expect(second.progress).toMatchObject({ isBest: false, bestEntryId: 'sound-peak', bestComparisonNumber: 1 })
+    expect(second.progress.note).toContain('navigate_history')
+    expect(second.progress.note).toContain('sound-peak')
+  })
+
+  it('starts the best over when a new reference replaces the old matching problem', async () => {
+    const decodeAudio = vi.fn()
+      .mockResolvedValueOnce(decodedReference())
+      .mockResolvedValueOnce(decodedReference({ decodedBytes: 8, channelData: [Float32Array.from([0, 0.02, -0.02, 0])] }))
+    const { engine, execute } = setup(undefined, decodeAudio)
+    engine.scopeL = Float32Array.from([0, 0.5, -0.5, 0])
+    engine.scopeR = engine.scopeL
+
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'first.wav' })
+    const matched = await execute('compare_audio')
+    await execute('compare_audio')
+    expect(matched.progress).toMatchObject({ comparisonNumber: 1, isBest: true })
+
+    // A different target: a best earned against the previous one would be a lie.
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'second.wav' })
+    const fresh = await execute('compare_audio')
+    expect(fresh.progress).toMatchObject({ comparisonNumber: 1, isBest: true, bestComparisonNumber: 1, comparisonsSinceBest: 0, deltaFromBest: 0 })
+    expect(fresh.progress.best).toBe(Math.round(fresh.comparison.similarity * 1e4) / 1e4)
+    expect(fresh.progress.best).not.toBe(matched.progress.best)
   })
 
   it('compares against the latest real render and retains only the latest reference analysis', async () => {
@@ -1084,6 +1293,9 @@ describe('offline rendering', () => {
     expect(tool.description).toMatch(/offline/i)
     expect(tool.description).not.toMatch(/CLICK TO START AUDIO/i)
     expect(byName.get('play_notes')!.description).toMatch(/CLICK TO START AUDIO/i)
+    // play_notes registers at page load, so its description is read long
+    // before it is usable: it must point at the tool that needs no gesture.
+    expect(byName.get('play_notes')!.description).toMatch(/render_audio/)
   })
 
   it('renders offline by default, without a Start gesture, and repeats itself exactly', async () => {

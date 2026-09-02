@@ -29,7 +29,10 @@ export function readinessSentence(state: AgentActivitySnapshot): string {
   if (state.toolAvailability === 'checking') return 'Checking AI tools…'
   const ready = `${state.readyTools} tools ready`
   if (state.registrationErrors.length) return `${ready} · ${state.registrationErrors.length} registration failures`
-  return `${ready}${state.audioToolsLocked ? ' · Start audio to unlock 1' : ''}`
+  // Nothing is withheld any more: every tool registers at page load. Only
+  // live playback still waits for the gesture, so the strip says that instead
+  // of promising an unlock.
+  return `${ready}${state.livePlaybackLocked ? ' · Start audio for live playback' : ''}`
 }
 
 /** Short state word for the single AI button, so the icon never has to carry meaning alone. */

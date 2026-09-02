@@ -62,7 +62,7 @@ describe('AgentActivityStore', () => {
     store.setToolReadiness(14, true, { available: true, errors: [{ tool: 'save_preset', message: 'Denied' }] })
     expect(store.snapshot()).toMatchObject({ toolAvailability: 'error', readyTools: 14 })
     store.setToolReadiness(17, false, { available: true })
-    expect(store.snapshot()).toMatchObject({ toolAvailability: 'ready', registrationErrors: [], audioToolsLocked: false })
+    expect(store.snapshot()).toMatchObject({ toolAvailability: 'ready', registrationErrors: [], livePlaybackLocked: false })
   })
 
   it('publishes tool readiness and action results', () => {
@@ -77,7 +77,7 @@ describe('AgentActivityStore', () => {
 
     expect(store.snapshot()).toMatchObject({
       readyTools: 9,
-      audioToolsLocked: true,
+      livePlaybackLocked: true,
       changedParameters: ['master.volume', 'filter1.cutoff'],
       lastAction: { label: 'Updated parameters', status: 'completed', summary: '2 parameters' }
     })

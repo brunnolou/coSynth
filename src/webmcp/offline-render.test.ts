@@ -7,7 +7,7 @@ import { paramIndex, WAVETABLE_NAMES } from '../shared/params'
 import { NUM_MIPS, type Wavetable } from '../shared/wavetable-gen'
 import {
   BASE64_MAX_SECONDS, BASE64_SAMPLE_RATE, encodeWav, monoWavBase64, offlineRenderAvailable, renderOffline,
-  type MonoWavBase64
+  WORKLET_LOAD_FAILURE, type MonoWavBase64
 } from './offline-render'
 
 const SAMPLE_RATE = 48000
@@ -373,7 +373,9 @@ describe('renderOffline', () => {
     expect(scratchEngines).toHaveLength(1)
     expect(scratchEngines[0].offline).toBe(true)
     expect(scratchEngines[0].running, 'an offline engine never "runs"').toBe(false)
-    expect(scratchEngines[0].started).toBe(true)
+    expect(scratchEngines[0].everStarted, 'the scratch engine built its worklet graph').toBe(true)
+    expect(scratchEngines[0].disposed, 'and released it once the render was done').toBe(true)
+    expect(scratchEngines[0].started, 'so it holds no graph any more').toBe(false)
     expect(engine.started, 'the live engine was never started').toBe(false)
     expect(engine.heldNotes.size).toBe(0)
   })
@@ -724,6 +726,141 @@ describe('renderOffline worklet barrier and silence guard', () => {
   })
 })
 
+
+/**
+ * A render that cannot load the worklet module is the one failure whose cause
+ * is neither the patch nor the request, and it used to surface as the raw
+ * `Unable to load a worklet's module` paired with advice to retry in real time
+ * — the one suggestion guaranteed not to help, since the real-time graph loads
+ * the same module and additionally needs a user gesture.
+ */
+describe('renderOffline worklet module failures', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  const notes: PerformanceNote[] = [{ midi: 60, velocity: 1, start: 0, duration: 0.1 }]
+
+  it('reports a module that will not load in terms a caller can act on', async () => {
+    const { createContext } = harness(context => {
+      context.audioWorklet.addModule = vi.fn(async () => {
+        throw new Error("Unable to load a worklet's module.")
+      })
+    })
+    const error = await renderOffline(liveEngineStub(), notes, 0.2, { createContext })
+      .then(() => null, (reason: Error) => reason)
+
+    expect(error).toBeInstanceOf(Error)
+    expect(error!.name).toBe(WORKLET_LOAD_FAILURE)
+    const message = error!.message
+    // It says the result is not a measurement of the patch...
+    expect(message).toMatch(/never started/)
+    expect(message).toMatch(/nothing here is a fact about the \s*patch or the notes/)
+    // ...keeps the underlying cause for anyone who wants it...
+    expect(message).toMatch(/Unable to load a worklet's module/)
+    // ...and gives advice that can actually work, having ruled out the one
+    // that cannot.
+    expect(message).toMatch(/Reload the page/)
+    expect(message).toMatch(/mode: "realtime" cannot help/)
+  })
+
+  it('does not retry a module failure as if it were the silence guard', async () => {
+    const addModule = vi.fn(async () => { throw new Error("Unable to load a worklet's module.") })
+    const { createContext } = harness(context => { context.audioWorklet.addModule = addModule })
+    await expect(renderOffline(liveEngineStub(), notes, 0.2, { createContext })).rejects.toThrow()
+    // The retry exists for a render that came back as unconfirmed silence. A
+    // module that will not load will not load twice either, and the caller is
+    // told so rather than being made to wait for a second identical failure.
+    expect(addModule).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a cancellation classified as a cancellation', async () => {
+    const controller = new AbortController()
+    const { createContext } = harness(context => {
+      context.audioWorklet.addModule = vi.fn(async () => {
+        controller.abort()
+        const error = new Error('Execution aborted')
+        error.name = 'AbortError'
+        throw error
+      })
+    })
+    // A cancel that lands inside `addModule` is a cancel, not a broken module:
+    // `register.ts` classifies by name, so mislabelling it would report a
+    // user-requested stop as an environment failure.
+    await expect(renderOffline(liveEngineStub(), notes, 0.2, { createContext, signal: controller.signal }))
+      .rejects.toMatchObject({ name: 'AbortError' })
+  })
+})
+
+/**
+ * An `OfflineAudioContext` is single-use and, in Chromium, has no `close()` at
+ * all, so the scratch engine's graph is the only thing a render can actually
+ * release. It must be released on every exit, including the abort path — an
+ * abandoned render is precisely the case where the graph would otherwise be
+ * left attached with nobody to drop it.
+ */
+describe('renderOffline scratch engine disposal', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  const notes: PerformanceNote[] = [{ midi: 60, velocity: 1, start: 0, duration: 0.1 }]
+
+  const withScratch = () => {
+    const scratchEngines: SynthEngine[] = []
+    const { createContext } = harness()
+    const createEngine = (context: BaseAudioContext) => {
+      const scratch = new SynthEngine({ context })
+      scratchEngines.push(scratch)
+      return scratch
+    }
+    return { scratchEngines, createContext, createEngine }
+  }
+
+  it('disposes the scratch engine after a successful render', async () => {
+    const { scratchEngines, createContext, createEngine } = withScratch()
+    await renderOffline(liveEngineStub(), notes, 0.2, { createContext, createEngine })
+    expect(scratchEngines).toHaveLength(1)
+    expect(scratchEngines[0].everStarted).toBe(true)
+    expect(scratchEngines[0].disposed).toBe(true)
+    expect(scratchEngines[0].started, 'the graph is gone, not merely finished with').toBe(false)
+  })
+
+  it('disposes the scratch engine when the render is cancelled', async () => {
+    const controller = new AbortController()
+    const { scratchEngines, createContext, createEngine } = withScratch()
+    const pending = renderOffline(liveEngineStub(), notes, 0.2, {
+      createContext, createEngine, signal: controller.signal
+    })
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    expect(scratchEngines).toHaveLength(1)
+    expect(scratchEngines[0].disposed, 'an abandoned render still releases its graph').toBe(true)
+  })
+
+  it('disposes the scratch engine when the module never loaded', async () => {
+    const scratchEngines: SynthEngine[] = []
+    const { createContext } = harness(context => {
+      context.audioWorklet.addModule = vi.fn(async () => { throw new Error('nope') })
+    })
+    await expect(renderOffline(liveEngineStub(), notes, 0.2, {
+      createContext,
+      createEngine: context => {
+        const scratch = new SynthEngine({ context })
+        scratchEngines.push(scratch)
+        return scratch
+      }
+    })).rejects.toThrow()
+    expect(scratchEngines[0].disposed).toBe(true)
+    expect(scratchEngines[0].everStarted, 'it never got a graph to begin with').toBe(false)
+  })
+
+  it('leaves a disposed engine inert rather than throwing on later posts', () => {
+    const engine = new SynthEngine()
+    // Never started: dispose must be safe on an engine with no graph, and
+    // idempotent, because it runs from a `finally` that cannot know how far
+    // the render got.
+    expect(() => { engine.dispose(); engine.dispose() }).not.toThrow()
+    expect(engine.disposed).toBe(true)
+    expect(() => engine.noteOn(60, 1)).not.toThrow()
+  })
+})
 
 describe('WAV encoding', () => {
   it('writes a 16-bit PCM header that matches the payload', () => {

@@ -42,20 +42,17 @@ describe('registerWebMcpTools', () => {
     expect(calls[0].signal?.aborted).toBe(true)
   })
 
-  it('exposes render_audio before audio starts and gates only play_notes', async () => {
+  it('has no option that can withhold a tool until the Start gesture', async () => {
+    // In the discoverability eval Codex listed the tools once, before the
+    // gesture, saw no `play_notes`, concluded playback was not a WebMCP tool
+    // and drove the DOM for the rest of the run. The advertised set must be
+    // the same before and after Start, so nothing may split it.
     const names: string[] = []
-    const modelContext = context(tool => { names.push(tool.name) })
-    await registerWebMcpTools(engine, modelContext, { audioTools: 'exclude' }).ready
-    // render_audio defaults to an offline render, which needs no user gesture.
-    // Withholding it until Start would hide the one tool an agent needs to
-    // hear what it is designing.
+    // @ts-expect-error - `audioTools` is gone; a stray option must not gate a tool.
+    await registerWebMcpTools(engine, context(tool => { names.push(tool.name) }), { audioTools: 'exclude' }).ready
+    expect(names).toContain('play_notes')
     expect(names).toContain('render_audio')
-    expect(names).not.toContain('play_notes')
-    expect(names).toHaveLength(11)
-
-    names.length = 0
-    await registerWebMcpTools(engine, modelContext, { audioTools: 'only' }).ready
-    expect(names).toEqual(['play_notes'])
+    expect(names).toHaveLength(12)
   })
 
   it('returns actionable expected errors while preserving cancellation semantics', async () => {
@@ -100,13 +97,13 @@ describe('registerWebMcpTools', () => {
     warn.mockRestore()
   })
 
-  it('registers injected teaching tools before audio without patch checkpoints', async () => {
+  it('registers injected teaching tools at page load without patch checkpoints', async () => {
     const calls: WebMCP.ModelContextTool[] = []
     const engine = new SynthEngine()
     const guide = { show: vi.fn(() => ({ shown: true, stepCount: 1, warnings: [] })), listTargets: vi.fn(() => ({ items: [], total: 0, offset: 0, limit: 5 })) }
-    const registration = registerWebMcpTools(engine, context(tool => { calls.push(tool) }), { audioTools: 'exclude', guide })
+    const registration = registerWebMcpTools(engine, context(tool => { calls.push(tool) }), { guide })
     await registration.ready
-    expect(registration.registeredCount).toBe(13)
+    expect(registration.registeredCount).toBe(14)
     const show = calls.find(t => t.name === 'show_ui_guide')!
     const get = calls.find(t => t.name === 'get_ui_targets')!
     expect(show.annotations?.readOnlyHint).toBe(false)

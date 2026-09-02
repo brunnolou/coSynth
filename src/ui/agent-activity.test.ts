@@ -178,7 +178,7 @@ it('offers one AI button that opens activity and invites a first prompt', () => 
   const keep = [...panel.root.querySelectorAll('button')].find(node => node.textContent === 'Keep changes') as HTMLButtonElement
   expect(keep.hidden).toBe(true) // Nothing to keep, so no dead controls or reject explainer.
   expect((panel.root.querySelector('.agent-param-list') as HTMLElement).hidden).toBe(true)
-  expect(panel.root.querySelector('.agent-feed')?.textContent).toBe('15 tools ready · Start audio to unlock 1')
+  expect(panel.root.querySelector('.agent-feed')?.textContent).toBe('15 tools ready · Start audio for live playback')
 })
 
 it('names the pending count on the button and swaps the invitation for the change list', () => {

@@ -3,9 +3,11 @@
 import assert from 'node:assert/strict'
 import { chromium } from 'playwright'
 
-// Only play_notes waits for the audio gesture; render_audio registers at load
-// because it renders offline.
-const TOOLS_AT_LOAD = 17
+// Every tool registers at page load and the set never changes across the
+// gesture. play_notes is registered but refuses until audio starts: an agent
+// that could not see it concluded playback was not a tool at all and went off
+// to drive the DOM instead.
+const TOOLS_AT_LOAD = 18
 const TOOLS_AFTER_AUDIO = 18
 
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined })
@@ -35,7 +37,7 @@ try {
   const previous = () => page.locator('.driver-popover-prev-btn').click()
 
   await page.waitForFunction(count => window.__guideTestTools.size === count, TOOLS_AT_LOAD)
-  assert.equal(await page.locator('.agent-feed-line').textContent(), `${TOOLS_AT_LOAD} tools ready · Start audio to unlock 1`)
+  assert.equal(await page.locator('.agent-feed-line').textContent(), `${TOOLS_AT_LOAD} tools ready · Start audio for live playback`)
   await show([{ markdown: 'Introduction' }, { target: { id: 'button.audio.start' }, markdown: 'Start audio yourself when ready.' }])
   await page.keyboard.press('ArrowRight')
   await highlighted('button.audio.start')
@@ -189,7 +191,34 @@ try {
   const boundsSmall = await page.locator('.driver-popover').boundingBox()
   assert.ok(boundsSmall.x >= 0 && boundsSmall.x + boundsSmall.width <= 391)
   assert.ok(boundsSmall.y >= 0 && boundsSmall.y + boundsSmall.height <= 844)
+  // AI guides deliberately survive outside clicks so a stray tap on the synth cannot
+  // wipe the instructions, so the narrow layout must still offer a reachable way out.
   await page.locator('.driver-overlay').click({ position: { x: 3, y: 3 } })
+  assert.equal(await page.locator('.driver-popover').count(), 1, 'An outside click must not dismiss an AI guide')
+  const closeButton = page.locator('.driver-popover-close-btn')
+  const closeBounds = await closeButton.boundingBox()
+  assert.ok(closeBounds, 'A text-only step must offer a close button')
+  assert.ok(closeBounds.x >= 0 && closeBounds.x + closeBounds.width <= 391, 'The close button must stay on screen')
+  assert.ok(closeBounds.y >= 0 && closeBounds.y + closeBounds.height <= 844, 'The close button must stay on screen')
+  // The question here is whether anything covers the close button, so the hit
+  // element only has to be the button or a descendant of it. Comparing
+  // `className` to the exact class instead required the point to land on the
+  // button element itself: Driver.js renders the X as an inline SVG in other
+  // versions, and an `<svg>`'s `className` is an SVGAnimatedString that equals
+  // no string at all, so the assertion would fail on a perfectly reachable
+  // control.
+  assert.equal(
+    await page.evaluate(
+      ([x, y]) => Boolean(document.elementFromPoint(x, y)?.closest('.driver-popover-close-btn')),
+      [closeBounds.x + closeBounds.width / 2, closeBounds.y + closeBounds.height / 2]
+    ),
+    true,
+    'Nothing may cover the close button'
+  )
+  await page.keyboard.press('Escape')
+  await page.locator('.driver-popover').waitFor({ state: 'detached' })
+  await show([{ markdown: 'Text-only help\n\n' + 'A readable explanation. '.repeat(70) }])
+  await page.locator('.driver-popover-close-btn').click()
   await page.locator('.driver-popover').waitFor({ state: 'detached' })
 
   // Every built-in step remains readable when the synth switches to its narrow layout.

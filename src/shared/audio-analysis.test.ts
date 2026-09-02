@@ -766,8 +766,19 @@ describe('compareAudioMetrics', () => {
     }
     for (const result of [compareAudioMetrics(silence, silence), compareAudioMetrics(silence, changed)]) {
       expect(Number.isFinite(result.similarity)).toBe(true)
+      expect(result.similarity).toBeGreaterThanOrEqual(0)
+      expect(result.similarity).toBeLessThanOrEqual(1)
       for (const key of detailKeys) {
-        expect(Number.isFinite(result.details[key].similarity)).toBe(true)
+        const { similarity, reference, candidate } = result.details[key]
+        // Stricter than "finite": the only permitted non-number is the null that means
+        // "not measurable", and it is only permitted when a side is actually null.
+        if (similarity === null) {
+          expect(reference === null || candidate === null).toBe(true)
+          continue
+        }
+        expect(Number.isFinite(similarity)).toBe(true)
+        expect(similarity).toBeGreaterThanOrEqual(0)
+        expect(similarity).toBeLessThanOrEqual(1)
       }
     }
   })
@@ -789,11 +800,45 @@ describe('compareAudioMetrics', () => {
     expect(compareAudioMetrics(quiet, { ...quiet }).details.decayT60Ms).toEqual({
       reference: null, candidate: null, delta: null, similarity: 1
     })
+    // Not 0: one side unmeasurable is an absence of evidence, not maximal disagreement.
     const mismatch = compareAudioMetrics(quiet, referenceMetrics).details.decayT60Ms
-    expect(mismatch).toEqual({ reference: null, candidate: 800, delta: null, similarity: 0 })
+    expect(mismatch).toEqual({ reference: null, candidate: 800, delta: null, similarity: null })
     const shorter = compareAudioMetrics(referenceMetrics, { ...referenceMetrics, decayT60Ms: 100 })
     expect(shorter.details.decayT60Ms.delta).toBe(-700)
-    expect(shorter.details.decayT60Ms.similarity).toBeLessThan(0.7)
+    expect(shorter.details.decayT60Ms.similarity as number).toBeLessThan(0.7)
+  })
+
+  it('excludes an unmeasurable decay from the overall score but not a badly wrong one', () => {
+    // A sustaining patch against a decaying reference: the most common case in the
+    // reference-matching loop, and the one the eval saw scoring 0.
+    const unmeasurable = compareAudioMetrics(referenceMetrics, { ...referenceMetrics, decayT60Ms: null })
+    // A measured value 160x too fast: genuinely, readably wrong.
+    const wrong = compareAudioMetrics(referenceMetrics, { ...referenceMetrics, decayT60Ms: 5 })
+
+    // An agent tells them apart from the detail alone, without reading the overall figure.
+    expect(unmeasurable.details.decayT60Ms.similarity).toBeNull()
+    expect(unmeasurable.details.decayT60Ms.candidate).toBeNull()
+    expect(wrong.details.decayT60Ms.similarity as number).toBeLessThan(0.05)
+    expect(wrong.details.decayT60Ms.candidate).toBe(5)
+
+    // With every other metric identical, "not measurable" must not cost anything at all,
+    // while "wrong" must. Previously both were penalised and the wrong one scored *higher*
+    // (0.9029 against 0.9000), because a wrong value still contributes a little and a null
+    // contributed exactly nothing while occupying a slot in the mean.
+    expect(unmeasurable.similarity).toBe(1)
+    expect(wrong.similarity).toBeLessThan(0.95)
+    expect(unmeasurable.similarity).toBeGreaterThan(wrong.similarity)
+
+    // Both sides unmeasurable is still a match and still counted.
+    const neither = { ...referenceMetrics, decayT60Ms: null }
+    expect(compareAudioMetrics(neither, { ...neither }).details.decayT60Ms.similarity).toBe(1)
+    expect(compareAudioMetrics(neither, { ...neither }).similarity).toBe(1)
+
+    // The exclusion must not let a bad candidate hide: everything else still counts.
+    const alsoDark = compareAudioMetrics(referenceMetrics, {
+      ...referenceMetrics, decayT60Ms: null, spectralCentroidHz: 80
+    })
+    expect(alsoDark.similarity).toBeLessThan(0.95)
   })
 
   it('scores envelope shape by correlation, not by absolute level', () => {
@@ -804,7 +849,7 @@ describe('compareAudioMetrics', () => {
     expect(compareAudioMetrics(referenceMetrics, referenceMetrics).details.envelope.similarity).toBe(1)
   })
 
-  it('scores bandsDb by mean absolute dB difference on a 6 dB scale', () => {
+  it('scores bandsDb by per-band capped dB difference read linearly against the 20 dB cap', () => {
     const identical = compareAudioMetrics(referenceMetrics, { ...referenceMetrics })
     expect(identical.details.bands.similarity).toBe(1)
     expect(identical.details.bands.delta).toBe(0)
@@ -815,11 +860,53 @@ describe('compareAudioMetrics', () => {
     }
     const shifted = compareAudioMetrics(referenceMetrics, tilted).details.bands
     expect(shifted.delta).toBeCloseTo(-6, 5)
-    // A flat 6 dB offset is exactly one scale unit away.
-    expect(shifted.similarity).toBeCloseTo(Math.exp(-1), 5)
+    // A flat 6 dB offset is 6/20 of the way to "these bands share nothing".
+    expect(shifted.similarity).toBeCloseTo(0.7, 5)
 
+    // Six bands past the cap, four inside it: 0.2. Well under the 0.822 a one-parameter
+    // change scores below, which is the separation that matters, not the absolute figure.
     const brighter = { ...referenceMetrics, bandsDb: [-60, -50, -40, -30, -20, -10, -6, -6, -8, -12] }
-    expect(compareAudioMetrics(referenceMetrics, brighter).details.bands.similarity).toBeLessThan(0.1)
+    expect(compareAudioMetrics(referenceMetrics, brighter).details.bands.similarity).toBeCloseTo(0.2, 5)
+  })
+
+  /**
+   * Band vectors measured by `analyzeAudio`, not invented: the reference row is
+   * `docs/agent-match-eval-reference.wav`, the candidate rows are C4 patches - a plain
+   * sawtooth, the same sawtooth after one round of parameter edits, and a sine, which is as
+   * spectrally unlike the recording as a single note gets.
+   */
+  const WAV_REFERENCE_BANDS = [-4.4, -19.7, -16, -12, -9.2, -7.4, -8, -13.7, -17.8, -23.2]
+  const SAW_C4_BANDS = [-79, -72, -59, -2, -8, -9, -13, -18, -25, -100]
+  const SAW_C4_EDITED_BANDS = [-75, -69, -56, -1, -9, -15, -23, -22, -28, -100]
+  const SINE_C4_BANDS = [-76, -70, -57, 0, -57, -79, -90, -100, -100, -100]
+
+  it('keeps band similarity informative against a real recorded reference', () => {
+    const bandsOf = (bandsDb: number[]) =>
+      compareAudioMetrics({ ...referenceMetrics, bandsDb: WAV_REFERENCE_BANDS }, { ...referenceMetrics, bandsDb })
+        .details.bands.similarity
+
+    const saw = bandsOf(SAW_C4_BANDS)
+    const edited = bandsOf(SAW_C4_EDITED_BANDS)
+    const sine = bandsOf(SINE_C4_BANDS)
+
+    // Both plausible candidates must land somewhere an agent can read and steer by, rather
+    // than in the bottom hundredth where the eval found them (0.010 and 0.008).
+    expect(saw).toBeGreaterThan(0.25)
+    expect(edited).toBeGreaterThan(0.25)
+    expect(saw).toBeLessThan(0.75)
+    expect(edited).toBeLessThan(0.75)
+    // One round of edits must move the metric by more than the 0.002 it moved before.
+    expect(Math.abs(saw - edited)).toBeGreaterThan(0.05)
+    // And the scale must still put a genuinely unrelated spectrum far below both.
+    expect(sine).toBeLessThan(Math.min(saw, edited) - 0.2)
+
+    // Two candidates one parameter change apart still read as close to each other.
+    const near = compareAudioMetrics(
+      { ...referenceMetrics, bandsDb: SAW_C4_BANDS },
+      { ...referenceMetrics, bandsDb: SAW_C4_EDITED_BANDS }
+    ).details.bands.similarity
+    expect(near).toBeGreaterThan(0.7)
+    expect(near).toBeGreaterThan(Math.max(saw, edited) + 0.3)
   })
 
   it('rejects malformed band arrays', () => {

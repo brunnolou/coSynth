@@ -2,9 +2,11 @@
 import assert from 'node:assert/strict'
 import { chromium } from 'playwright'
 
-// Only play_notes waits for the audio gesture; render_audio registers at load
-// because it renders offline.
-const TOOLS_AT_LOAD = 17
+// Every tool registers at page load and the set never changes across the
+// gesture. play_notes is registered but refuses until audio starts: an agent
+// that could not see it concluded playback was not a tool at all and went off
+// to drive the DOM instead.
+const TOOLS_AT_LOAD = 18
 const TOOLS_AFTER_AUDIO = 18
 
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined })
@@ -21,6 +23,11 @@ try {
       }
     } })
     window.__historyTools = tools
+    // History is a returning-user concern. The first-run walkthrough (covered by
+    // guide-smoke) opens right after audio starts and its driver.js overlay makes
+    // the whole app `pointer-events: none`, so every synthetic gesture below would
+    // silently land on the overlay instead of a control.
+    try { localStorage.setItem('cosynth.walkthrough.seen.v1', '1') } catch { /* Storage can be blocked. */ }
   })
   await page.goto(process.argv[2] ?? 'http://127.0.0.1:4175/', { waitUntil: 'networkidle' })
   const call = (name, input = {}) => page.evaluate(async ({ name, input }) =>
@@ -44,15 +51,30 @@ try {
   }
   const held = () => page.evaluate(() => window.coSynth.heldNotes.size)
   const noteOns = () => page.evaluate(() => window.__historyNotes.filter(event => event.on).map(event => event.midi))
+  // Returns how many separate patch mutations the gesture produced. Grouping is
+  // only meaningful when the drag really emitted several of them, so the caller
+  // asserts on this instead of trusting that the pointer did anything at all.
   const drag = async (id, moves = 4) => {
     const canvas = target(id).locator('.knob-main-canvas')
     await canvas.scrollIntoViewIfNeeded()
     const bounds = await canvas.boundingBox()
     const x = bounds.x + bounds.width / 2, y = bounds.y + bounds.height / 2
+    // An overlay (guide, dialog, modal) would swallow the whole drag without any
+    // assertion below noticing that nothing was dragged.
+    assert.equal(await page.evaluate(([px, py]) =>
+      document.elementFromPoint(px, py)?.classList.contains('knob-main-canvas') === true, [x, y]),
+    true, `The pointer must reach the ${id} knob canvas`)
+    await page.evaluate(() => {
+      window.__dragMutations = 0
+      window.__dragStop = window.coSynth.onPatchChange(mutation => {
+        if (mutation.changes.some(change => change.kind === 'param')) window.__dragMutations++
+      })
+    })
     await page.mouse.move(x, y)
     await page.mouse.down()
     for (let move = 1; move <= moves; move++) await page.mouse.move(x, y - move * 8)
     await page.mouse.up()
+    return page.evaluate(() => { window.__dragStop(); return window.__dragMutations })
   }
 
   await page.waitForFunction(count => window.__historyTools.size === count, TOOLS_AT_LOAD)
@@ -90,7 +112,8 @@ try {
   assert.equal(performance.noteCount, 3)
   const beforeDrag = await sounds()
   const beforeDragPatch = await patch()
-  await drag('param.osc1.morph')
+  const dragMutations = await drag('param.osc1.morph')
+  assert.ok(dragMutations > 1, `The drag must emit several patch mutations to group, got ${dragMutations}`)
   const afterDrag = await sounds()
   assert.equal(afterDrag.total, beforeDrag.total + 1, 'A multi-event drag must create exactly one sound entry')
   const humanEntry = afterDrag.items.find(entry => entry.current)
@@ -106,9 +129,17 @@ try {
   assert.deepEqual(await patch(), beforeDragPatch)
   assert.equal(await page.locator('.oct-label').textContent(), octave)
   assert.equal(await held(), 0)
+  // The button is an icon button: its label lives in aria-label, and a short
+  // performance can pass through Stop faster than a poll, so record the labels.
+  await page.evaluate(() => {
+    const button = document.querySelector('[data-guide-id="button.history.play"]')
+    window.__playLabels = [button.getAttribute('aria-label')]
+    new MutationObserver(() => window.__playLabels.push(button.getAttribute('aria-label')))
+      .observe(button, { attributes: true, attributeFilter: ['aria-label'] })
+  })
   await target('button.history.play').click()
-  await page.waitForFunction(() => document.querySelector('[data-guide-id="button.history.play"]')?.textContent === 'Stop')
-  await page.waitForFunction(() => document.querySelector('[data-guide-id="button.history.play"]')?.textContent === 'Play again')
+  await page.waitForFunction(() => window.__playLabels.includes('Stop'))
+  await page.waitForFunction(() => window.__playLabels.at(-1) === 'Play again')
   assert.deepEqual((await noteOns()).slice(-3), notes.map(note => note.midi))
   assert.equal((await replays()).total, replayCount, 'Replaying must not duplicate a saved performance')
   await page.keyboard.press('Control+Shift+z')
@@ -181,12 +212,14 @@ try {
   await finishBackground()
   assert.equal(await held(), 0)
   assert.ok((await replays()).items.some(entry => entry.kind === 'performance' && entry.status === 'cancelled'))
-  await startInBackground('render_audio', { notes: [{ midi: 62, velocity: 0.5, start: 0, duration: 3 }], duration: 4 })
+  // Explicitly real time: render_audio is offline by default now, and only the
+  // live path holds notes on the engine that history restoration has to wait for.
+  await startInBackground('render_audio', { notes: [{ midi: 62, velocity: 0.5, start: 0, duration: 3 }], duration: 4, mode: 'realtime' })
   await page.waitForFunction(() => window.coSynth.heldNotes.has(62))
   await navigate('undo')
   await finishBackground()
   assert.equal(await held(), 0, 'History restoration must await render note cleanup')
-  assert.equal(await target('button.history.play').textContent(), 'Play again')
+  assert.equal(await target('button.history.play').getAttribute('aria-label'), 'Play again')
 
   // Reopen a closed walkthrough through History. It starts from step one, not the closed step.
   const beforeGuide = await patch()

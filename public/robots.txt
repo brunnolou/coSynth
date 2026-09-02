@@ -1,0 +1,7 @@
+# coSynth — https://github.com/brunnolou/coSynth
+# Everything here is public. There is nothing to hide from crawlers or agents.
+User-agent: *
+Allow: /
+
+# What this app offers an automated client, in prose:
+# https://cosynth.vercel.app/llms.txt

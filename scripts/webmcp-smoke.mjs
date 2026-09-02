@@ -15,9 +15,14 @@ const coldBrowser = await chromium.launch({ executablePath: process.env.CHROMIUM
 async function trackedPage(instance = browser) {
   const page = await instance.newPage()
   const errors = []
+  // Every Worker the page really starts. jsdom has no `Worker` at all, so the
+  // unit suite cannot see whether analysis runs off the render thread; only a
+  // real browser can, and only against a production build.
+  const workers = []
+  page.on('worker', worker => workers.push(worker.url()))
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
   page.on('pageerror', error => errors.push(String(error)))
-  return { page, errors }
+  return { page, errors, workers }
 }
 
 /** Standards-shaped `document.modelContext`, exposed to the test as `__webMcpTools`. */
@@ -44,7 +49,7 @@ function installShim(page) {
   })
 }
 
-const TOOLS_AT_LOAD = 17
+const TOOLS_AT_LOAD = 18
 const TOOLS_AFTER_AUDIO = 18
 
 try {
@@ -86,6 +91,11 @@ try {
     const render = await tools.get('render_audio').execute({
       notes: [{ midi: 60, velocity: 0.9, start: 0, duration: 1 }], duration: 2
     }, { signal: new AbortController().signal })
+    // A second render, so the smoke can tell the two analysis worker loads
+    // apart: the first from the bundled asset, the next from the cached copy.
+    await tools.get('render_audio').execute({
+      notes: [{ midi: 60, velocity: 0.9, start: 0, duration: 1 }], duration: 2
+    }, { signal: new AbortController().signal })
     return {
       before,
       patch,
@@ -98,7 +108,9 @@ try {
     throw new Error(`Page was not cold: ${JSON.stringify(coldResult.before)}`)
   }
   if (!coldResult.before.names.includes('render_audio')) throw new Error('render_audio was not registered at page load')
-  if (coldResult.before.names.includes('play_notes')) throw new Error('play_notes was exposed before the audio gesture')
+  // play_notes is visible before the gesture on purpose - it refuses to run,
+  // but an agent that cannot see it concludes playback is not a tool.
+  if (!coldResult.before.names.includes('play_notes')) throw new Error('play_notes was hidden before the audio gesture')
   if (coldResult.render?.ok === false) throw new Error(`Cold offline render failed: ${JSON.stringify(coldResult.render)}`)
   if (coldResult.render.renderMode !== 'offline') {
     throw new Error(`Cold render did not use the offline path: ${JSON.stringify({ renderMode: coldResult.render.renderMode, renderModeFallback: coldResult.render.renderModeFallback })}`)
@@ -113,6 +125,23 @@ try {
   }
   if (!Number.isFinite(coldMetrics.peakDb) || coldMetrics.peakDb <= -80) {
     throw new Error(`Cold offline render is silent: ${JSON.stringify(coldMetrics)}`)
+  }
+  // The analysis worker must actually start. It is loaded by URL, so it only
+  // exists in a build if Vite emitted it as a worker entry: computing the URL
+  // outside a `new Worker(...)` call silently stopped that emission, the URL
+  // then resolved to the SPA's HTML fallback, and every analysis fell back to
+  // the render thread with no error anywhere. Assert on the asset the first
+  // render loads, and on the `blob:` copy the second one reuses, so a
+  // regression in either the bundling or the caching fails here.
+  const analysisWorkers = cold.workers.filter(worker => !worker.includes('processor'))
+  if (analysisWorkers.length < 2) {
+    throw new Error(`Two renders started ${analysisWorkers.length} analysis worker(s); expected one each: ${JSON.stringify(cold.workers)}`)
+  }
+  if (!/\/assets\/audio-analysis\.worker-[^/]*\.js$/.test(analysisWorkers[0])) {
+    throw new Error(`The first analysis worker did not load Vite's emitted worker asset: ${analysisWorkers[0]}`)
+  }
+  if (!analysisWorkers[1].startsWith('blob:')) {
+    throw new Error(`The second analysis worker did not reuse the cached copy: ${analysisWorkers[1]}`)
   }
   if (!coldResult.overlayAfter || coldResult.runningAfter !== false) {
     throw new Error(`Offline render started live audio: ${JSON.stringify({ running: coldResult.runningAfter, overlay: coldResult.overlayAfter })}`)
@@ -141,7 +170,7 @@ try {
   await shimmed.page.goto(url, { waitUntil: 'networkidle' })
   await shimmed.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOLS_AT_LOAD)
   const toolsBeforeAudio = await shimmed.page.evaluate(() => [...window.__webMcpTools.keys()])
-  if (toolsBeforeAudio.includes('play_notes')) throw new Error('play_notes was exposed before audio startup')
+  if (!toolsBeforeAudio.includes('play_notes')) throw new Error('play_notes was hidden before audio startup')
   await shimmed.page.click('#start-btn')
   await shimmed.page.waitForFunction(() => !document.getElementById('start-overlay'), { timeout: 10000 })
   await shimmed.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOLS_AFTER_AUDIO)

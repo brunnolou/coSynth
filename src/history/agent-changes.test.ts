@@ -22,7 +22,7 @@ async function setup() {
   const tools = new Map<string, WebMCP.ModelContextTool>()
   const registration = registerWebMcpTools(engine, {
     registerTool(tool: WebMCP.ModelContextTool) { tools.set(tool.name, tool) }
-  } as WebMCP.ModelContext, { services, guide, audioTools: 'exclude' })
+  } as WebMCP.ModelContext, { services, guide })
   await registration.ready
   cleanups.push(() => { registration.dispose(); services.dispose(); activity.dispose(); guide.dispose() })
   const call = (name: string, input: Record<string, unknown>) => tools.get(name)!.execute(input, { signal: new AbortController().signal })

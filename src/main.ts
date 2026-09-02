@@ -38,7 +38,6 @@ guideTarget(overlay.querySelector<HTMLButtonElement>('#start-btn')!, 'button.aud
 
 let starting = false
 let webMcp: ReturnType<typeof registerWebMcpTools> | null = null
-let audioWebMcp: ReturnType<typeof registerWebMcpTools> | null = null
 
 // Standard entry point first (`document.modelContext`, then the deprecated
 // `navigator` spelling). Only when neither exists do we pay to fetch the legacy
@@ -55,10 +54,10 @@ const registerTools = (options: WebMcpRegistrationOptions) => legacyWebMcp
   : registerWebMcpTools(engine, modelContext, options)
 
 const updateReadiness = () => agentActivity.setToolReadiness(
-  (webMcp?.registeredCount ?? 0) + (audioWebMcp?.registeredCount ?? 0), !engine.running,
+  webMcp?.registeredCount ?? 0, !engine.running,
   { available: legacyLoading || (webMcp?.available ?? false),
-    registering: !!(legacyLoading || webMcp?.pending || audioWebMcp?.pending),
-    errors: [...(webMcp?.errors ?? []), ...(audioWebMcp?.errors ?? [])] }
+    registering: !!(legacyLoading || webMcp?.pending),
+    errors: webMcp?.errors ?? [] }
 )
 // Show the "registering" state while the legacy chunk is in flight.
 if (legacyLoading) updateReadiness()
@@ -69,17 +68,11 @@ const start = async () => {
   try {
     await engine.start()
     // Audio is live the moment start() resolves, so the overlay has done its
-    // job. Registering the audio tools can still be waiting on the legacy
-    // widget's dynamic import, and leaving a full-screen Start screen over a
-    // running synth would look frozen: `starting` is already true, so a second
-    // click does nothing.
+    // job. There is nothing left to register: every tool went up at page load,
+    // so the advertised set is identical before and after this gesture. Only
+    // the readiness line changes, because live playback is now possible.
     overlay.remove()
-    if (!audioWebMcp) {
-      await legacyReady
-      audioWebMcp = registerTools({ audioTools: 'only', services })
-      updateReadiness()
-      void audioWebMcp.ready.then(updateReadiness)
-    }
+    updateReadiness()
     try { welcomeTour.startOnce() }
     catch (error) { console.warn('Welcome walkthrough could not start:', error) }
   } catch (err) {
@@ -106,14 +99,13 @@ window.addEventListener('keydown', startFromKey)
 // Progressive enhancement: WebMCP registration must never block synth startup.
 const registerPageTools = () => {
   try {
-    webMcp = registerTools({ audioTools: 'exclude', guide, services })
+    webMcp = registerTools({ guide, services })
     updateReadiness()
     void webMcp.ready.then(updateReadiness)
     bindWebMcpLifecycle({
       ready: webMcp.ready,
       dispose() {
         webMcp?.dispose()
-        audioWebMcp?.dispose()
         window.removeEventListener('keydown', startFromKey)
         disposeInteractions()
         disposeApp()

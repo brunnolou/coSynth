@@ -27,7 +27,7 @@ export type ToolAvailability = 'checking' | 'unavailable' | 'ready' | 'error'
 
 export interface AgentActivitySnapshot {
   readyTools: number
-  audioToolsLocked: boolean
+  livePlaybackLocked: boolean
   toolAvailability: ToolAvailability
   registrationErrors: ToolRegistrationError[]
   actions: AgentAction[]
@@ -85,7 +85,7 @@ export class AgentActivityStore {
   private actionId = 0
   private state: AgentActivitySnapshot = {
     readyTools: 0,
-    audioToolsLocked: true,
+    livePlaybackLocked: true,
     toolAvailability: 'checking',
     registrationErrors: [],
     actions: [],
@@ -206,11 +206,11 @@ export class AgentActivityStore {
     return () => this.listeners.delete(listener)
   }
 
-  setToolReadiness(readyTools: number, audioToolsLocked: boolean, options: {
+  setToolReadiness(readyTools: number, livePlaybackLocked: boolean, options: {
     available?: boolean; registering?: boolean; errors?: readonly ToolRegistrationError[]
   } = {}): void {
     this.state.readyTools = readyTools
-    this.state.audioToolsLocked = audioToolsLocked
+    this.state.livePlaybackLocked = livePlaybackLocked
     this.state.registrationErrors = (options.errors ?? []).map(error => ({ ...error }))
     this.state.toolAvailability = options.available === false ? 'unavailable'
       : this.state.registrationErrors.length ? 'error'
