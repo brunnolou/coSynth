@@ -18,11 +18,12 @@ const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 
 const noteName = (note: number) => `${NOTE_NAMES[note % 12]}${Math.floor(note / 12) - 1}`
 
 /** Selectable widths of the drawn keyboard, in octaves. */
-const OCTAVE_CHOICES = [2, 3, 4, 5, 6, 7]
+const OCTAVE_CHOICES = [1, 2, 3, 4, 5, 6, 7]
 const DEFAULT_OCTAVES = 5
-/** Extra octaves extend downwards from C6 — keeping the played window on screen — until C0, then upwards. */
-const TOP_NOTE = 84 // C6
-const BOTTOM_NOTE = 12 // C0
+const BOTTOM_NOTE = 12 // C0; below this the keys are subsonic, so the range never scrolls past it
+const MIN_OCTAVE = 0
+const MAX_OCTAVE = 7
+const HIGHEST_NOTE = 127
 
 export class Keyboard {
   readonly root: HTMLElement
@@ -44,7 +45,9 @@ export class Keyboard {
     guideTarget(octDown, 'button.octave.down', 'Keyboard octave down', 'button')
     guideTarget(octUp, 'button.octave.up', 'Keyboard octave up', 'button')
     const setOct = (o: number) => {
-      this.octave = Math.max(0, Math.min(7, o))
+      this.octave = Math.max(MIN_OCTAVE, Math.min(MAX_OCTAVE, o))
+      octDown.disabled = this.octave === MIN_OCTAVE
+      octUp.disabled = this.octave === MAX_OCTAVE
       this.syncKeys()
     }
     octDown.addEventListener('click', () => setOct(this.octave - 1))
@@ -60,6 +63,7 @@ export class Keyboard {
     range.value = String(this.octaves)
     range.addEventListener('change', () => {
       this.octaves = Number(range.value)
+      this.drawnStart = -1
       this.syncKeys(true)
     })
 
@@ -132,17 +136,33 @@ export class Keyboard {
     this.pointerNotes.clear()
   }
 
+  /** C-aligned range starts that keep the whole played window on screen, as [lowest, highest]. */
+  private validStarts(span: number): [number, number] {
+    const [lo, hi] = this.playableRange()
+    const ceiling = Math.floor((HIGHEST_NOTE - span) / 12) * 12
+    return [Math.max(BOTTOM_NOTE, Math.ceil((hi - span) / 12) * 12), Math.min(lo, ceiling)]
+  }
+
   /**
-   * Lowest drawn note: anchored below C6 for the chosen width, then shifted in whole octaves
-   * (so the row still starts on a C) as far as needed to keep the played window on screen.
+   * Lowest drawn note. The range holds still while the played window sits inside it, and when
+   * Z / X pushes the window out it pages — landing the window against the opposite edge — so
+   * the highlight travels the width of the keyboard instead of standing still. Scrolling by
+   * the minimum instead would shift the range by the same 12 semitones as the window on every
+   * step, which is what made Z / X look like it did nothing.
    */
   private rangeStart(): number {
     const span = this.octaves * 12
-    const [lo, hi] = this.playableRange()
-    let start = Math.max(BOTTOM_NOTE, TOP_NOTE - span)
-    if (hi > start + span) start += Math.ceil((hi - start - span) / 12) * 12
-    if (lo < start) start -= Math.ceil((start - lo) / 12) * 12
-    return Math.max(0, Math.min(start, 127 - span))
+    const [lowest, highest] = this.validStarts(span)
+    // Narrow widths cannot hold the whole window; show it from its lowest note up.
+    if (lowest > highest) return highest
+    if (this.drawnStart < 0) {
+      // First draw, or a fresh width: centre the window in the view.
+      const centred = Math.round((this.playableRange()[0] - (span - KEYMAP_SPAN) / 2) / 12) * 12
+      return Math.min(highest, Math.max(lowest, centred))
+    }
+    if (this.drawnStart < lowest) return highest // window climbed out of view: page up
+    if (this.drawnStart > highest) return lowest // window dropped out of view: page down
+    return this.drawnStart
   }
 
   /** Rebuilds the key row only when the drawn range moves; otherwise just restyles it. */
@@ -168,6 +188,7 @@ export class Keyboard {
       const note = startNote + oct * 12 + WHITE_OFFSETS[inOct]
       const key = el('div', 'key white')
       key.dataset.note = String(note)
+      if (note % 12 === 0) key.appendChild(el('span', 'key-name', noteName(note)))
       this.keys.appendChild(key)
       this.keyEls.set(note, key)
       if (w < numWhite - 1 && inOct in BLACK_OFFSETS) {
