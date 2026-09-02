@@ -84,6 +84,26 @@ function revealInScrollContainer(element: HTMLElement): void {
   }
 }
 
+export interface GuideTargetInfo { id: string; label: string; type: string; visible: boolean }
+
+const DEFAULT_TARGET_PAGE_SIZE = 5
+
+/**
+ * One teaching target as a single line: `param.env1.release knob env1 Release`,
+ * mirroring `compactParameter` in src/webmcp/tools.ts so the two discovery
+ * tools read as one API.
+ *
+ * Visibility stays on the line — as a trailing ` (hidden)`, the way a compact
+ * parameter carries a trailing `mod` — because `show_ui_guide` degrades a step
+ * whose target is off-screen into a warning ("open the relevant panel first").
+ * An agent picking between `tab.env1` and `param.env1.release` needs to know
+ * that the knob only exists once its tab is open, before it builds the guide
+ * rather than after the human sees the warning.
+ */
+export function compactTarget(item: GuideTargetInfo): string {
+  return `${item.id} ${item.type} ${item.label}${item.visible ? '' : ' (hidden)'}`
+}
+
 export class UiGuideController {
   private active: Driver | null = null
   private disposed = false
@@ -137,21 +157,29 @@ export class UiGuideController {
   }
 
   listTargets(input: unknown) {
-    const value = object(input, ['search', 'offset', 'limit'], 'input')
+    const value = object(input, ['format', 'search', 'offset', 'limit'], 'input')
+    const format = value.format ?? 'full'
+    if (format !== 'full' && format !== 'compact') throw new Error("format must be 'full' or 'compact'")
     const search = value.search === undefined ? '' : text(value.search, 100, 'search').toLowerCase()
     const offset = value.offset ?? 0
-    const limit = value.limit ?? 5
     if (!Number.isInteger(offset) || (offset as number) < 0) throw new Error('offset must be a non-negative integer')
-    if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > 20) throw new Error('limit must be an integer from 1 to 20')
+    if (value.limit !== undefined && (!Number.isInteger(value.limit) || (value.limit as number) < 1 || (value.limit as number) > 20)) {
+      throw new Error('limit must be an integer from 1 to 20')
+    }
     const blocking = this.blockingRoot()
-    const items = this.matches('[data-guide-id]').map(element => ({
+    const items: GuideTargetInfo[] = this.matches('[data-guide-id]').map(element => ({
       id: element.dataset.guideId!, label: element.dataset.guideLabel ?? element.dataset.guideId!,
       type: element.dataset.guideKind ?? element.tagName.toLowerCase(),
       visible: visible(element) && (!blocking || blocking.contains(element) || blocking === element)
     })).filter(item => `${item.id} ${item.label} ${item.type}`.toLowerCase().includes(search)).sort((a, b) => a.id.localeCompare(b.id))
-    const page = items.slice(offset as number, (offset as number) + (limit as number))
+    // A compact call needs no page size: the whole space is the point of it.
+    const limit = (value.limit ?? (format === 'compact' ? Math.max(items.length, 1) : DEFAULT_TARGET_PAGE_SIZE)) as number
+    const page = items.slice(offset as number, (offset as number) + limit)
     const nextOffset = (offset as number) + page.length
-    return { items: page, total: items.length, offset, limit, ...(nextOffset < items.length ? { nextOffset } : {}) }
+    const more = nextOffset < items.length ? { nextOffset } : {}
+    return format === 'compact'
+      ? { items: page.map(compactTarget), total: items.length, format: 'compact' as const, ...more }
+      : { items: page, total: items.length, offset, limit, ...more }
   }
 
   show(input: unknown, presentation: GuidePresentation = {}) {

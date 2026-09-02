@@ -95,7 +95,7 @@ All eighteen semantic tools register at page load, so `GET /tools` returns the s
 - `analyze_reference_audio` — decodes a short Base64 reference in browser memory and analyzes it with exactly the same metrics as `analyze_audio`.
 - `compare_audio` — compares that latest reference analysis against the same latest-render/current-scope candidate selected by `analyze_audio`. With nothing rendered and a silent scope it refuses rather than scoring the reference against silence, which returned a plausible-looking similarity an agent read as a baseline. Each result also carries `progress`: the session best so far against this reference and how far the current comparison is from it.
 - `save_preset`, `load_preset`, and `list_presets` — validated, replace-by-name browser presets in localStorage, and the names already saved.
-- `get_ui_targets` — searchable, paginated semantic teaching targets with ID, label, type, and visibility.
+- `get_ui_targets` — semantic teaching targets with ID, label, type, and visibility. Call once with `format: 'compact'` for every mounted target as one line each (`param.env1.release knob env1 Release`, with a trailing `(hidden)` when the target's panel or tab is not open yet); `search`/`offset`/`limit` page the full objects, up to 20 at a time.
 - `show_ui_guide` — interactive Driver.js walkthroughs with safe CommonMark instructions, powered by micromark. No patch changes or checkpoints.
 - `get_history` — bounded pages of retained sound states or replay entries, with the current sound ID and history revision.
 - `navigate_history` — undo, redo, or restore a retained sound version using an expected revision to guard against stale AI requests.
@@ -106,7 +106,7 @@ All eighteen semantic tools register at page load, so `GET /tools` returns the s
 
 After audio starts for the first time, coSynth opens a four-step introduction to its AI controls, playable keyboard, and synth workspace. Closing or finishing it records a versioned browser-local preference. The Help button in the activity toolbar restarts it from step one. This built-in tour never enters Replays or changes the sound.
 
-Use `get_ui_targets({ search: 'echo' })` to discover `fx.delay`, or search by parameter ID, panel, tab, or source. Common target IDs include `panel.osc1`, `tab.env1`, `param.env1.attack`, `source.env1`, and `param.filter1.cutoff`. Only currently mounted targets appear in discovery; changing the ENV/LFO tab updates the available knob IDs.
+Call `get_ui_targets({ format: 'compact' })` once to see the whole teaching space — roughly 259 targets, about 12 KB, one line each — rather than paging or guessing search terms; `get_ui_targets({ search: 'echo' })` narrows it to `fx.delay`, and search also spans parameter ID, panel, tab, and source. Common target IDs include `panel.osc1`, `tab.env1`, `param.env1.attack`, `source.env1`, and `param.filter1.cutoff`. Only currently mounted targets appear in discovery; changing the ENV/LFO tab updates the available knob IDs.
 
 ```json
 {

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { guideMarkdown, UiGuideController, validateGuide } from './guide'
+import { guideMarkdown, UiGuideController, validateGuide, type GuideTargetInfo } from './guide'
 import { guideTarget } from './guide-target'
 
 describe('guide validation', () => {
@@ -44,8 +44,8 @@ describe('UiGuideController with Driver.js', () => {
   let app: HTMLElement
   let guide: UiGuideController
   const tick = () => vi.advanceTimersByTimeAsync(50)
-  const target = (id: string, parent = app) => {
-    const element = guideTarget(document.createElement('button'), id, id, 'button')
+  const target = (id: string, parent = app, label = id, kind = 'button') => {
+    const element = guideTarget(document.createElement('button'), id, label, kind)
     parent.appendChild(element)
     return element
   }
@@ -79,11 +79,52 @@ describe('UiGuideController with Driver.js', () => {
     target('overlay.button', overlay)
     const page = guide.listTargets({ search: 'osc1', limit: 1 })
     expect(page).toMatchObject({ total: 2, nextOffset: 1, items: [{ id: 'param.osc1.level', visible: false }] })
-    expect(guide.listTargets({}).items.some(t => t.id === 'outside')).toBe(false)
+    expect((guide.listTargets({}).items as GuideTargetInfo[]).some(t => t.id === 'outside')).toBe(false)
     expect(guide.listTargets({ search: 'overlay' }).items).toHaveLength(1)
     unregister()
     expect(guide.listTargets({ search: 'overlay' }).items).toHaveLength(0)
     expect(() => guide.listTargets({ limit: 21 })).toThrow()
+  })
+
+  /**
+   * The teaching eval: both models spent ten calls hunting for two IDs because
+   * 259 targets only came 20 at a time. One compact call must return the whole
+   * space, exactly as `get_parameter_schema`'s compact format already does.
+   */
+  it('returns every teaching target as one line each in a single unpaged call', () => {
+    target('param.env1.release', app, 'env1 Release', 'knob')
+    target('tab.env1', app, 'Env 1 amplitude envelope', 'tab')
+    target('fx.delay', app, 'Delay / echo effect', 'panel').hidden = true
+
+    const page = guide.listTargets({ format: 'compact' })
+    expect(page).toMatchObject({ format: 'compact', total: 3 })
+    expect(page).not.toHaveProperty('nextOffset')
+    // `id type label`, sorted by id, with visibility as a trailing marker:
+    // an agent must be able to tell `tab.env1` from `param.env1.release`, and
+    // to know which of them needs its panel opened first.
+    expect(page.items).toEqual([
+      'fx.delay panel Delay / echo effect (hidden)',
+      'param.env1.release knob env1 Release',
+      'tab.env1 tab Env 1 amplitude envelope'
+    ])
+  })
+
+  it('keeps compact paging and filtering honest, and leaves the full format alone', () => {
+    target('param.env1.release', app, 'env1 Release', 'knob')
+    target('tab.env1', app, 'Env 1 amplitude envelope', 'tab')
+    target('fx.delay', app, 'Delay / echo effect', 'panel')
+
+    expect(guide.listTargets({ format: 'compact', search: 'echo' })).toMatchObject({
+      items: ['fx.delay panel Delay / echo effect'], total: 1, format: 'compact'
+    })
+    // An explicit limit still pages, and still says how much is left.
+    expect(guide.listTargets({ format: 'compact', limit: 2 })).toMatchObject({ total: 3, nextOffset: 2 })
+    // The paged object format is unchanged for callers that already use it.
+    const full = guide.listTargets({ limit: 1 })
+    expect(full).toMatchObject({ offset: 0, limit: 1, total: 3, nextOffset: 1 })
+    expect(full.items).toEqual([{ id: 'fx.delay', label: 'Delay / echo effect', type: 'panel', visible: true }])
+    expect(full).not.toHaveProperty('format')
+    expect(() => guide.listTargets({ format: 'brief' })).toThrow(/format/)
   })
 
   it('highlights real controls without activating them and keeps a close control', async () => {
