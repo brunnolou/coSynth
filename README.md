@@ -173,6 +173,12 @@ During `npm run dev`, `vite.config.ts` proxies two endpoints, `/register` and `/
 
 The `/localhost_5173` path slug is hardcoded to the dev port. Serving the dev server on another port means changing three things together: `server.port` in `vite.config.ts`, that proxy key (the bridge derives the slug from the port the page is served on), and the port in the rewritten token `server` URL.
 
+### Measuring the agent experience
+
+`scripts/agent-ux-probe.mjs` keeps one live page open behind a small HTTP API so an evaluating agent can drive the tools one call at a time while session state persists. It exposes only what a real WebMCP client sees - each tool's `name`, `description`, `inputSchema` and `annotations` - and logs every call with its outcome and wall-clock cost, so "how many round trips did that cost" is measured rather than recalled. `GET /tools`, `POST /call`, `POST /start` (the human gesture), `GET /log`, `POST /reset`.
+
+It exists because the useful question is how the surface reads to an agent that has never seen the source, so an evaluating session must be given the descriptors and nothing else. Point it at a preview server, hand a fresh agent the task, and compare its `GET /log` summary against the field evidence above: calls to full discovery, calls before the first successful `update_parameters`, wall clock for a velocity sweep, and whether `attackMs` stays under 10 ms with a 7-cent detune.
+
 coSynth accepts both the current standards callback shape,
 `execute(input, { signal })`, and experimental clients that omit the execution
 options or its `AbortSignal`. Invocations without a signal remain cancellable
@@ -196,6 +202,7 @@ npm run preview
 node scripts/history-smoke.mjs http://localhost:4173/
 node scripts/guide-smoke.mjs http://localhost:4173/
 node scripts/webmcp-smoke.mjs http://localhost:4173/   # includes the cold-page offline render_audio check
+node scripts/agent-ux-probe.mjs http://localhost:4173/  # agent-UX measurement harness, see below
 # in another terminal:
 node scripts/webmcp-smoke.mjs
 SHOT=/tmp/cosynth-smoke.png node scripts/smoke.mjs
