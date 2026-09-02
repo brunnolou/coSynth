@@ -99,8 +99,14 @@ const scalarMetricKeys: (keyof AudioMetrics)[] = [
   'spectralRolloffHz', 'spectralFlatness'
 ]
 const ENVELOPE_POINTS = 64
-/** Round to 0.1 dB and normalise -0, which reads as an oddity in JSON diffs. */
-const roundDb = (value: number): number => (Math.round(value * 10) / 10) + 0 || 0
+/**
+ * Round to 0.1 dB and normalise -0, which reads as an oddity in JSON diffs. `|| 0` would
+ * also turn NaN into 0, which would disarm the finiteness guards this module ends with.
+ */
+const roundDb = (value: number): number => {
+  const rounded = Math.round(value * 10) / 10
+  return rounded === 0 ? 0 : rounded
+}
 const BAND_COUNT = 10
 /** Octave band centres: 31.25 Hz doubled nine times, ending at 16 kHz. */
 const BAND_CENTERS_HZ = Array.from({ length: BAND_COUNT }, (_, index) => 31.25 * 2 ** index)
@@ -248,6 +254,14 @@ export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMet
 
 const toDb = (amplitude: number): number => amplitude > 0 ? 20 * Math.log10(amplitude) : -160
 
+/**
+ * Level relative to a reference, floored and never positive. `toDb(a) - toDb(b)` cannot be
+ * used for this: its -160 floor applies to each term separately, so a near-silent buffer
+ * whose reference is below the floor produces a *positive* "relative to peak" level.
+ */
+const relativeToPeakDb = (value: number, peak: number, floorDb: number): number =>
+  value > 0 && peak > 0 ? Math.max(floorDb, Math.min(0, 20 * Math.log10(value / peak))) : floorDb
+
 const ENVELOPE_WINDOW_SECONDS = 0.005
 const ENVELOPE_HOP_SECONDS = 0.001
 /** How long the envelope must stop climbing before a hop counts as a local maximum. */
@@ -263,23 +277,32 @@ const LOUDNESS_GATE = 10 ** (-60 / 20)
 const ENVELOPE_FLOOR_DB = -100
 
 interface Envelope {
-  /** RMS amplitude per hop, each window centred on its hop and zero-padded at the edges. */
+  /** RMS amplitude per hop, each window centred on its hop and shifted inward at the edges. */
   values: Float32Array
   hopMs: number
   peak: number
   peakIndex: number
 }
 
-/** Mono-summed RMS envelope: 5 ms window, 1 ms hop. */
+/**
+ * RMS envelope of the channel *power*, not of a mono downmix: 5 ms window, 1 ms hop.
+ *
+ * Summing amplitudes would cancel anti-phase or merely decorrelated channels, so a wide
+ * stereo patch would read as silence and a unison-spread control would look like a level
+ * change. `sqrt(mean over channels of x²)` is level-preserving for any channel correlation
+ * and is identical to the old downmix for mono and for two equal channels.
+ *
+ * Windows are shifted inward rather than zero-padded at the buffer edges: a partial window
+ * reads low, and an agent cannot tell that trailing dip from a real decay.
+ */
 function computeEnvelope(channels: readonly Float32Array[], length: number, sampleRate: number): Envelope {
-  const window = Math.max(1, Math.round(ENVELOPE_WINDOW_SECONDS * sampleRate))
+  const window = Math.min(length, Math.max(1, Math.round(ENVELOPE_WINDOW_SECONDS * sampleRate)))
   const hop = Math.max(1, Math.round(ENVELOPE_HOP_SECONDS * sampleRate))
   const cumulative = new Float64Array(length + 1)
   for (let i = 0; i < length; i++) {
-    let mono = 0
-    for (const channel of channels) mono += channel[i]
-    mono /= channels.length
-    cumulative[i + 1] = cumulative[i] + mono * mono
+    let power = 0
+    for (const channel of channels) power += channel[i] * channel[i]
+    cumulative[i + 1] = cumulative[i] + power / channels.length
   }
 
   const half = Math.floor(window / 2)
@@ -288,11 +311,9 @@ function computeEnvelope(channels: readonly Float32Array[], length: number, samp
   let peak = 0
   let peakIndex = 0
   for (let index = 0; index < count; index++) {
-    const start = index * hop - half
-    const low = Math.max(0, start)
-    const high = Math.min(length, start + window)
-    const power = high > low ? cumulative[high] - cumulative[low] : 0
-    const value = Math.sqrt(power / window)
+    const low = Math.max(0, Math.min(index * hop - half, length - window))
+    const power = cumulative[low + window] - cumulative[low]
+    const value = Math.sqrt(Math.max(0, power) / window)
     values[index] = value
     if (value > peak) {
       peak = value
@@ -593,12 +614,11 @@ export function analyzeAudio(
     decayT60Ms = measureDecayT60Ms(envelope, localMax.index, localMax.level)
 
     const sustainIndex = Math.min(envelopeValues.length - 1, Math.round(0.8 * (envelopeValues.length - 1)))
-    sustainDb = Math.max(ENVELOPE_FLOOR_DB, toDb(envelopeValues[sustainIndex]) - toDb(envelopePeak))
+    sustainDb = relativeToPeakDb(envelopeValues[sustainIndex], envelopePeak, ENVELOPE_FLOOR_DB)
 
     envelopeDb = Array.from({ length: ENVELOPE_POINTS }, (_, point) => {
       const index = Math.round(point * (envelopeValues.length - 1) / (ENVELOPE_POINTS - 1))
-      const db = Math.max(ENVELOPE_FLOOR_DB, toDb(envelopeValues[index]) - toDb(envelopePeak))
-      return Math.round(db * 10) / 10
+      return roundDb(relativeToPeakDb(envelopeValues[index], envelopePeak, ENVELOPE_FLOOR_DB))
     })
 
     let gatedPower = 0

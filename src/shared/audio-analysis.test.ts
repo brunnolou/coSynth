@@ -117,6 +117,39 @@ describe('analyzeAudio', () => {
     expect(analyzeAudio([signal], sampleRate).spectralCentroidHz).toBeCloseTo(3000, -1)
   })
 
+  it('preserves envelope metrics for anti-phase and decorrelated stereo', () => {
+    const sampleRate = 48000
+    const left = sine(440, sampleRate, 1, 0.5)
+    const mono = analyzeAudio([left], sampleRate)
+    // An amplitude downmix cancels these to digital silence, so every envelope metric read
+    // as silence and a stereo-width control looked like a level change.
+    const antiPhase = analyzeAudio([left, Float32Array.from(left, value => -value)], sampleRate)
+    expect(antiPhase.loudnessDb).toBeCloseTo(mono.loudnessDb, 4)
+    expect(antiPhase.sustainDb).toBeCloseTo(mono.sustainDb, 4)
+    expect(antiPhase.envelopeDb).toEqual(mono.envelopeDb)
+
+    const decorrelated = analyzeAudio([left, sine(440, sampleRate, 1, 0.5, Math.PI / 2)], sampleRate)
+    expect(decorrelated.loudnessDb).toBeCloseTo(mono.loudnessDb, 1)
+  })
+
+  it('does not read the trailing envelope window as a decay on a steady tone', () => {
+    const sampleRate = 48000
+    const { envelopeDb, decayT60Ms } = analyzeAudio([sine(440, sampleRate, 1, 0.5)], sampleRate)
+    // A window that ran off the end of the buffer read ~1.9 dB low; an agent sees a real decay.
+    expect(envelopeDb[63]).toBeGreaterThan(-1)
+    expect(decayT60Ms).toBeNull()
+  })
+
+  it('keeps sustainDb and envelopeDb relative to the peak for a near-silent buffer', () => {
+    const sampleRate = 8000
+    const signal = new Float32Array(sampleRate)
+    for (let i = 0; i < sampleRate / 2; i++) signal[i] = 1e-9 * Math.sin(2 * Math.PI * 440 * i / sampleRate)
+    const metrics = analyzeAudio([signal], sampleRate)
+    // toDb's -160 floor applied to the reference alone once pushed this to +23 dB.
+    expect(metrics.sustainDb).toBeLessThanOrEqual(0)
+    expect(metrics.envelopeDb.every(value => value <= 0)).toBe(true)
+  })
+
   it('preserves spectral energy for anti-phase stereo', () => {
     const left = sine(1024, 8192, 1, 0.5)
     const right = Float32Array.from(left, value => -value)
@@ -293,6 +326,16 @@ describe('analyzeAudio', () => {
     const huge = Float32Array.from([3e38, -3e38, 3e38, -3e38])
     expect(Array.from(huge).every(Number.isFinite)).toBe(true)
     expect(() => analyzeAudio([huge], 48000)).toThrow(/analysis.*nonfinite/i)
+  })
+
+  it('lets the harmonics finiteness guard fire instead of rounding NaN to zero', () => {
+    // The 32768-sample harmonic FFT overflows Float32 here while the 4096-sample spectral
+    // FFT does not, so every scalar is finite and only the partial amplitudes go NaN.
+    // Rounding with `|| 0` turned those into 0 dB and let a fabricated B through.
+    const sampleRate = 48000
+    const huge = Float32Array.from({ length: sampleRate }, (_, i) => 5e34 * Math.sin(2 * Math.PI * 440 * i / sampleRate))
+    expect(Array.from(huge).every(Number.isFinite)).toBe(true)
+    expect(() => analyzeAudio([huge], sampleRate, { f0Hz: 440 })).toThrow(/nonfinite metric: harmonics/)
   })
 
   it('returns accepted metrics whose scalars are finite and never serialize as null', () => {
