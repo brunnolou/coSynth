@@ -3,6 +3,7 @@ import { PARAMS, defaultValues, paramIndex } from '../shared/params'
 import { DEFAULT_FX_ORDER, FX_IDS, MAX_MOD_SLOTS, defaultLfoShape, modSourceIndex, type ModSlotState } from '../shared/messages'
 import type { PresetData, RecordedAudio, SynthEngine } from '../audio/engine'
 import { createWebMcpTools, type WebMcpToolDependencies } from './tools'
+import { encodeWav } from './offline-render'
 import type { DecodeBase64AudioOptions, DecodedBase64Audio } from './audio-input'
 
 class MemoryStorage implements Storage {
@@ -523,7 +524,7 @@ describe('render and analysis tools', () => {
   it('records real-time output, analyzes it, returns a blob URL, and revokes the prior URL', async () => {
     vi.useFakeTimers()
     const { engine, execute } = setup()
-    const input = { notes: [{ midi: 60, velocity: 0.8, start: 0, duration: 0.05 }], duration: 0.1 }
+    const input = { notes: [{ midi: 60, velocity: 0.8, start: 0, duration: 0.05 }], duration: 0.1, format: 'url' }
     const firstPromise = execute('render_audio', input)
     await vi.advanceTimersByTimeAsync(200)
     const first = await firstPromise
@@ -546,7 +547,7 @@ describe('render and analysis tools', () => {
     const lifecycle = new AbortController()
     const { engine, execute } = setup(lifecycle.signal)
     const rendered = execute('render_audio', {
-      notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02, format: 'url'
     })
     await vi.advanceTimersByTimeAsync(30)
     const result = await rendered
@@ -695,7 +696,7 @@ describe('render and analysis tools', () => {
     const latest = await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'latest.wav' })
 
     const rendering = execute('render_audio', {
-      notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02, format: 'url'
     })
     await vi.advanceTimersByTimeAsync(30)
     const render = await rendering
@@ -846,6 +847,159 @@ describe('render and analysis tools', () => {
     const stopped = setup(); stopped.engine.running = false
     await expect(stopped.execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }] })).rejects.toThrow(/start audio/i)
     await expect(setup().execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }], duration: 15.1 })).rejects.toThrow(/15 seconds/i)
+  })
+})
+
+/**
+ * Offline rendering (plan Task 10). jsdom has no `OfflineAudioContext`, so the
+ * renderer is injected exactly as `decodeAudio` is; `offline-render.test.ts`
+ * covers the real implementation against a fake offline context.
+ */
+describe('offline rendering', () => {
+  const OFFLINE_RATE = 8000
+
+  /** Deterministic: the same notes and duration always produce the same PCM. */
+  function offlineRenderer() {
+    return vi.fn(async (_engine: unknown, notes: readonly { midi: number }[], duration: number): Promise<RecordedAudio> => {
+      const length = Math.max(64, Math.round(duration * OFFLINE_RATE))
+      const f0 = 440 * Math.pow(2, ((notes[0]?.midi ?? 69) - 69) / 12)
+      const channel = Float32Array.from({ length }, (_, index) => {
+        const t = index / OFFLINE_RATE
+        return 0.5 * Math.exp(-3 * t) * Math.sin(2 * Math.PI * f0 * t)
+      })
+      const channelData = [channel, channel.slice()]
+      return {
+        blob: new Blob([encodeWav(channelData, OFFLINE_RATE)], { type: 'audio/wav' }),
+        mimeType: 'audio/wav',
+        duration,
+        sampleRate: OFFLINE_RATE,
+        channelData
+      }
+    })
+  }
+
+  function offlineSetup(renderOffline = offlineRenderer()) {
+    const engine = new FakeEngine()
+    engine.running = false
+    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, { renderOffline })
+    const byName = new Map(tools.map(tool => [tool.name, tool]))
+    const execute = async (name: string, input: Record<string, unknown> = {}) =>
+      await byName.get(name)!.execute(input, { signal: new AbortController().signal }) as any
+    return { engine, byName, execute, renderOffline }
+  }
+
+  it('advertises the mode and format choices and no longer demands a Start gesture', () => {
+    const { byName } = offlineSetup()
+    const tool = byName.get('render_audio')!
+    expect((tool.inputSchema as any).properties.mode.enum).toEqual(['offline', 'realtime'])
+    expect((tool.inputSchema as any).properties.format.enum).toEqual(['metrics', 'url', 'base64'])
+    expect(tool.description).toMatch(/offline/i)
+    expect(tool.description).not.toMatch(/CLICK TO START AUDIO/i)
+    expect(byName.get('play_notes')!.description).toMatch(/CLICK TO START AUDIO/i)
+  })
+
+  it('renders offline by default, without a Start gesture, and repeats itself exactly', async () => {
+    const { engine, execute, renderOffline } = offlineSetup()
+    const input = { notes: [{ midi: 60, velocity: 0.8, start: 0, duration: 1 }], duration: 1.5 }
+    const first = await execute('render_audio', input)
+    expect(first).toMatchObject({ renderMode: 'offline', mimeType: 'audio/wav', duration: 1.5, sampleRate: OFFLINE_RATE, channels: 2 })
+    expect(first).not.toHaveProperty('url')
+    expect(first).not.toHaveProperty('audio')
+    expect(first).not.toHaveProperty('renderModeFallback')
+    expect(engine.recordOutput, 'no live capture, no gesture').not.toHaveBeenCalled()
+    expect(engine.noteOn).not.toHaveBeenCalled()
+    expect(renderOffline).toHaveBeenCalledWith(engine, expect.any(Array), 1.5)
+
+    const second = await execute('render_audio', input)
+    expect(second.metrics).toEqual(first.metrics)
+    // A single-pitch sequence gets harmonic analysis for free (plan Task 7.4).
+    expect(first.metrics.harmonics?.inharmonicity).toBeTypeOf('number')
+    expect(first.metrics.decayT60Ms).toBeGreaterThan(0)
+  })
+
+  it('omits harmonics when the sequence holds more than one pitch', async () => {
+    const { execute } = offlineSetup()
+    const result = await execute('render_audio', {
+      notes: [
+        { midi: 60, velocity: 0.8, start: 0, duration: 0.5 },
+        { midi: 64, velocity: 0.8, start: 0, duration: 0.5 }
+      ],
+      duration: 1
+    })
+    expect(result.renderMode).toBe('offline')
+    expect(result.metrics.harmonics).toBeUndefined()
+  })
+
+  it('returns a blob URL or an inline mono WAV on request', async () => {
+    const { execute } = offlineSetup()
+    const input = { notes: [{ midi: 60, velocity: 0.8, start: 0, duration: 0.5 }], duration: 1 }
+    const url = await execute('render_audio', { ...input, format: 'url' })
+    expect(url.url).toMatch(/^blob:/)
+    expect(url).not.toHaveProperty('audio')
+
+    const base64 = await execute('render_audio', { ...input, format: 'base64' })
+    expect(base64.audio).toMatchObject({ mimeType: 'audio/wav', channels: 1, sampleRate: 22050, truncated: false })
+    expect(base64.audio.duration).toBeCloseTo(1, 2)
+    expect(atob(base64.audio.base64).slice(0, 4)).toBe('RIFF')
+    expect(base64).not.toHaveProperty('url')
+  })
+
+  it('renders far faster than real time — a 15-second render returns without waiting 15 seconds', async () => {
+    // An honest, weak claim: jsdom has no real OfflineAudioContext, so this can
+    // only show the offline path never runs a wall-clock capture. The plan's
+    // "< 25 % of the requested duration" belongs in a browser benchmark.
+    const { execute } = offlineSetup()
+    const started = Date.now()
+    const result = await execute('render_audio', {
+      notes: [{ midi: 60, velocity: 0.8, start: 0, duration: 14 }], duration: 15
+    })
+    expect(result.renderMode).toBe('offline')
+    expect(Date.now() - started).toBeLessThan(15000 * 0.25)
+  })
+
+  it('falls back to real time, and says so, when offline rendering is unavailable', async () => {
+    vi.useFakeTimers()
+    const { engine, execute } = setup()
+    const rendering = execute('render_audio', {
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.05 }], duration: 0.1, mode: 'offline'
+    })
+    await vi.advanceTimersByTimeAsync(200)
+    const result = await rendering
+    expect(result.renderMode).toBe('realtime')
+    expect(result.renderModeFallback).toMatch(/offline rendering is unavailable/i)
+    expect(engine.recordOutput).toHaveBeenCalled()
+  })
+
+  it('reports the missing gesture and the missing offline path separately', async () => {
+    const stopped = setup(); stopped.engine.running = false
+    await expect(stopped.execute('render_audio', {
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }], mode: 'realtime'
+    })).rejects.toThrow(/mode: "offline"/)
+    await expect(stopped.execute('render_audio', {
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }], mode: 'offline'
+    })).rejects.toThrow(/offline rendering is unavailable/i)
+  })
+
+  it('still renders in real time when the agent asks for it', async () => {
+    vi.useFakeTimers()
+    const renderOffline = offlineRenderer()
+    const engine = new FakeEngine()
+    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, { renderOffline })
+    const render = tools.find(tool => tool.name === 'render_audio')!
+    const rendering = render.execute({
+      notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.05 }], duration: 0.1, mode: 'realtime'
+    }, { signal: new AbortController().signal }) as Promise<any>
+    await vi.advanceTimersByTimeAsync(200)
+    expect(await rendering).toMatchObject({ renderMode: 'realtime', mimeType: 'audio/webm' })
+    expect(renderOffline).not.toHaveBeenCalled()
+    expect(engine.recordOutput).toHaveBeenCalled()
+  })
+
+  it('rejects unknown mode and format values', async () => {
+    const { execute } = offlineSetup()
+    const notes = [{ midi: 60, velocity: 1, start: 0, duration: 0.1 }]
+    await expect(execute('render_audio', { notes, mode: 'fast' })).rejects.toThrow(/mode must be one of offline, realtime/)
+    await expect(execute('render_audio', { notes, format: 'wav' })).rejects.toThrow(/format must be one of metrics, url, base64/)
   })
 })
 

@@ -1,4 +1,4 @@
-import type { SynthEngine } from '../audio/engine'
+import type { RecordedAudio, SynthEngine } from '../audio/engine'
 import { agentActivityFor } from './activity'
 import {
   PARAMS, defaultNorm, formatValue, normToValue, paramIndex, valueToNorm,
@@ -9,6 +9,7 @@ import { analyzeAudio, compareAudioMetrics, type AudioMetrics, type AudioMetrics
 import { listPresets, loadPreset, savePreset, validatePresetData, validatePresetName } from '../shared/preset-store'
 import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
 import { analyzeAudioAbortably } from './audio-analysis-task'
+import { BASE64_MAX_SECONDS, monoWavBase64, offlineRenderAvailable, renderOffline, type OfflineRenderer } from './offline-render'
 import { PerformanceManager, performNotes, assertNotesAvailable, validatePerformanceNotes } from '../history/performance'
 import type { ReplayStore } from '../history/replays'
 
@@ -44,6 +45,12 @@ type DecodeAudio = typeof decodeBase64Audio
 export interface WebMcpToolDependencies {
   decodeAudio?: DecodeAudio
   analyzeAudioAsync?: typeof analyzeAudioAbortably
+  /**
+   * Renders a note sequence without the live graph. Defaults to
+   * `renderOffline()` when this browser has `OfflineAudioContext` and the
+   * AudioWorklet; injected the same way as `decodeAudio` in tests.
+   */
+  renderOffline?: OfflineRenderer
   performance?: PerformanceManager
   replays?: ReplayStore
   currentSoundEntryId?: () => string
@@ -177,6 +184,49 @@ function assertFormat(value: unknown): 'full' | 'compact' {
   return value
 }
 
+const RENDER_MODES = ['offline', 'realtime'] as const
+const RENDER_FORMATS = ['metrics', 'url', 'base64'] as const
+type RenderMode = (typeof RENDER_MODES)[number]
+type RenderFormat = (typeof RENDER_FORMATS)[number]
+
+function assertRenderMode(value: unknown): RenderMode | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || !RENDER_MODES.includes(value as RenderMode)) {
+    throw new Error(`mode must be one of ${RENDER_MODES.join(', ')}`)
+  }
+  return value as RenderMode
+}
+
+function assertRenderFormat(value: unknown): RenderFormat {
+  if (value === undefined) return 'metrics'
+  if (typeof value !== 'string' || !RENDER_FORMATS.includes(value as RenderFormat)) {
+    throw new Error(`format must be one of ${RENDER_FORMATS.join(', ')}`)
+  }
+  return value as RenderFormat
+}
+
+/** A single-pitch sequence gets harmonic analysis for free (plan Task 7.4). */
+function analysisOptionsFor(notes: readonly { midi: number }[]): { f0Hz?: number } {
+  const pitches = new Set(notes.map(note => note.midi))
+  if (pitches.size !== 1) return {}
+  const [midi] = [...pitches]
+  return { f0Hz: 440 * Math.pow(2, (midi - 69) / 12) }
+}
+
+/**
+ * Resolve the offline renderer once per tool set: an injected dependency, then
+ * an engine that carries its own renderer, then the real implementation when
+ * this browser can render offline at all.
+ */
+function resolveOfflineRenderer(engine: SynthEngine, dependencies: WebMcpToolDependencies): OfflineRenderer | null {
+  if (dependencies.renderOffline) return dependencies.renderOffline
+  const own = (engine as Partial<{
+    renderOffline: (notes: readonly { midi: number; velocity: number; start: number; duration: number }[], duration: number) => Promise<RecordedAudio>
+  }>).renderOffline
+  if (typeof own === 'function') return (target, notes, duration) => own.call(target, notes, duration)
+  return offlineRenderAvailable() ? renderOffline : null
+}
+
 function routeValue(slot: number, route: ModSlotState) {
   return {
     slot,
@@ -297,6 +347,7 @@ export function createWebMcpTools(
   agentActivityFor(engine)
   const decodeAudio = dependencies.decodeAudio ?? decodeBase64Audio
   const analyzeAudioAsync = dependencies.analyzeAudioAsync ?? analyzeAudioAbortably
+  const offlineRenderer = resolveOfflineRenderer(engine, dependencies)
 
   const cleanup = () => {
     session.referenceGeneration++
@@ -690,29 +741,70 @@ export function createWebMcpTools(
     },
     {
       name: 'render_audio',
-      description: 'Record the live AudioWorklet output in real time while playing a bounded note sequence, and return audio metrics for it; this is not offline or deterministic. `peakDb` is an instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels. Requires runtime.running=true; otherwise click CLICK TO START AUDIO first.',
+      description: 'Render a bounded note sequence and return audio metrics for it. Offline by default: deterministic, far faster than real time, and available before the human has started audio — only `play_notes` needs that gesture. Pass `mode: "realtime"` to capture the live AudioWorklet output instead (needs running audio, not deterministic); an offline request falls back to real time, and says so in `renderModeFallback`, on browsers without OfflineAudioContext. `format` selects the audio payload: "metrics" (default, metrics only), "url" (a page-local blob URL), or "base64" (mono 16-bit WAV, 22.05 kHz, first ' + BASE64_MAX_SECONDS + ' s, so an audio-capable agent can listen). A single-pitch sequence also gets `metrics.harmonics`. `peakDb` is an instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels.',
       inputSchema: {
         type: 'object',
         properties: {
           notes: { type: 'array', minItems: 1, maxItems: MAX_NOTES, items: noteSchema },
-          duration: { type: 'number', exclusiveMinimum: 0, maximum: MAX_RENDER_SECONDS }
+          duration: { type: 'number', exclusiveMinimum: 0, maximum: MAX_RENDER_SECONDS },
+          mode: { type: 'string', enum: [...RENDER_MODES] },
+          format: { type: 'string', enum: [...RENDER_FORMATS] }
         },
         required: ['notes'], additionalProperties: false
       },
       annotations: { readOnlyHint: false },
       async execute(input, options) {
         return runPerformance(invocationSignal(options), async operationSignal => {
-          const value = assertObject(input, 'input', ['notes', 'duration'], ['notes'])
+          const value = assertObject(input, 'input', ['notes', 'duration', 'mode', 'format'], ['notes'])
           const sequence = validatePerformanceNotes(value.notes, MAX_RENDER_SECONDS)
-          if (!engine.running) throw new Error('Start audio with a user gesture before rendering audio')
+          const requestedMode = assertRenderMode(value.mode)
+          const format = assertRenderFormat(value.format)
           const duration = value.duration === undefined
             ? Math.min(MAX_RENDER_SECONDS, clean(sequence.duration + 0.25))
             : finite(value.duration, 'duration')
           if (duration <= 0 || duration > MAX_RENDER_SECONDS) throw new Error(`Render duration must be > 0 and limited to ${MAX_RENDER_SECONDS} seconds`)
           if (duration < sequence.duration) throw new Error('Render duration must cover the complete note sequence')
+          const wantsOffline = requestedMode === undefined ? offlineRenderer !== null : requestedMode === 'offline'
+          const renderModeFallback = wantsOffline && offlineRenderer === null
+            ? 'Offline rendering is unavailable here (no OfflineAudioContext or AudioWorklet); captured the live output in real time instead'
+            : undefined
+          const soundEntryId = dependencies.currentSoundEntryId?.()
+          const analysisOptions = analysisOptionsFor(sequence.notes)
+          const finish = (recording: RecordedAudio, metrics: AudioMetrics, renderMode: RenderMode) => {
+            if (session.lastRender) URL.revokeObjectURL(session.lastRender.url)
+            const url = URL.createObjectURL(recording.blob)
+            session.lastRender = { metrics, sampleRate: recording.sampleRate, channels: recording.channelData.length, url, soundEntryId }
+            return {
+              renderMode,
+              mimeType: recording.mimeType,
+              duration: recording.duration,
+              sampleRate: recording.sampleRate,
+              channels: recording.channelData.length,
+              metrics,
+              ...(format === 'url' ? { url } : {}),
+              ...(format === 'base64' ? { audio: monoWavBase64(recording.channelData, recording.sampleRate) } : {}),
+              ...(renderModeFallback ? { renderModeFallback } : {}),
+              ...(sequence.overlaps > 0 ? { retriggered: sequence.overlaps } : {})
+            }
+          }
+
+          if (wantsOffline && offlineRenderer) {
+            // No live graph, no held-note conflict, no Start gesture: the whole
+            // point of the offline path.
+            throwIfAborted(operationSignal)
+            const recording = await offlineRenderer(engine, sequence.notes, duration)
+            throwIfAborted(operationSignal)
+            const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal, analysisOptions)
+            return finish(recording, metrics, 'offline')
+          }
+
+          if (!engine.running) {
+            throw new Error(renderModeFallback
+              ? 'Start audio with a user gesture before rendering audio: offline rendering is unavailable in this browser'
+              : 'Start audio with a user gesture before rendering audio, or use mode: "offline"')
+          }
           assertNotesAvailable(engine, sequence.notes)
           throwIfAborted(operationSignal)
-          const soundEntryId = dependencies.currentSoundEntryId?.()
           const replayId = dependencies.replays?.startPerformance(sequence.notes, duration, 'AI rendered sequence', soundEntryId)
           const controller = new AbortController()
           const forwardAbort = () => controller.abort()
@@ -724,20 +816,9 @@ export function createWebMcpTools(
             notesTask = performance.trackPlayback(() => performNotes(engine, sequence.notes, controller.signal), 'ai')
             const [recording] = await Promise.all([recordingTask, notesTask])
             throwIfAborted(operationSignal)
-            const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal)
-            if (session.lastRender) URL.revokeObjectURL(session.lastRender.url)
-            const url = URL.createObjectURL(recording.blob)
-            session.lastRender = { metrics, sampleRate: recording.sampleRate, channels: recording.channelData.length, url, soundEntryId }
+            const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal, analysisOptions)
             if (replayId) dependencies.replays!.finishPerformance(replayId, 'completed')
-            return {
-              renderMode: 'realtime',
-              mimeType: recording.mimeType,
-              url,
-              duration: recording.duration,
-              sampleRate: recording.sampleRate,
-              channels: recording.channelData.length,
-              metrics
-            }
+            return finish(recording, metrics, 'realtime')
           } catch (error) {
             controller.abort()
             await Promise.allSettled([recordingTask, notesTask])
