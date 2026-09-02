@@ -3,9 +3,11 @@
 import assert from 'node:assert/strict'
 import { chromium } from 'playwright'
 
-// Only play_notes waits for the audio gesture; render_audio registers at load
-// because it renders offline.
-const TOOLS_AT_LOAD = 17
+// Every tool registers at page load and the set never changes across the
+// gesture. play_notes is registered but refuses until audio starts: an agent
+// that could not see it concluded playback was not a tool at all and went off
+// to drive the DOM instead.
+const TOOLS_AT_LOAD = 18
 const TOOLS_AFTER_AUDIO = 18
 
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined })
@@ -35,7 +37,7 @@ try {
   const previous = () => page.locator('.driver-popover-prev-btn').click()
 
   await page.waitForFunction(count => window.__guideTestTools.size === count, TOOLS_AT_LOAD)
-  assert.equal(await page.locator('.agent-feed-line').textContent(), `${TOOLS_AT_LOAD} tools ready · Start audio to unlock 1`)
+  assert.equal(await page.locator('.agent-feed-line').textContent(), `${TOOLS_AT_LOAD} tools ready · Start audio for live playback`)
   await show([{ markdown: 'Introduction' }, { target: { id: 'button.audio.start' }, markdown: 'Start audio yourself when ready.' }])
   await page.keyboard.press('ArrowRight')
   await highlighted('button.audio.start')

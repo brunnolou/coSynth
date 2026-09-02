@@ -2,9 +2,11 @@
 import assert from 'node:assert/strict'
 import { chromium } from 'playwright'
 
-// Only play_notes waits for the audio gesture; render_audio registers at load
-// because it renders offline.
-const TOOLS_AT_LOAD = 17
+// Every tool registers at page load and the set never changes across the
+// gesture. play_notes is registered but refuses until audio starts: an agent
+// that could not see it concluded playback was not a tool at all and went off
+// to drive the DOM instead.
+const TOOLS_AT_LOAD = 18
 const TOOLS_AFTER_AUDIO = 18
 
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined })

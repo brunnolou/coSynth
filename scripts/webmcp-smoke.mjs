@@ -44,7 +44,7 @@ function installShim(page) {
   })
 }
 
-const TOOLS_AT_LOAD = 17
+const TOOLS_AT_LOAD = 18
 const TOOLS_AFTER_AUDIO = 18
 
 try {
@@ -98,7 +98,9 @@ try {
     throw new Error(`Page was not cold: ${JSON.stringify(coldResult.before)}`)
   }
   if (!coldResult.before.names.includes('render_audio')) throw new Error('render_audio was not registered at page load')
-  if (coldResult.before.names.includes('play_notes')) throw new Error('play_notes was exposed before the audio gesture')
+  // play_notes is visible before the gesture on purpose - it refuses to run,
+  // but an agent that cannot see it concludes playback is not a tool.
+  if (!coldResult.before.names.includes('play_notes')) throw new Error('play_notes was hidden before the audio gesture')
   if (coldResult.render?.ok === false) throw new Error(`Cold offline render failed: ${JSON.stringify(coldResult.render)}`)
   if (coldResult.render.renderMode !== 'offline') {
     throw new Error(`Cold render did not use the offline path: ${JSON.stringify({ renderMode: coldResult.render.renderMode, renderModeFallback: coldResult.render.renderModeFallback })}`)
@@ -141,7 +143,7 @@ try {
   await shimmed.page.goto(url, { waitUntil: 'networkidle' })
   await shimmed.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOLS_AT_LOAD)
   const toolsBeforeAudio = await shimmed.page.evaluate(() => [...window.__webMcpTools.keys()])
-  if (toolsBeforeAudio.includes('play_notes')) throw new Error('play_notes was exposed before audio startup')
+  if (!toolsBeforeAudio.includes('play_notes')) throw new Error('play_notes was hidden before audio startup')
   await shimmed.page.click('#start-btn')
   await shimmed.page.waitForFunction(() => !document.getElementById('start-overlay'), { timeout: 10000 })
   await shimmed.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOLS_AFTER_AUDIO)
