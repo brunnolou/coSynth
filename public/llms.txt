@@ -11,6 +11,32 @@ client surfaces WebMCP tools, you already have them — call
 `get_parameter_schema` with `{"format": "compact"}` to see all 224 parameters,
 their units, ranges, defaults and which can be modulated, in one response.
 
+**If your client does NOT surface WebMCP tools and you are driving a browser
+yourself, registration will not have happened.** There is no host to register
+into, so `document.modelContext` is `undefined` and the tool surface does not
+exist — loading the page and looking for it finds nothing. Provide the host
+yourself, before navigation, and the app will register into it:
+
+```js
+await page.addInitScript(() => {
+  const tools = new Map()
+  Object.defineProperty(Document.prototype, 'modelContext', {
+    configurable: true,
+    get: () => ({
+      registerTool(tool) { tools.set(tool.name, tool); return Promise.resolve() },
+      async getTools() { return [...tools.values()] }
+    })
+  })
+  Object.defineProperty(window, '__tools', { value: tools })
+})
+// then navigate, and call tools with:
+//   __tools.get(name).execute(input, { signal: new AbortController().signal })
+```
+
+`window.coSynth` is the live engine, exposed for debugging and smoke tests. It
+is not the tool surface and carries none of the validation, so prefer the tools
+above; reach for it only to inspect state.
+
 If you are reading this file because you fetched the site: the app is a
 client-rendered single-page app, so fetching `/` returns a ~1 KB shell with no
 content. Nothing about the instrument is visible without executing its
