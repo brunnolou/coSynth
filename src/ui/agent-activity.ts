@@ -181,6 +181,11 @@ export class AgentActivityPanel {
     this.render()
   }
 
+  /** Lets a control outside this panel (the keyboard bar) raise the same dialog. */
+  openHistory(): void {
+    this.dialog.open()
+  }
+
   dispose(): void {
     this.disposed = true
     for (const unsubscribe of this.disposeListeners) unsubscribe()
