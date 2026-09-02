@@ -6,7 +6,8 @@ import type { ToWorklet } from '../shared/messages'
 import { paramIndex, WAVETABLE_NAMES } from '../shared/params'
 import { NUM_MIPS, type Wavetable } from '../shared/wavetable-gen'
 import {
-  BASE64_MAX_SECONDS, BASE64_SAMPLE_RATE, encodeWav, monoWavBase64, offlineRenderAvailable, renderOffline
+  BASE64_MAX_SECONDS, BASE64_SAMPLE_RATE, encodeWav, monoWavBase64, offlineRenderAvailable, renderOffline,
+  type MonoWavBase64
 } from './offline-render'
 
 const SAMPLE_RATE = 48000
@@ -487,6 +488,48 @@ describe('WAV encoding', () => {
     const short = monoWavBase64([left.subarray(0, SAMPLE_RATE)], SAMPLE_RATE)
     expect(short.truncated).toBe(false)
     expect(short.duration).toBeCloseTo(1, 2)
+  })
+
+  it('sends the louder channel when the mono sum cancels, and the plain sum otherwise', () => {
+    const tone = (hertz: number, gain = 1, phase = 0) => Float32Array.from(
+      { length: SAMPLE_RATE },
+      (_, index) => gain * Math.sin((2 * Math.PI * hertz * index) / SAMPLE_RATE + phase))
+    const level = (encoded: MonoWavBase64) => {
+      const bytes = atob(encoded.base64)
+      const view = new DataView(Uint8Array.from(bytes, character => character.charCodeAt(0)).buffer)
+      const frames = (view.byteLength - 44) / 2
+      let squares = 0
+      for (let index = 0; index < frames; index++) {
+        const sample = view.getInt16(44 + index * 2, true) / 32767
+        squares += sample * sample
+      }
+      return frames > 0 ? Math.sqrt(squares / frames) : 0
+    }
+
+    // Hard anti-phase: the analyzer's power downmix calls this loud, so a
+    // silent preview would contradict the metrics in the same response.
+    const antiphase = monoWavBase64([tone(1000), tone(1000, 1, Math.PI)], SAMPLE_RATE, 1)
+    expect(antiphase.downmix).toBe('left')
+    expect(level(antiphase), 'the agent hears the content, not the cancellation').toBeGreaterThan(0.5)
+
+    // The louder side wins, and it is named.
+    const quietLeft = monoWavBase64([tone(1000, 0.5), tone(1000, 1, Math.PI)], SAMPLE_RATE, 1)
+    expect(quietLeft.downmix).toBe('right')
+    expect(level(quietLeft)).toBeGreaterThan(0.5)
+
+    // Correlated stereo keeps the plain sum: nothing cancels.
+    const correlated = monoWavBase64([tone(1000), tone(1000)], SAMPLE_RATE, 1)
+    expect(correlated.downmix).toBe('sum')
+    expect(level(correlated)).toBeGreaterThan(0.5)
+
+    // So does ordinary wide stereo: two decorrelated channels lose 3 dB in any
+    // mono sum, which is the physics of mono, not a misleading artifact.
+    const wide = monoWavBase64([tone(1000), tone(1370)], SAMPLE_RATE, 1)
+    expect(wide.downmix, 'decorrelated is not cancelled').toBe('sum')
+
+    // Mono and silence have nothing to choose between.
+    expect(monoWavBase64([tone(1000)], SAMPLE_RATE, 1).downmix).toBe('sum')
+    expect(monoWavBase64([new Float32Array(SAMPLE_RATE), new Float32Array(SAMPLE_RATE)], SAMPLE_RATE, 1).downmix).toBe('sum')
   })
 
   it('attenuates content above the preview Nyquist instead of folding it back', () => {

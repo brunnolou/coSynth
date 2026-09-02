@@ -326,6 +326,87 @@ export interface MonoWavBase64 {
   bytes: number
   /** True when the source was longer than `BASE64_MAX_SECONDS`. */
   truncated: boolean
+  /**
+   * How the preview became mono: `sum` is the plain channel average, `left` /
+   * `right` means that average cancelled and the louder channel was sent alone.
+   */
+  downmix: 'sum' | 'left' | 'right'
+}
+
+/**
+ * How much level the mono sum may lose to phase cancellation before the preview
+ * switches to a single channel: the sum's RMS must stay above half (-6 dB) of
+ * the level-preserving power downmix `sqrt(mean over channels of x²)` that
+ * `analyzeAudio` measures.
+ *
+ * Two fully decorrelated channels of equal power already lose 3 dB in any mono
+ * sum — that is ordinary wide stereo and must keep the plain sum — so the
+ * threshold sits a further 3 dB down, where the loss can only come from
+ * correlated-but-opposed content. Hard anti-phase loses everything.
+ */
+const DOWNMIX_CANCELLATION_RATIO = 0.5
+
+/** RMS of `[0, frames)` of one channel. */
+function channelRms(channel: Float32Array | undefined, frames: number): number {
+  if (!channel || frames <= 0) return 0
+  let squares = 0
+  for (let frame = 0; frame < frames; frame++) {
+    const sample = channel[frame] ?? 0
+    squares += sample * sample
+  }
+  return Math.sqrt(squares / frames)
+}
+
+/** RMS of the plain channel average — the signal the preview would carry. */
+function sumRms(channels: readonly Float32Array[], frames: number): number {
+  if (frames <= 0) return 0
+  const channelCount = Math.max(1, channels.length)
+  let squares = 0
+  for (let frame = 0; frame < frames; frame++) {
+    let sum = 0
+    for (const channel of channels) sum += channel[frame] ?? 0
+    const mean = sum / channelCount
+    squares += mean * mean
+  }
+  return Math.sqrt(squares / frames)
+}
+
+/**
+ * Pick what the mono preview is made of.
+ *
+ * A true mono downmix of anti-phase content *is* silent, and that is correct
+ * for mono playback — but the preview exists so an audio-capable agent can hear
+ * what it just made, next to metrics that use the analyzer's power downmix and
+ * therefore report the content as loud. Handing over silence while the same
+ * response says `loudnessDb: -12` is the tools lying. So when the sum cancels,
+ * send the louder single channel instead and say which one.
+ */
+function selectDownmix(
+  channels: readonly Float32Array[],
+  frames: number
+): { sources: readonly Float32Array[]; downmix: MonoWavBase64['downmix'] } {
+  const plain = { sources: channels, downmix: 'sum' as const }
+  if (channels.length < 2) return plain
+  let power = 0
+  for (const channel of channels) {
+    const rms = channelRms(channel, frames)
+    power += rms * rms
+  }
+  const reference = Math.sqrt(power / channels.length)
+  // Silence cancels into silence: nothing to rescue, and no ratio to take.
+  if (reference <= 0) return plain
+  if (sumRms(channels, frames) >= DOWNMIX_CANCELLATION_RATIO * reference) return plain
+  let loudest = 0
+  let loudestRms = -1
+  channels.forEach((channel, index) => {
+    const rms = channelRms(channel, frames)
+    if (rms > loudestRms) {
+      loudestRms = rms
+      loudest = index
+    }
+  })
+  // Beyond stereo there is no better name for a channel than the side it is on.
+  return { sources: [channels[loudest]], downmix: loudest === 0 ? 'left' : 'right' }
 }
 
 /**
@@ -337,6 +418,9 @@ export interface MonoWavBase64 {
  * only about -13 dB — but it stops content above the preview's 11 kHz Nyquist
  * from folding back as a loud phantom tone in the middle of the band, which is
  * what an agent would otherwise hear and try to design away.
+ *
+ * `downmix` reports whether the channels were averaged or one of them was sent
+ * alone because the average cancelled: see `selectDownmix`.
  */
 export function monoWavBase64(
   channels: readonly Float32Array[],
@@ -350,13 +434,14 @@ export function monoWavBase64(
   const ratio = targetSampleRate / rate
   const outFrames = Math.max(0, Math.floor(keptFrames * ratio))
   const mono = new Float32Array(outFrames)
-  const channelCount = Math.max(1, channels.length)
+  const { sources, downmix } = selectDownmix(channels, keptFrames)
+  const channelCount = Math.max(1, sources.length)
   for (let index = 0; index < outFrames; index++) {
     const from = Math.min(keptFrames - 1, Math.floor(index / ratio))
     const to = Math.min(keptFrames, Math.max(from + 1, Math.floor((index + 1) / ratio)))
     let sum = 0
     for (let frame = from; frame < to; frame++) {
-      for (const channel of channels) sum += channel[frame] ?? 0
+      for (const channel of sources) sum += channel[frame] ?? 0
     }
     mono[index] = clampSample(sum / (channelCount * (to - from)))
   }
@@ -368,6 +453,7 @@ export function monoWavBase64(
     channels: 1,
     duration: outFrames / targetSampleRate,
     bytes: wav.byteLength,
-    truncated: keptFrames < sourceFrames
+    truncated: keptFrames < sourceFrames,
+    downmix
   }
 }
