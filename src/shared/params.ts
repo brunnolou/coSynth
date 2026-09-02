@@ -155,13 +155,22 @@ p({ id: 'dist.downsample', name: 'Rate', group: 'dist', min: 1, max: 64, def: 1,
 
 /**
  * Facts about a group that its parameter definitions cannot express, surfaced
- * by `get_parameter_schema`. Only hardwired routing belongs here: env1 is the
- * VCA (`voice.ts` multiplies the voice by `sources[SRC_ENV0]` and takes voice
- * lifetime from it), while env2..env6 and every LFO reach the sound only
- * through the mod matrix, so they get no note.
+ * by `get_parameter_schema`. Two kinds live here: hardwired routing - env1 is
+ * the VCA (`voice.ts` multiplies the voice by `sources[SRC_ENV0]` and takes
+ * voice lifetime from it), while env2..env6 and every LFO reach the sound only
+ * through the mod matrix - and the curve sign convention, which is a bare
+ * `-1..1` in the definitions and so a coin flip without it.
+ *
+ * The curve wording is measured, not guessed: `curveShape(t, c) = t^(2^(3c))`
+ * in `worklet/dsp.ts`, applied as `curveShape(t, atkCurve)` for the attack and
+ * as `1 - curveShape(t, -decCurve)` for decay and release, which is why the
+ * sign reads opposite between them. `worklet/dsp.test.ts` pins both directions.
  */
+const ENVELOPE_CURVE_NOTE = 'atk_curve, dec_curve, and rel_curve shape a stage, they do not lengthen it: 0 is linear. Positive atk_curve starts the attack slowly and rises steeply at its end; negative atk_curve jumps up and eases into the peak. dec_curve and rel_curve read the opposite way: positive falls fast and trails off into a long low tail (the usual exponential-sounding decay), negative holds near the level it started from and drops steeply only at the end of the stage - the default -0.4 is still at 96% of its starting level a quarter of the way through decay, which sounds like a delay before the decay rather than a slow one.'
+
 export const PARAM_GROUP_NOTES: Readonly<Record<string, string>> = {
-  env1: 'env1 is the amplitude envelope (VCA), hardwired to voice level and voice lifetime: a note stops sounding when env1 finishes its release. env2..env6 and lfo1..lfo8 have no hardwired destination and do nothing until routed with set_modulation.'
+  env1: 'env1 is the amplitude envelope (VCA), hardwired to voice level and voice lifetime: a note stops sounding when env1 finishes its release. env2..env6 and lfo1..lfo8 have no hardwired destination and do nothing until routed with set_modulation. ' + ENVELOPE_CURVE_NOTE,
+  ...Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`env${i + 2}`, ENVELOPE_CURVE_NOTE]))
 }
 
 // ---------------------------------------------------------------- envelopes (env1 = amp)

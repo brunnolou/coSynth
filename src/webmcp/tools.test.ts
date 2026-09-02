@@ -348,8 +348,24 @@ describe('state and parameter tools', () => {
     expect(env1.groupNotes.env1).toMatch(/amplitude/i)
     const env2 = await execute('get_parameter_schema', { group: 'env2' })
     // Only env1 is hardwired; nothing must be claimed for the others.
-    expect(env2.groupNotes).toBeUndefined()
+    expect(env2.groupNotes.env2).not.toMatch(/amplitude|hardwired|VCA/i)
     expect(JSON.stringify(await execute('get_parameter_schema'))).not.toContain('groupNotes')
+  })
+
+  it('says which way the envelope curve parameters bend', async () => {
+    const { execute } = setup()
+    // `-1..1 =-0.4` with no stated meaning made the sign a coin flip: an agent
+    // guessed wrong and its "3 second decay" was flat for the first 1.5 s.
+    for (const group of ['env1', 'env3', 'env6']) {
+      const notes = (await execute('get_parameter_schema', { group })).groupNotes[group]
+      expect(notes, group).toMatch(/atk_curve/)
+      expect(notes, group).toMatch(/dec_curve/)
+      expect(notes, group).toMatch(/rel_curve/)
+      // Both directions must be named, with the sign attached to each.
+      expect(notes, group).toMatch(/0 is linear/i)
+      expect(notes, group).toMatch(/positive/i)
+      expect(notes, group).toMatch(/negative/i)
+    }
   })
 
   it('lists modulation sources from a bare sourceLimit and in compact format', async () => {
