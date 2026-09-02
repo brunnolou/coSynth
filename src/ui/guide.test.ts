@@ -191,6 +191,20 @@ describe('UiGuideController with Driver.js', () => {
     expect(guide.isActive()).toBe(false)
   })
 
+  it('leaves a text-only step an escape route because outside clicks are ignored', async () => {
+    guide.show({ steps: [{ markdown: 'A long text-only explanation with no target.' }] })
+    await tick()
+    const close = document.querySelector<HTMLButtonElement>('.driver-popover-close-btn')
+    expect(close).not.toBeNull()
+    expect(close!.hidden).toBe(false)
+    expect(getComputedStyle(close!).display).not.toBe('none')
+    document.querySelector<SVGElement>('.driver-overlay path')!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    expect(guide.isActive()).toBe(true)
+    window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape' }))
+    expect(guide.isActive()).toBe(false)
+    expect(document.querySelector('.driver-popover')).toBeNull()
+  })
+
   it('does not bypass blocking startup screens or leave a guide trapped in a closed dialog', async () => {
     target('app.control')
     const screen = document.createElement('div')

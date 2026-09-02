@@ -191,7 +191,24 @@ try {
   const boundsSmall = await page.locator('.driver-popover').boundingBox()
   assert.ok(boundsSmall.x >= 0 && boundsSmall.x + boundsSmall.width <= 391)
   assert.ok(boundsSmall.y >= 0 && boundsSmall.y + boundsSmall.height <= 844)
+  // AI guides deliberately survive outside clicks so a stray tap on the synth cannot
+  // wipe the instructions, so the narrow layout must still offer a reachable way out.
   await page.locator('.driver-overlay').click({ position: { x: 3, y: 3 } })
+  assert.equal(await page.locator('.driver-popover').count(), 1, 'An outside click must not dismiss an AI guide')
+  const closeButton = page.locator('.driver-popover-close-btn')
+  const closeBounds = await closeButton.boundingBox()
+  assert.ok(closeBounds, 'A text-only step must offer a close button')
+  assert.ok(closeBounds.x >= 0 && closeBounds.x + closeBounds.width <= 391, 'The close button must stay on screen')
+  assert.ok(closeBounds.y >= 0 && closeBounds.y + closeBounds.height <= 844, 'The close button must stay on screen')
+  assert.equal(
+    await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.className, [closeBounds.x + closeBounds.width / 2, closeBounds.y + closeBounds.height / 2]),
+    'driver-popover-close-btn',
+    'Nothing may cover the close button'
+  )
+  await page.keyboard.press('Escape')
+  await page.locator('.driver-popover').waitFor({ state: 'detached' })
+  await show([{ markdown: 'Text-only help\n\n' + 'A readable explanation. '.repeat(70) }])
+  await page.locator('.driver-popover-close-btn').click()
   await page.locator('.driver-popover').waitFor({ state: 'detached' })
 
   // Every built-in step remains readable when the synth switches to its narrow layout.
