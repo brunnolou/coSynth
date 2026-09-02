@@ -34,12 +34,13 @@ const PROMPT_IDEAS = [
 ]
 
 function invitation(state: AgentActivitySnapshot): string {
+  const invite = 'Open this page in the ChatGPT Desktop app and ask.'
   if (state.toolAvailability === 'unavailable') {
-    return 'Nothing yet — this browser can’t reach the AI tools. Open coSynth in ChatGPT Desktop’s in-app browser and ChatGPT can design sounds with you here. Keep playing meanwhile.'
+    return `Nothing yet — this browser can’t reach the AI tools. ${invite} ChatGPT then designs sounds with you right here. Keep playing meanwhile.`
   }
-  if (state.toolAvailability === 'checking') return 'Getting the AI tools ready. Once they are up, ask ChatGPT for a sound and every move it makes shows up here.'
-  if (state.toolAvailability === 'error') return 'The AI tools failed to register. Reload the page, or reopen coSynth in ChatGPT Desktop’s in-app browser.'
-  return 'Nothing yet. Ask ChatGPT in the chat next to this page — every parameter it touches lands here for you to keep or reject.'
+  if (state.toolAvailability === 'checking') return `Getting the AI tools ready. ${invite} Every move ChatGPT makes shows up here.`
+  if (state.toolAvailability === 'error') return `The AI tools failed to register. Reload the page, or ${invite.charAt(0).toLowerCase()}${invite.slice(1)}`
+  return `Nothing yet. ${invite} Every parameter ChatGPT touches lands here for you to keep or reject.`
 }
 
 interface HistoryRow { root: HTMLElement; label: HTMLElement; meta: HTMLElement; direct: HTMLElement; details: HTMLElement; action: HTMLButtonElement; signature: string }

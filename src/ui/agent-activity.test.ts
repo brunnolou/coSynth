@@ -173,7 +173,7 @@ it('offers one AI button that opens activity and invites a first prompt', () => 
   expect((panel.root.querySelector('[data-guide-id="dialog.agent-changes"]') as HTMLDialogElement).open).toBe(true)
   const onboarding = panel.root.querySelector('.agent-onboarding') as HTMLElement
   expect(onboarding.hidden).toBe(false)
-  expect(onboarding.textContent).toContain('every parameter it touches lands here')
+  expect(onboarding.textContent).toContain('Open this page in the ChatGPT Desktop app and ask.')
   expect(onboarding.querySelectorAll('.agent-onboarding-prompts li').length).toBeGreaterThan(2)
   const keep = [...panel.root.querySelectorAll('button')].find(node => node.textContent === 'Keep changes') as HTMLButtonElement
   expect(keep.hidden).toBe(true) // Nothing to keep, so no dead controls or reject explainer.
@@ -186,7 +186,7 @@ it('names the pending count on the button and swaps the invitation for the chang
   const review = panel.root.querySelector('[data-guide-id="button.agent.checkpoint"]') as HTMLButtonElement
   activity.setToolReadiness(0, true, { available: false })
   expect(review.textContent).toBe('AI off')
-  expect(panel.root.querySelector('.agent-onboarding')?.textContent).toContain('ChatGPT Desktop')
+  expect(panel.root.querySelector('.agent-onboarding')?.textContent).toContain('ChatGPT Desktop app')
   activity.setToolReadiness(17, false, { available: true })
   engine.setParamById('osc1.level', 0.1, 'ai')
   expect(review.textContent).toBe('1 change')
@@ -282,10 +282,10 @@ it('explains a browser without AI tools inside the activity dialog', () => {
   review.click()
   expect((panel.root.querySelector('[data-guide-id="dialog.agent-changes"]') as HTMLDialogElement).open).toBe(true)
   expect(onboarding.hidden).toBe(false)
-  expect(onboarding.textContent).toContain('ChatGPT Desktop')
+  expect(onboarding.textContent).toContain('can’t reach the AI tools. Open this page in the ChatGPT Desktop app and ask.')
   activity.setToolReadiness(0, true, { available: true, errors: [{ tool: 'get_synth_state', message: 'Denied' }] })
   expect(review.textContent).toBe('AI error')
   expect(onboarding.textContent).toContain('failed to register')
-  expect(onboarding.textContent).not.toContain('ChatGPT Desktop’s in-app browser and ChatGPT')
+  expect(onboarding.textContent).toContain('open this page in the ChatGPT Desktop app and ask.')
   expect(panel.root.querySelector('[data-guide-id="dialog.agent-changes"] .history-error')?.textContent).toContain('get_synth_state: Denied')
 })
