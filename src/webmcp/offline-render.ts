@@ -277,6 +277,12 @@ export interface MonoWavBase64 {
 /**
  * Mono 16-bit WAV at 22.05 kHz, capped at 8 seconds — small enough to hand to
  * an audio-capable agent inside a tool result.
+ *
+ * Downsampling averages every source frame that falls inside an output frame
+ * rather than point-sampling it. That box filter is crude — its stopband is
+ * only about -13 dB — but it stops content above the preview's 11 kHz Nyquist
+ * from folding back as a loud phantom tone in the middle of the band, which is
+ * what an agent would otherwise hear and try to design away.
  */
 export function monoWavBase64(
   channels: readonly Float32Array[],
@@ -292,16 +298,13 @@ export function monoWavBase64(
   const mono = new Float32Array(outFrames)
   const channelCount = Math.max(1, channels.length)
   for (let index = 0; index < outFrames; index++) {
-    const position = index / ratio
-    const left = Math.min(keptFrames - 1, Math.floor(position))
-    const right = Math.min(keptFrames - 1, left + 1)
-    const fraction = position - left
+    const from = Math.min(keptFrames - 1, Math.floor(index / ratio))
+    const to = Math.min(keptFrames, Math.max(from + 1, Math.floor((index + 1) / ratio)))
     let sum = 0
-    for (const channel of channels) {
-      const a = channel[left] ?? 0
-      sum += a + ((channel[right] ?? a) - a) * fraction
+    for (let frame = from; frame < to; frame++) {
+      for (const channel of channels) sum += channel[frame] ?? 0
     }
-    mono[index] = clampSample(sum / channelCount)
+    mono[index] = clampSample(sum / (channelCount * (to - from)))
   }
   const wav = encodeWav([mono], targetSampleRate)
   return {

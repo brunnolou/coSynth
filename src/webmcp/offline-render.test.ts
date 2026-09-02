@@ -396,4 +396,24 @@ describe('WAV encoding', () => {
     expect(short.truncated).toBe(false)
     expect(short.duration).toBeCloseTo(1, 2)
   })
+
+  it('attenuates content above the preview Nyquist instead of folding it back', () => {
+    const tone = (hertz: number) => Float32Array.from(
+      { length: SAMPLE_RATE }, (_, index) => Math.sin((2 * Math.PI * hertz * index) / SAMPLE_RATE))
+    const level = (samples: Float32Array) => {
+      let sum = 0
+      for (const sample of samples) sum += sample * sample
+      return Math.sqrt(sum / Math.max(1, samples.length))
+    }
+    const decoded = (source: Float32Array) => {
+      const bytes = atob(monoWavBase64([source], SAMPLE_RATE).base64)
+      const view = new DataView(Uint8Array.from(bytes, character => character.charCodeAt(0)).buffer)
+      const frames = (view.byteLength - 44) / 2
+      return Float32Array.from({ length: frames }, (_, index) => view.getInt16(44 + index * 2, true) / 32767)
+    }
+    // 20 kHz has no home below 11.025 kHz: it must be attenuated, not aliased down.
+    expect(level(decoded(tone(20000)))).toBeLessThan(0.4 * level(tone(20000)))
+    // A tone well inside the preview band survives.
+    expect(level(decoded(tone(1000)))).toBeGreaterThan(0.6 * level(tone(1000)))
+  })
 })
