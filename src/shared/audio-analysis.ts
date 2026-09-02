@@ -264,14 +264,24 @@ const relativeToPeakDb = (value: number, peak: number, floorDb: number): number 
 
 const ENVELOPE_WINDOW_SECONDS = 0.005
 const ENVELOPE_HOP_SECONDS = 0.001
-/** How long the envelope must stop climbing before a hop counts as a local maximum. */
+/** Shortest window the envelope hull's growth rate is measured over. */
 const PLATEAU_HOLD_MS = 10
 /**
- * A hop is a local maximum when nothing in the next PLATEAU_HOLD_MS exceeds it by more
- * than this. Slow unison beating climbs a few percent per 10 ms; a real attack climbs far
- * faster, so this separates "still attacking" from "sustaining while the beat drifts".
+ * The attack ends at the first hop whose hull growth has fallen to this fraction of the
+ * average growth since onset. Comparing a rate against the run's *own* average rate is
+ * what separates "still attacking" from "sustaining while a beat drifts": a beating
+ * unison reaches half its eventual level in the first couple of milliseconds and then
+ * crawls, twenty times slower, so it trips this immediately - while a linear swell grows
+ * at one steady rate for its whole length and trips it only at the top, however long that
+ * takes.
  */
-const PLATEAU_TOLERANCE = 0.08
+const ATTACK_SLOPE_FRACTION = 0.25
+/**
+ * The growth window also grows with elapsed time. A 10 ms window is a couple of cycles at
+ * the low end, so its ripple swamps the growth of a multi-second swell; widening it keeps
+ * short attacks sharp and long ones measurable.
+ */
+const ATTACK_SPAN_FRACTION = 0.25
 /** Envelope windows quieter than this are excluded from the gated loudness figure. */
 const LOUDNESS_GATE = 10 ** (-60 / 20)
 const ENVELOPE_FLOOR_DB = -100
@@ -323,27 +333,42 @@ function computeEnvelope(channels: readonly Float32Array[], length: number, samp
   return { values, hopMs: hop * 1000 / sampleRate, peak, peakIndex }
 }
 
+/** Running maximum, left to right. Monotone, so it is immune to the RMS window's ripple. */
+function risingHull(values: Float32Array): Float32Array {
+  const hull = new Float32Array(values.length)
+  let highest = 0
+  for (let index = 0; index < values.length; index++) {
+    if (values[index] > highest) highest = values[index]
+    hull[index] = highest
+  }
+  return hull
+}
+
 /**
- * The first hop the envelope stops climbing for PLATEAU_HOLD_MS, and the height it reaches
- * there. This is the end of the attack; the global peak may arrive much later (tremolo,
- * unison beating, a swell), which is what `timeToPeakMs` reports.
+ * Where the attack ends, and the level it reached. The global peak may arrive much later
+ * (tremolo, unison beating, a swell), which is what `timeToPeakMs` reports.
+ *
+ * Measured as growth of the rising hull over PLATEAU_HOLD_MS, compared against the fastest
+ * growth since onset. A fixed fractional growth per fixed hold cannot work: any rising
+ * envelope's fractional growth per 10 ms drops below 8 % about 125 ms in, so every attack
+ * longer than that read the same ~94 ms.
  */
 function findFirstLocalMax(envelope: Envelope): { index: number; level: number } {
   const { values, peak, peakIndex } = envelope
   const hold = Math.max(1, Math.round(PLATEAU_HOLD_MS / envelope.hopMs))
-  const floor = peak * 0.1
-  for (let index = 0; index < values.length; index++) {
-    if (values[index] < floor) continue
-    const last = Math.min(values.length - 1, index + hold)
-    let highest = values[index]
-    let highestIndex = index
-    for (let ahead = index + 1; ahead <= last; ahead++) {
-      if (values[ahead] > highest) {
-        highest = values[ahead]
-        highestIndex = ahead
-      }
+  const hull = risingHull(values)
+  for (let index = 0; index < hull.length - 1; index++) {
+    const elapsed = index + 1
+    const ahead = Math.min(hull.length - 1, index + Math.max(hold, Math.round(elapsed * ATTACK_SPAN_FRACTION)))
+    if (ahead <= index) break
+    const growth = (hull[ahead] - hull[index]) / (ahead - index)
+    // Averaged from the buffer start, never from a level threshold: dividing a level that
+    // has already arrived by one hop reads as an impossibly fast rate and ends the attack
+    // at its own onset. A late-starting note only dilutes the average, which errs long.
+    const average = hull[index] / elapsed
+    if (average > 0 && growth <= average * ATTACK_SLOPE_FRACTION) {
+      return { index: ahead, level: hull[ahead] }
     }
-    if (highest <= values[index] * (1 + PLATEAU_TOLERANCE)) return { index: highestIndex, level: highest }
   }
   return { index: peakIndex, level: peak }
 }

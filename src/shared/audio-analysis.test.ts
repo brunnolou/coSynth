@@ -30,6 +30,15 @@ function beating(sampleRate: number, seconds: number, attackSeconds: number): Fl
   })
 }
 
+/** A 220 Hz tone with a linear attack of the given length, then a steady sustain. */
+function swell(attackMs: number, sampleRate: number, seconds: number): Float32Array {
+  const attackSeconds = attackMs / 1000
+  return Float32Array.from({ length: Math.round(sampleRate * seconds) }, (_, i) => {
+    const t = i / sampleRate
+    return 0.5 * Math.min(1, t / attackSeconds) * Math.sin(2 * Math.PI * 220 * t)
+  })
+}
+
 /** Band-limited sawtooth: partial n has amplitude 1/n, so partial levels fall 6 dB per octave. */
 function sawtooth(frequency: number, sampleRate: number, seconds: number, amplitude = 0.5): Float32Array {
   const partials = Math.floor(sampleRate / 2 / frequency)
@@ -171,6 +180,25 @@ describe('analyzeAudio', () => {
     expect(metrics.decayT60Ms as number).toBeLessThan(2100)
     expect(metrics.sustainDb).toBeLessThan(-20)
     expect(metrics.timeToPeakMs).toBeLessThan(20)
+  })
+
+  it('tracks attacks from 2 ms to 2 s instead of saturating just past 100 ms', () => {
+    const sampleRate = 48000
+    // A fixed fractional growth over a fixed hold reports the same ~94 ms for every attack
+    // longer than ~125 ms, because *any* rising envelope grows slower than 8 % per 10 ms
+    // by then. Every pad and swell read the same wrong number.
+    const measured = [2, 5, 50, 250, 1000, 2000].map(attackMs => ({
+      attackMs,
+      reported: analyzeAudio([swell(attackMs, sampleRate, Math.max(3, attackMs / 500))], sampleRate).attackMs
+    }))
+    for (const { attackMs, reported } of measured) {
+      // 10 % to 90 % of a linear ramp is 80 % of its length, plus the RMS window's smear.
+      expect(reported).toBeGreaterThan(0.8 * attackMs - 8)
+      expect(reported).toBeLessThan(0.8 * attackMs + 8)
+    }
+    for (let i = 1; i < measured.length; i++) {
+      expect(measured[i].reported).toBeGreaterThan(measured[i - 1].reported)
+    }
   })
 
   it('measures the attack of a beating unison instead of the beat rise', () => {
