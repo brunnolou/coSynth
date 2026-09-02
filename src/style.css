@@ -802,8 +802,10 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   cursor: pointer;
 }
 .oct-btn:disabled { opacity: 0.35; cursor: default; }
-.kb-history { flex: 0 0 22px; width: 22px; height: 20px; padding: 0; }
-.kb-history svg { width: 13px; height: 13px; }
+/* Two classes so this beats .agent-icon-button's 30x28 from iconButton,
+   whatever order the stylesheets land in. */
+.kb-bar .kb-history { flex: 0 0 22px; width: 22px; height: 20px; padding: 0; }
+.kb-bar .kb-history svg { width: 13px; height: 13px; }
 .oct-label { font-size: 10px; color: var(--text-dim); width: 56px; text-align: center; }
 .kb-range { font-size: 10px; padding: 2px 4px; }
 .kb-hint { font-size: 9px; color: var(--text-dim); margin-left: auto; }
