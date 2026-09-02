@@ -14,7 +14,13 @@ export default defineConfig({
   // at ws://localhost:5173 instead of ws://localhost:4797 to use this.
   // Tests assert on style.css (see ui/knob.test.ts: gating must not take the whole
   // knob root out of pointer reach). Vitest blanks CSS imports unless told otherwise.
-  test: { css: { include: [/style\.css/] } },
+  // Agent worktrees live under .claude/worktrees/, so they hold a second copy of
+  // the whole suite at some other commit. Collecting those doubles the reported
+  // test count and runs stale code, which reads as a bigger green than it is.
+  test: {
+    css: { include: [/style\.css/] },
+    exclude: ['**/node_modules/**', '**/dist/**', '.claude/**']
+  },
   server: {
     port: 5173,
     proxy: {
