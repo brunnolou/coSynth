@@ -90,7 +90,7 @@ function setup(
 }
 
 beforeEach(() => {
-  vi.stubGlobal('localStorage', new MemoryStorage())
+  vi.stubGlobal('sessionStorage', new MemoryStorage())
   vi.stubGlobal('URL', {
     createObjectURL: vi.fn(() => `blob:render-${Math.random()}`),
     revokeObjectURL: vi.fn()
@@ -1250,7 +1250,7 @@ describe('preset tools', () => {
 
   it('returns useful save/load errors when browser storage is unavailable', async () => {
     const { engine, execute } = setup()
-    Object.defineProperty(globalThis, 'localStorage', {
+    Object.defineProperty(globalThis, 'sessionStorage', {
       configurable: true,
       get() { throw new DOMException('blocked', 'SecurityError') }
     })

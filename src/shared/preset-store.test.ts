@@ -109,15 +109,15 @@ describe('preset store', () => {
     expect(loadPreset('Patch 0', storage)?.params['osc1.level']).toBe(0.9)
   })
 
-  it('returns an empty list when the localStorage getter or storage access throws', () => {
-    const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
-    Object.defineProperty(globalThis, 'localStorage', {
+  it('returns an empty list when the sessionStorage getter or storage access throws', () => {
+    const previous = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage')
+    Object.defineProperty(globalThis, 'sessionStorage', {
       configurable: true,
       get() { throw new DOMException('blocked', 'SecurityError') }
     })
     expect(listPresets()).toEqual([])
-    if (previous) Object.defineProperty(globalThis, 'localStorage', previous)
-    else delete (globalThis as { localStorage?: Storage }).localStorage
+    if (previous) Object.defineProperty(globalThis, 'sessionStorage', previous)
+    else delete (globalThis as { sessionStorage?: Storage }).sessionStorage
 
     const throwing = new MemoryStorage()
     throwing.getItem = () => { throw new DOMException('blocked', 'SecurityError') }

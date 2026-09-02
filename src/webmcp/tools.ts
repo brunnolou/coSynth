@@ -1032,7 +1032,7 @@ export function createWebMcpTools(
     },
     {
       name: 'save_preset',
-      description: 'Save the complete current patch to localStorage under a validated name, replacing that name if present.',
+      description: 'Save the complete current patch to sessionStorage under a validated name, replacing that name if present.',
       inputSchema: {
         type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 80 } },
         required: ['name'], additionalProperties: false
@@ -1047,7 +1047,7 @@ export function createWebMcpTools(
     },
     {
       name: 'load_preset',
-      description: 'Load a named user preset previously saved to localStorage and return its verifiable resulting state. Factory presets from the UI dropdown are not included.',
+      description: 'Load a named user preset previously saved to sessionStorage and return its verifiable resulting state. Factory presets from the UI dropdown are not included.',
       inputSchema: {
         type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 80 } },
         required: ['name'], additionalProperties: false
@@ -1066,7 +1066,7 @@ export function createWebMcpTools(
     },
     {
       name: 'list_presets',
-      description: 'List the user presets saved to localStorage, newest storage order first, so you can see what save_preset and the human have stored. Factory presets from the UI dropdown are not included.',
+      description: 'List the user presets saved to sessionStorage, newest storage order first, so you can see what save_preset and the human have stored. Factory presets from the UI dropdown are not included.',
       inputSchema: emptySchema,
       annotations: { readOnlyHint: true },
       execute(input) {

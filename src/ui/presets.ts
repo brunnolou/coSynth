@@ -1,4 +1,4 @@
-// Preset browser: factory presets, localStorage user presets, JSON file
+// Preset browser: factory presets, sessionStorage user presets, JSON file
 // export/import.
 
 import { paramDef, valueToNorm } from '../shared/params'
@@ -687,7 +687,7 @@ export class PresetBrowser {
 
     const save = el('button', 'hdr-btn', 'Save')
     guideTarget(save, 'button.preset.save', 'Save preset', 'button')
-    save.title = 'Save current patch to the browser'
+    save.title = 'Save current patch to this browser tab session'
     save.addEventListener('click', () => {
       closeActions(true)
       nameInput.value = this.select.value.startsWith('user:') ? this.select.value.slice(5) : 'My Patch'

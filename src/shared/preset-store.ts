@@ -135,8 +135,8 @@ export function validatePresetData(value: unknown): PresetData {
 
 function browserStorage(): Storage {
   try {
-    if (typeof localStorage === 'undefined') throw new Error('localStorage is unavailable')
-    return localStorage
+    if (typeof sessionStorage === 'undefined') throw new Error('sessionStorage is unavailable')
+    return sessionStorage
   } catch (error) {
     throw new Error(`Preset storage is unavailable: ${error instanceof Error ? error.message : String(error)}`)
   }

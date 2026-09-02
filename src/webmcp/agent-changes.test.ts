@@ -17,7 +17,7 @@ function setup() {
 }
 
 const route = () => ({ source: modSourceIndex('env2'), dest: paramIndex('filter1.cutoff'), depth: 0.3, enabled: true })
-afterEach(() => { localStorage.clear(); vi.restoreAllMocks() })
+afterEach(() => { sessionStorage.clear(); vi.restoreAllMocks() })
 
 describe('AI patch ownership', () => {
   it('compares stored float32 values and does not checkpoint no-ops', () => {

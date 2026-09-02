@@ -75,7 +75,7 @@ and expanded into a morph table.
 position highlighted, oscilloscope, and log-frequency spectrum analyzer.
 
 **Presets** — JSON patches (parameters + matrix + LFO shapes + FX order).
-Factory patches included; save to localStorage, or export/import files.
+Factory patches included; save to sessionStorage for the current tab session, or export/import files to keep them.
 
 Presets are stored at format version 2. LFO tempo-sync divisions now run from `31/1` down to `1/32`, and because a choice parameter persists as its position in the list, growing that list changed the scale a stored division is read against. Version 1 presets and exported files are rescaled on load, so a patch saved before this change still sounds the same; the delay keeps its own thirteen-entry division list and is untouched. The LFO menu shows the slow multiples first, then the original divisions in their familiar grouping. A synced control's bypassed partner is dimmed and inert - turning SYNC on mutes the free-running rate, turning it off mutes the division - without altering either stored value.
 
@@ -94,7 +94,7 @@ Eighteen semantic tools are available over the full audio-enabled lifecycle. Sev
 - `analyze_audio` — re-analyzes the last render (`source: 'last-render'`) or the live output right now (`source: 'scope'`), without re-rendering.
 - `analyze_reference_audio` — decodes a short Base64 reference in browser memory and analyzes it with exactly the same metrics as `analyze_audio`.
 - `compare_audio` — compares that latest reference analysis against the same latest-render/current-scope candidate selected by `analyze_audio`.
-- `save_preset`, `load_preset`, and `list_presets` — validated, replace-by-name browser presets in localStorage, and the names already saved.
+- `save_preset`, `load_preset`, and `list_presets` — validated, replace-by-name browser presets in sessionStorage, and the names already saved.
 - `get_ui_targets` — searchable, paginated semantic teaching targets with ID, label, type, and visibility.
 - `show_ui_guide` — interactive Driver.js walkthroughs with safe CommonMark instructions, powered by micromark. No patch changes or checkpoints.
 - `get_history` — bounded pages of retained sound states or replay entries, with the current sound ID and history revision.

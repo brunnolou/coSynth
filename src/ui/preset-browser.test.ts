@@ -25,7 +25,7 @@ describe('compact preset browser', () => {
       this.open = false
       this.dispatchEvent(new Event('close'))
     } })
-    localStorage.clear()
+    sessionStorage.clear()
     engine = new SynthEngine()
     vi.spyOn(engine, 'loadPreset')
     browser = new PresetBrowser(engine)
@@ -36,7 +36,7 @@ describe('compact preset browser', () => {
     toggle()
     document.body.replaceChildren()
     vi.restoreAllMocks()
-    localStorage.clear()
+    sessionStorage.clear()
   })
 
   it('places chevrons around the select and groups all actions behind a cog', () => {
@@ -221,7 +221,7 @@ describe('compact preset browser', () => {
   })
 
   it('upgrades a format 1 user preset in storage to the current division scale', () => {
-    localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify([{
+    sessionStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify([{
       name: 'Old Patch', version: 1,
       // Format 1 wrote 1/4 as 4/12 and the delay's 1/8 as 7/12.
       params: { 'lfo1.division': 4 / 12, 'delay.division': 7 / 12 },

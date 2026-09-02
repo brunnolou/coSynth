@@ -174,7 +174,7 @@ function parseCompactItem(line: string): { id: string; moddable: boolean } {
 }
 
 beforeEach(() => {
-  vi.stubGlobal('localStorage', new MemoryStorage())
+  vi.stubGlobal('sessionStorage', new MemoryStorage())
   vi.stubGlobal('URL', {
     createObjectURL: vi.fn(() => `blob:first-contact-${Math.random()}`),
     revokeObjectURL: vi.fn()
