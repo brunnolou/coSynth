@@ -5,6 +5,7 @@
 // worklet-facing state transfer is identical in both modes.
 
 import processorUrl from '../worklet/processor.ts?worker&url'
+import { cachedScriptUrl, forgetCachedScript } from '../shared/cached-script-url'
 import {
   PARAMS, NUM_PARAMS, paramIndex, defaultValues, WAVETABLE_NAMES, DIST_TYPES
 } from '../shared/params'
@@ -202,7 +203,21 @@ export class SynthEngine {
   async start(): Promise<void> {
     if (this.ctx) return
     const ctx = this.providedContext ?? this.createContext()
-    await ctx.audioWorklet.addModule(processorUrl)
+    // The in-memory copy first, so a render after the first one needs no
+    // network. If that copy is ever refused — a browser that will not load a
+    // worklet from a blob, say — fall back to the network URL once rather than
+    // failing the render, and stop trusting the copy from then on.
+    const moduleUrl = await cachedScriptUrl(processorUrl)
+    if (moduleUrl === processorUrl) {
+      await ctx.audioWorklet.addModule(processorUrl)
+    } else {
+      try {
+        await ctx.audioWorklet.addModule(moduleUrl)
+      } catch {
+        forgetCachedScript(processorUrl)
+        await ctx.audioWorklet.addModule(processorUrl)
+      }
+    }
     const node = new AudioWorkletNode(ctx, 'cosynth', {
       numberOfInputs: 0,
       numberOfOutputs: 1,
