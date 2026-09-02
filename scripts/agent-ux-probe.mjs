@@ -10,7 +10,7 @@
 // outcome and wall-clock cost so "how many round trips did that cost" is a
 // measured number rather than a recollection.
 //
-//   node scripts/agent-ux-probe.mjs [url] [--port 4792] [--headed]
+//   node scripts/agent-ux-probe.mjs [url] [--port 4790] [--headed]
 //
 //   GET  /tools            the descriptors, and nothing else
 //   POST /call             {"tool":"...","input":{...}} -> {ok, result|error, ms, call}
@@ -28,7 +28,10 @@ const value = (name, fallback) => {
   return at >= 0 && args[at + 1] ? args[at + 1] : fallback
 }
 const url = args.find(arg => !arg.startsWith('--') && arg !== value('--port', null)) ?? 'http://localhost:4173/'
-const port = Number(value('--port', '4792'))
+// 4790 is the agent-UX eval's port, and what `docs/agent-ux-eval.md` documents
+// curling. The match and teaching evals run the same harness on 4792 and pass
+// `--port` for it; the discovery probe holds 4791.
+const port = Number(value('--port', '4790'))
 
 function installShim(page) {
   return page.addInitScript(() => {

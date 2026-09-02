@@ -22,7 +22,7 @@ wall-clock cost.
 ```bash
 npm run build
 npx vite preview --port 4173 &
-node scripts/agent-ux-probe.mjs http://localhost:4173/ &
+node scripts/agent-ux-probe.mjs http://localhost:4173/ --port 4790 &
 curl -s http://localhost:4790/health
 ```
 

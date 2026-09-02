@@ -204,7 +204,7 @@ npm run preview
 node scripts/history-smoke.mjs http://localhost:4173/
 node scripts/guide-smoke.mjs http://localhost:4173/
 node scripts/webmcp-smoke.mjs http://localhost:4173/   # includes the cold-page offline render_audio check
-node scripts/agent-ux-probe.mjs http://localhost:4173/  # agent-UX measurement harness, see below
+node scripts/agent-ux-probe.mjs http://localhost:4173/ --port 4790  # agent-UX measurement harness, see below
 # in another terminal:
 node scripts/webmcp-smoke.mjs
 SHOT=/tmp/cosynth-smoke.png node scripts/smoke.mjs
