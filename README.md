@@ -77,6 +77,8 @@ position highlighted, oscilloscope, and log-frequency spectrum analyzer.
 **Presets** — JSON patches (parameters + matrix + LFO shapes + FX order).
 Factory patches included; save to localStorage, or export/import files.
 
+Presets are stored at format version 2. LFO tempo-sync divisions now run from `31/1` down to `1/32`, and because a choice parameter persists as its position in the list, growing that list changed the scale a stored division is read against. Version 1 presets and exported files are rescaled on load, so a patch saved before this change still sounds the same; the delay keeps its own thirteen-entry division list and is untouched. The LFO menu shows the slow multiples first, then the original divisions in their familiar grouping. A synced control's bypassed partner is dimmed and inert - turning SYNC on mutes the free-running rate, turning it off mutes the division - without altering either stored value.
+
 ## WebMCP agent tools
 
 coSynth progressively exposes the same live `SynthEngine` used by the UI through the current WebMCP API, `document.modelContext.registerTool(tool, { signal })`. Chrome 146-149 origin-trial builds only expose the pre-2026-07-21 `navigator.modelContext` spelling, so both entry points are accepted. Where neither exists, it lazily imports the vendored legacy [webmcp.dev](https://webmcp.dev/) widget (`src/vendor/webmcp-widget.js`, taken from `@jason.today/webmcp@0.1.13`), which lets a user explicitly connect a local WebMCP bridge with a token. Browsers on the standard path never fetch that chunk. If neither path is available, the normal synth still runs without an agent integration.
