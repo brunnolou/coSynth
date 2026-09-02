@@ -93,7 +93,7 @@ Eighteen semantic tools are available over the full audio-enabled lifecycle. Sev
 - `render_audio` — renders a note sequence and returns metrics. `mode: 'offline'` (the default) renders deterministically through `OfflineAudioContext`, faster than realtime and without a user gesture; `mode: 'realtime'` captures the live graph. `format` selects `'metrics'` (default), `'url'`, or `'base64'` for a mono 16-bit WAV an audio-capable agent can listen to.
 - `analyze_audio` — re-analyzes the last render (`source: 'last-render'`) or the live output right now (`source: 'scope'`), without re-rendering.
 - `analyze_reference_audio` — decodes a short Base64 reference in browser memory and analyzes it with exactly the same metrics as `analyze_audio`.
-- `compare_audio` — compares that latest reference analysis against the same latest-render/current-scope candidate selected by `analyze_audio`.
+- `compare_audio` — compares that latest reference analysis against the same latest-render/current-scope candidate selected by `analyze_audio`. With nothing rendered and a silent scope it refuses rather than scoring the reference against silence, which returned a plausible-looking similarity an agent read as a baseline.
 - `save_preset`, `load_preset`, and `list_presets` — validated, replace-by-name browser presets in localStorage, and the names already saved.
 - `get_ui_targets` — searchable, paginated semantic teaching targets with ID, label, type, and visibility.
 - `show_ui_guide` — interactive Driver.js walkthroughs with safe CommonMark instructions, powered by micromark. No patch changes or checkpoints.

@@ -227,6 +227,16 @@ const METRIC_NOTES = {
   decayT60Ms: "Measured from the rendered tail, not read back from `env1.decay`: the note's own `duration` and `env1.release` shape that tail, so the same patch reports a different T60 over a longer note. It is `null` — its most common value on short notes — whenever the buffer never falls the 20 dB the slope fit needs, or falls too abruptly for the envelope to resolve."
 } as const
 
+/**
+ * A peak this low is digital silence: `analyzeAudio` floors an all-zero buffer
+ * at -160 dB, and nothing audible sits below -100 dB.
+ */
+const SILENT_PEAK_DB = -100
+
+/** Refusal text for `compare_audio` with no render and a silent live scope. */
+const SILENT_CANDIDATE_REFUSAL =
+  'Nothing has been rendered yet and the live scope is silent (peak below -100 dB), so there is nothing to compare the reference against; scoring it against silence would return a similarity that means nothing. Call render_audio first — it renders offline and needs no user gesture — then call compare_audio again. The scope fallback is only for comparing against a human who is actually playing.'
+
 /** How the Base64 preview became mono; travels with the payload it describes. */
 const DOWNMIX_NOTE = '"sum" is the plain channel average; "left"/"right" means that average cancelled and the louder channel was sent alone.'
 
@@ -1055,7 +1065,7 @@ export function createWebMcpTools(
     },
     {
       name: 'compare_audio',
-      description: 'Step 2 of matching a target sound: report per-metric and overall similarity between the latest `analyze_reference_audio` reference and the latest render. With nothing rendered it falls back to the live scope — the same candidate `analyze_audio` returns.',
+      description: 'Step 2 of matching a target sound: report per-metric and overall similarity between the latest `analyze_reference_audio` reference and the latest render. With nothing rendered it falls back to the live scope — the same candidate `analyze_audio` returns — and refuses outright when that scope is silent rather than scoring against silence.',
       inputSchema: emptySchema,
       annotations: { readOnlyHint: true },
       execute(input, options) {
@@ -1064,6 +1074,15 @@ export function createWebMcpTools(
         assertObject(input, 'input', [])
         if (!session.lastReference) throw new Error('Call analyze_reference_audio first before compare_audio')
         const candidate = currentCandidate()
+        // The scope fallback exists for a human who IS playing. Before the
+        // audio gesture the scope is guaranteed digital silence, and scoring a
+        // reference against it returned `ok` with a plausible similarity
+        // (0.209 in the match eval) that an agent following "Step 1 ... Step 2"
+        // reads as a baseline. A wrong number an agent trusts is worse than an
+        // error, so refuse and say what to call first.
+        if (candidate.source === 'scope' && candidate.metrics.peakDb <= SILENT_PEAK_DB) {
+          throw new Error(SILENT_CANDIDATE_REFUSAL)
+        }
         if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
         const comparison = compareAudioMetrics(session.lastReference.metrics, candidate.metrics)
         dependencies.onComparison?.(comparison, candidate.source === 'last-render' ? session.lastRender?.soundEntryId : dependencies.currentSoundEntryId?.())

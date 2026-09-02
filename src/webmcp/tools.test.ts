@@ -897,6 +897,29 @@ describe('render and analysis tools', () => {
     })).rejects.toThrow(/mimeType.*conflict/i)
   })
 
+  it('refuses to score a reference against a silent scope instead of returning a baseline-looking number', async () => {
+    const { engine, execute } = setup()
+    // Before the audio gesture the scope is guaranteed digital silence. An
+    // agent following the descriptions' own "Step 1 ... Step 2" ordering used
+    // to get ok with similarity 0.209 against it — the only tells were
+    // `candidate.source === "scope"` and a peakDb similarity of exactly 0.
+    engine.running = false
+    engine.scopeL = new Float32Array(256)
+    engine.scopeR = new Float32Array(256)
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const rejection = expect(execute('compare_audio')).rejects
+    await rejection.toThrow(/silent/i)
+    await rejection.toThrow(/render_audio/)
+    // Explicitly asking for the silent scope still works: -160 dB is legible.
+    await expect(execute('analyze_audio', { source: 'scope' })).resolves.toMatchObject({ source: 'scope' })
+
+    // The documented purpose of the fallback is untouched: a human IS playing,
+    // so the scope carries real audio and the comparison is meaningful.
+    const playing = setup()
+    await playing.execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    await expect(playing.execute('compare_audio')).resolves.toMatchObject({ candidate: { source: 'scope' } })
+  })
+
   it('requires a reference then compares against exactly the analyze_audio scope candidate', async () => {
     const { execute } = setup()
     await expect(execute('compare_audio')).rejects.toThrow(/analyze_reference_audio.*first/i)
