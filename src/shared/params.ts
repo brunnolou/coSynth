@@ -54,9 +54,19 @@ export const SYNC_DIVISIONS = [...BEAT_DIVISIONS, ...SLOW_DIVISIONS]
 // menu -- is not done here.
 export const DELAY_DIVISIONS = BEAT_DIVISIONS
 /** SYNC_DIVISIONS indices in menu order: slowest cycle first. */
-export const SYNC_DIVISION_ORDER = SYNC_DIVISIONS
-  .map((_, i) => i)
-  .sort((a, b) => divisionToBeats(b) - divisionToBeats(a))
+/**
+ * Menu order for `SYNC_DIVISIONS`: the slow multiples first, longest to
+ * shortest, then the original thirteen in the grouped order they have always
+ * been shown in. Sorting the whole list strictly by duration would interleave
+ * dotted and triplet values (1/2, 1/4., 1/2T, 1/4, ...) and bury the 1/4
+ * default thirty entries down, and it would disagree with the delay's menu,
+ * which shows the same thirteen labels. Values stay the choice index, so this
+ * changes presentation only.
+ */
+export const SYNC_DIVISION_ORDER = [
+  ...SLOW_DIVISIONS.map((_, i) => BEAT_DIVISIONS.length + i).reverse(),
+  ...BEAT_DIVISIONS.map((_, i) => i)
+]
 export const WAVETABLE_NAMES = ['Basic Shapes', 'Harmonic Sweep', 'PWM', 'Vocal', 'FM Bell', 'Digital', 'Custom']
 
 /** Beats per cycle for a sync division: `n/d` is 4n/d beats, `.` dotted, `T` triplet. */

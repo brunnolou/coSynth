@@ -103,11 +103,17 @@ describe('sync divisions', () => {
     expect(divisionToBeats(SYNC_DIVISIONS.length)).toBe(1)
   })
 
-  it('orders the menu slowest first without touching the stored indices', () => {
-    const beats = SYNC_DIVISION_ORDER.map(divisionToBeats)
-    expect(beats).toEqual([...beats].sort((a, b) => b - a))
-    expect(SYNC_DIVISIONS[SYNC_DIVISION_ORDER[0]]).toBe('31/1')
-    expect(SYNC_DIVISIONS[SYNC_DIVISION_ORDER.at(-1)!]).toBe('1/32')
+  it('prepends the slow multiples and keeps the original grouping after them', () => {
+    const labels = SYNC_DIVISION_ORDER.map(i => SYNC_DIVISIONS[i])
+    // Slow block: longest first, down to 2/1.
+    expect(labels.slice(0, 30)).toEqual(Array.from({ length: 30 }, (_, i) => `${31 - i}/1`))
+    // Then the thirteen originals, in their own order - not re-sorted by
+    // duration, so dotted and triplet values stay grouped with their beat and
+    // this menu still agrees with the delay's.
+    expect(labels.slice(30)).toEqual(ORIGINAL)
+    expect(labels[30]).toBe('1/1')
+    expect(labels.at(-1)).toBe('1/32')
+    // Every index appears exactly once: presentation only, nothing dropped.
     expect([...SYNC_DIVISION_ORDER].sort((a, b) => a - b)).toEqual(SYNC_DIVISIONS.map((_, i) => i))
   })
 
