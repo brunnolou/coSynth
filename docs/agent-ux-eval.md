@@ -53,6 +53,11 @@ Known weakness in the harness's own numbers: `discoveryCalls` counts
 `get_synth_state` as discovery, so it inflates when an agent inspects state at
 the end. Read the call log, not just the summary.
 
+Every run's agent report and harness log is archived in
+[`agent-ux-eval-runs/`](agent-ux-eval-runs/) — the reports because an agent's own
+wording for a complaint is usually the fix, and the logs because they are the
+independent evidence behind the numbers below.
+
 ## Results
 
 Baseline is the field evidence in the plan: one agent session, before any of this

@@ -1,0 +1,652 @@
+{
+  "summary": {
+    "totalCalls": 17,
+    "failedCalls": 0,
+    "callsToFirstSuccessfulUpdateParameters": 2,
+    "discoveryCalls": 2,
+    "perTool": {
+      "get_parameter_schema": {
+        "calls": 1,
+        "failed": 0,
+        "totalMs": 11
+      },
+      "get_synth_state": {
+        "calls": 1,
+        "failed": 0,
+        "totalMs": 5
+      },
+      "list_presets": {
+        "calls": 1,
+        "failed": 0,
+        "totalMs": 2
+      },
+      "play_notes": {
+        "calls": 1,
+        "failed": 0,
+        "totalMs": 3015
+      },
+      "render_audio": {
+        "calls": 8,
+        "failed": 0,
+        "totalMs": 1966
+      },
+      "save_preset": {
+        "calls": 1,
+        "failed": 0,
+        "totalMs": 3
+      },
+      "set_modulation": {
+        "calls": 2,
+        "failed": 0,
+        "totalMs": 26
+      },
+      "update_parameters": {
+        "calls": 2,
+        "failed": 0,
+        "totalMs": 19
+      }
+    },
+    "silentRenders": 0,
+    "startGestureDispatchedAtCall": 16,
+    "pageErrors": []
+  },
+  "log": [
+    {
+      "kind": "call",
+      "call": 1,
+      "at": "2026-09-02T16:14:21.093Z",
+      "tool": "get_parameter_schema",
+      "input": {
+        "format": "compact",
+        "sourceLimit": 60
+      },
+      "ok": true,
+      "ms": 11,
+      "result": {
+        "parameters": {
+          "total": 224,
+          "items": 224
+        },
+        "modulationSources": {
+          "total": 24,
+          "items": 24
+        }
+      }
+    },
+    {
+      "kind": "call",
+      "call": 2,
+      "at": "2026-09-02T16:14:59.369Z",
+      "tool": "update_parameters",
+      "input": {
+        "updates": [
+          {
+            "id": "env1.attack",
+            "value": 0.002
+          },
+          {
+            "id": "env1.decay",
+            "value": 3.5
+          },
+          {
+            "id": "env1.sustain",
+            "value": 0
+          },
+          {
+            "id": "env1.release",
+            "value": 0.35
+          },
+          {
+            "id": "env1.dec_curve",
+            "value": 0.6
+          },
+          {
+            "id": "env1.rel_curve",
+            "value": 0.5
+          },
+          {
+            "id": "filter1.type",
+            "value": "LP 24"
+          },
+          {
+            "id": "filter1.cutoff",
+            "value": 1200
+          },
+          {
+            "id": "filter1.resonance",
+            "value": 0.05
+          },
+          {
+            "id": "filter1.keytrack",
+            "value": 0.6
+          },
+          {
+            "id": "osc1.wavetable",
+            "value": "Basic Shapes"
+          },
+          {
+            "id": "osc1.morph",
+            "value": 0.3
+          },
+          {
+            "id": "osc1.level",
+            "value": 0.7
+          },
+          {
+            "id": "osc2.enabled",
+            "value": 1
+          },
+          {
+            "id": "osc2.transpose",
+            "value": 12
+          },
+          {
+            "id": "osc2.level",
+            "value": 0.28
+          },
+          {
+            "id": "sub.enabled",
+            "value": 1
+          },
+          {
+            "id": "sub.level",
+            "value": 0.22
+          },
+          {
+            "id": "env2.attack",
+            "value": 0.001
+          },
+          {
+            "id": "env2.decay",
+            "value": 0.9
+          },
+          {
+            "id": "env2.sustain",
+            "value": 0
+          },
+          {
+            "id": "env2.release",
+            "value": 0.2
+          },
+          {
+            "id": "env2.dec_curve",
+            "value": 0.6
+          }
+        ]
+      },
+      "ok": true,
+      "ms": 13,
+      "result": {
+        "appliedCount": 23
+      }
+    },
+    {
+      "kind": "call",
+      "call": 3,
+      "at": "2026-09-02T16:15:05.763Z",
+      "tool": "set_modulation",
+      "input": {
+        "action": "add",
+        "source": "env2",
+        "destination": "filter1.cutoff",
+        "depth": 0.35
+      },
+      "ok": true,
+      "ms": 20,
+      "result": {
+        "route": {
+          "slot": 0,
+          "source": "env2",
+          "destination": "filter1.cutoff",
+          "depth": 0.35,
+          "enabled": true
+        }
+      }
+    },
+    {
+      "kind": "call",
+      "call": 4,
+      "at": "2026-09-02T16:15:05.778Z",
+      "tool": "set_modulation",
+      "input": {
+        "action": "add",
+        "source": "velocity",
+        "destination": "filter1.cutoff",
+        "depth": 0.15
+      },
+      "ok": true,
+      "ms": 6,
+      "result": {
+        "route": {
+          "slot": 1,
+          "source": "velocity",
+          "destination": "filter1.cutoff",
+          "depth": 0.15,
+          "enabled": true
+        }
+      }
+    },
+    {
+      "kind": "call",
+      "call": 5,
+      "at": "2026-09-02T16:15:13.536Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.8,
+            "start": 0,
+            "duration": 1.5
+          }
+        ],
+        "duration": 6
+      },
+      "ok": true,
+      "ms": 228,
+      "result": {
+        "peakDb": -10.211186352339457,
+        "rmsDb": -31.151523177351727,
+        "loudnessDb": -25.240444205572402,
+        "attackMs": 6.324494328649469,
+        "decayT60Ms": null,
+        "inharmonicity": -4.319737927591304e-06,
+        "windowCentroidsHz": [
+          269.2,
+          266.3,
+          0,
+          0
+        ],
+        "renderMode": "offline"
+      }
+    },
+    {
+      "kind": "call",
+      "call": 6,
+      "at": "2026-09-02T16:15:33.019Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.8,
+            "start": 0,
+            "duration": 8
+          }
+        ],
+        "duration": 10
+      },
+      "ok": true,
+      "ms": 309,
+      "result": {
+        "peakDb": -9.537065764089402,
+        "rmsDb": -32.98026783394993,
+        "loudnessDb": -26.97074641111817,
+        "attackMs": 4.517529400983597,
+        "decayT60Ms": 6551.454077758745,
+        "inharmonicity": -4.326982980776659e-06,
+        "windowCentroidsHz": [
+          269,
+          266.3,
+          0,
+          0
+        ],
+        "renderMode": "offline"
+      }
+    },
+    {
+      "kind": "call",
+      "call": 7,
+      "at": "2026-09-02T16:15:43.017Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.2,
+            "start": 0,
+            "duration": 2
+          }
+        ],
+        "duration": 4
+      },
+      "ok": true,
+      "ms": 247,
+      "result": {
+        "peakDb": -18.570000069543475,
+        "rmsDb": -35.879057866449415,
+        "loudnessDb": -32.88467840738371,
+        "attackMs": 9.294003184919934,
+        "decayT60Ms": 5113.60004938632,
+        "inharmonicity": -6.265836232115928e-06,
+        "windowCentroidsHz": [
+          265.7,
+          256.6,
+          256.6,
+          0
+        ],
+        "renderMode": "offline"
+      }
+    },
+    {
+      "kind": "call",
+      "call": 8,
+      "at": "2026-09-02T16:15:43.242Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.4,
+            "start": 0,
+            "duration": 2
+          }
+        ],
+        "duration": 4
+      },
+      "ok": true,
+      "ms": 216,
+      "result": {
+        "peakDb": -14.866275653420375,
+        "rmsDb": -33.037680922092036,
+        "loudnessDb": -30.05194764469188,
+        "attackMs": 7.663392458150822,
+        "decayT60Ms": 5077.12928123063,
+        "inharmonicity": -5.672183279865084e-06,
+        "windowCentroidsHz": [
+          267.5,
+          260.9,
+          260.9,
+          0
+        ],
+        "renderMode": "offline"
+      }
+    },
+    {
+      "kind": "call",
+      "call": 9,
+      "at": "2026-09-02T16:15:43.474Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.7,
+            "start": 0,
+            "duration": 2
+          }
+        ],
+        "duration": 4
+      },
+      "ok": true,
+      "ms": 221,
+      "result": {
+        "peakDb": -10.470676696772866,
+        "rmsDb": -29.95425737494748,
+        "loudnessDb": -26.97721788805214,
+        "attackMs": 6.227042052565857,
+        "decayT60Ms": 5028.575000415173,
+        "inharmonicity": -4.654578929438997e-06,
+        "windowCentroidsHz": [
+          269.2,
+          265.3,
+          265.3,
+          0
+        ],
+        "renderMode": "offline"
+      }
+    },
+    {
+      "kind": "call",
+      "call": 10,
+      "at": "2026-09-02T16:15:43.725Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 1,
+            "start": 0,
+            "duration": 2
+          }
+        ],
+        "duration": 4
+      },
+      "ok": true,
+      "ms": 241,
+      "result": {
+        "peakDb": -8.49621999136623,
+        "rmsDb": -27.697304105118373,
+        "loudnessDb": -24.71823231594206,
+        "attackMs": 6.172888124426295,
+        "decayT60Ms": 5015.707114792904,
+        "inharmonicity": -3.698688962858632e-06,
+        "windowCentroidsHz": [
+          270.2,
+          267.9,
+          267.9,
+          0
+        ],
+        "renderMode": "offline"
+      }
+    },
+    {
+      "kind": "call",
+      "call": 11,
+      "at": "2026-09-02T16:15:52.976Z",
+      "tool": "update_parameters",
+      "input": {
+        "updates": [
+          {
+            "id": "osc1.unison",
+            "value": 2
+          },
+          {
+            "id": "osc1.detune",
+            "value": 7
+          }
+        ]
+      },
+      "ok": true,
+      "ms": 6,
+      "result": {
+        "appliedCount": 2
+      }
+    },
+    {
+      "kind": "call",
+      "call": 12,
+      "at": "2026-09-02T16:16:02.837Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.8,
+            "start": 0,
+            "duration": 3
+          }
+        ],
+        "duration": 5
+      },
+      "ok": true,
+      "ms": 244,
+      "result": {
+        "peakDb": -11.052518378931687,
+        "rmsDb": -29.801722258998655,
+        "loudnessDb": -26.769892372059804,
+        "attackMs": 8.695671926578541,
+        "decayT60Ms": 6515.257236883889,
+        "inharmonicity": 4.1502522249309435e-05,
+        "windowCentroidsHz": [
+          269.3,
+          266.3,
+          266.8,
+          0
+        ],
+        "renderMode": "offline"
+      }
+    },
+    {
+      "kind": "call",
+      "call": 13,
+      "at": "2026-09-02T16:16:17.556Z",
+      "tool": "render_audio",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.7,
+            "start": 0,
+            "duration": 2
+          },
+          {
+            "midi": 64,
+            "velocity": 0.7,
+            "start": 0.25,
+            "duration": 2
+          },
+          {
+            "midi": 67,
+            "velocity": 0.7,
+            "start": 0.5,
+            "duration": 2
+          },
+          {
+            "midi": 60,
+            "velocity": 0.9,
+            "start": 1,
+            "duration": 2
+          },
+          {
+            "midi": 64,
+            "velocity": 0.9,
+            "start": 1,
+            "duration": 2
+          },
+          {
+            "midi": 67,
+            "velocity": 0.9,
+            "start": 1,
+            "duration": 2
+          }
+        ],
+        "duration": 6
+      },
+      "ok": true,
+      "ms": 260,
+      "result": {
+        "peakDb": -3.359261456232981,
+        "rmsDb": -23.62004827864771,
+        "loudnessDb": -20.551440300680326,
+        "attackMs": 5.730149144538301,
+        "decayT60Ms": 5868.922720246276,
+        "windowCentroidsHz": [
+          332.7,
+          334.6,
+          338.4,
+          0
+        ],
+        "renderMode": "offline",
+        "retriggered": 3
+      }
+    },
+    {
+      "kind": "call",
+      "call": 14,
+      "at": "2026-09-02T16:16:24.617Z",
+      "tool": "save_preset",
+      "input": {
+        "name": "Plucked Piano Eval4"
+      },
+      "ok": true,
+      "ms": 3,
+      "result": {
+        "saved": true
+      }
+    },
+    {
+      "kind": "call",
+      "call": 15,
+      "at": "2026-09-02T16:16:24.627Z",
+      "tool": "list_presets",
+      "input": {},
+      "ok": true,
+      "ms": 2,
+      "result": {
+        "presetCount": 1
+      }
+    },
+    {
+      "kind": "call",
+      "call": 16,
+      "at": "2026-09-02T16:16:31.166Z",
+      "tool": "get_synth_state",
+      "input": {
+        "format": "compact"
+      },
+      "ok": true,
+      "ms": 5
+    },
+    {
+      "kind": "gesture",
+      "at": "2026-09-02T16:16:36.985Z",
+      "before": {
+        "running": false
+      }
+    },
+    {
+      "kind": "call",
+      "call": 17,
+      "at": "2026-09-02T16:16:51.919Z",
+      "tool": "play_notes",
+      "input": {
+        "notes": [
+          {
+            "midi": 60,
+            "velocity": 0.7,
+            "start": 0,
+            "duration": 2
+          },
+          {
+            "midi": 64,
+            "velocity": 0.7,
+            "start": 0.25,
+            "duration": 2
+          },
+          {
+            "midi": 67,
+            "velocity": 0.7,
+            "start": 0.5,
+            "duration": 2
+          },
+          {
+            "midi": 60,
+            "velocity": 0.9,
+            "start": 1,
+            "duration": 2
+          },
+          {
+            "midi": 64,
+            "velocity": 0.9,
+            "start": 1,
+            "duration": 2
+          },
+          {
+            "midi": 67,
+            "velocity": 0.9,
+            "start": 1,
+            "duration": 2
+          }
+        ]
+      },
+      "ok": true,
+      "ms": 3015,
+      "result": {
+        "retriggered": 3,
+        "completed": true,
+        "noteCount": 6
+      }
+    }
+  ]
+}
