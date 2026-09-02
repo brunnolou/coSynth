@@ -198,6 +198,23 @@ const summarise = () => {
         return acc
       }, {})
     ).sort(([a], [b]) => a.localeCompare(b))),
+    // Teaching: when a human asks how to do something themselves, the right
+    // answer is to show them the controls, not to reach in and change the
+    // sound for them. `taught` false with `changedSoundInstead` true is the
+    // failure this measures - the agent did the job rather than explaining it.
+    teaching: (() => {
+      const guides = calls.filter(entry => entry.tool === 'show_ui_guide' && entry.ok)
+      const mutations = calls.filter(entry => ['update_parameters', 'set_modulation', 'load_preset'].includes(entry.tool) && entry.ok)
+      const firstGuide = calls.findIndex(entry => entry.tool === 'show_ui_guide' && entry.ok)
+      return {
+        taught: guides.length > 0,
+        showGuideCalls: guides.length,
+        lookedUpTargets: calls.filter(entry => entry.tool === 'get_ui_targets' && entry.ok).length,
+        callsBeforeFirstGuide: firstGuide < 0 ? null : firstGuide + 1,
+        changedSoundInstead: mutations.length,
+        guideStepCounts: guides.map(entry => Array.isArray(entry.input?.steps) ? entry.input.steps.length : null)
+      }
+    })(),
     // Renders that came back as an all-zero buffer. This must stay at zero;
     // a nonzero count means the offline path silently produced nothing.
     silentRenders: calls.filter(entry => entry.result?.SILENT).length,
