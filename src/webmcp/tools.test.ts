@@ -133,6 +133,30 @@ describe('WebMCP tool metadata', () => {
     })
     expect((tools[7].inputSchema as any).properties.mimeType.pattern).toBe('^[aA][uU][dD][iI][oO]/')
   })
+
+  it('keeps the whole tool listing small enough to survive a client that truncates it', () => {
+    const { tools } = setup()
+    const listing = tools.map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }))
+    const bytes = (value: string) => new TextEncoder().encode(value).length
+    // In the discoverability eval Codex truncated the 17-tool listing and lost
+    // `play_notes` entirely, then drove the page through <select> elements
+    // instead. These 12 tools were 10751 B of that listing (5019 B of prose,
+    // 4958 B of schema) after four rounds of per-tool clarity fixes.
+    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(9900)
+    // The prose half — what a truncating client renders first — must stay well
+    // under what those four rounds had grown it to.
+    const prose = listing.reduce((total, tool) => total + bytes(tool.description), 0)
+    expect(prose).toBeLessThanOrEqual(3400)
+    for (const tool of listing) {
+      // No single tool may dominate the read: render_audio's description alone
+      // was 1273 B, a tenth of the whole listing.
+      expect(bytes(tool.description), `${tool.name} description`).toBeLessThanOrEqual(600)
+      // Essential sentence first, so a truncated read still gets the useful
+      // half: nothing may open with a 200-byte run-on.
+      const lead = tool.description.split(/(?<=\.)\s/)[0] ?? ''
+      expect(bytes(lead), `${tool.name} lead sentence`).toBeLessThanOrEqual(200)
+    }
+  })
 })
 
 describe('validation errors that carry the schema', () => {
@@ -387,25 +411,38 @@ describe('state and parameter tools', () => {
   })
 
   it('says decayT60Ms is measured from the rendered tail, not read back from env1.decay', async () => {
-    const { byName } = setup()
+    vi.useFakeTimers()
+    const { byName, execute } = setup()
     const description = byName.get('render_audio')!.description
+    const schema = byName.get('render_audio')!.inputSchema as any
     // An agent read decayT60Ms as a readback of env1.decay, then spent a
-    // render discovering the note's own length moves it.
-    expect(description).toContain('decayT60Ms')
-    expect(description).toMatch(/decayT60Ms[^.]*(tail|rendered)/i)
-    expect(description).toContain('env1.release')
-    expect(description).toMatch(/null/i)
-    // The sentences earlier findings put here must survive.
-    expect(description).toContain('`peakDb` is an instantaneous peak')
-    expect(description).toContain('mode: "realtime"')
+    // render discovering the note's own length moves it. The sentence now
+    // travels with the number, in the response's `metricNotes`, because in the
+    // description it was a tenth of the whole tool listing.
+    const rendering = execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 })
+    await vi.advanceTimersByTimeAsync(30)
+    const notes = (await rendering).metricNotes
+    expect(notes.decayT60Ms).toMatch(/decayT60Ms|tail/i)
+    expect(notes.decayT60Ms).toMatch(/tail|rendered/i)
+    expect(notes.decayT60Ms).toContain('env1.decay')
+    expect(notes.decayT60Ms).toContain('env1.release')
+    expect(notes.decayT60Ms).toMatch(/null/i)
+    // The facts earlier findings bought must survive, each where a client reads
+    // it: the response for how to read a metric, the schema for how to call.
+    expect(notes.peakDb).toContain('instantaneous peak')
+    expect(schema.properties.mode.description).toContain('"realtime"')
+    expect(schema.properties.mode.description).toContain('renderModeFallback')
     expect(description).toContain('metrics.harmonics')
-    expect(description).toContain('renderModeFallback')
+    expect(description).toMatch(/metricNotes/)
   })
 
-  it('names the valid modulation sources in the set_modulation description', async () => {
+  it('names the valid modulation sources on the set_modulation source property', async () => {
     const { byName } = setup()
-    const description = byName.get('set_modulation')!.description
-    for (const source of MOD_SOURCES) expect(description).toContain(source.id)
+    // The 24-id vocabulary an agent guessed twice in round 1 now sits on the
+    // property it fills in rather than in the prose, which a truncating client
+    // reads first and which had grown past what that client would show.
+    const schema = byName.get('set_modulation')!.inputSchema as any
+    for (const source of MOD_SOURCES) expect(schema.properties.source.description).toContain(source.id)
   })
 
   it('returns modulation routes by default, as get_synth_state promises', async () => {
@@ -764,12 +801,21 @@ describe('render and analysis tools', () => {
     await expect(execute('analyze_audio', { source: 'nope' })).rejects.toThrow(/source/i)
   })
 
-  it('documents the reference workflow as ordered steps and peakDb as instantaneous', () => {
-    const { byName } = setup()
+  it('documents the reference workflow as ordered steps and peakDb as instantaneous', async () => {
+    vi.useFakeTimers()
+    const { byName, execute } = setup()
     expect(byName.get('analyze_reference_audio')!.description).toMatch(/^Step 1 /)
     expect(byName.get('compare_audio')!.description).toMatch(/^Step 2/)
+    // Both tools that report peakDb still say it is a peak — now in the
+    // `metricNotes` that ship with the number instead of in the tool listing.
+    const rendering = execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 })
+    await vi.advanceTimersByTimeAsync(30)
+    await rendering
     for (const name of ['render_audio', 'analyze_audio']) {
-      expect(byName.get(name)!.description).toContain('instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels')
+      const again = name === 'render_audio' ? execute(name, { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 }) : execute(name)
+      await vi.advanceTimersByTimeAsync(30)
+      const result = await again
+      expect(result.metricNotes.peakDb, name).toContain('instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels')
     }
     expect(byName.get('play_notes')!.description).toContain('{"notes":[{"midi":60,"velocity":0.8,"start":0,"duration":0.5}]}')
     expect(byName.get('update_parameters')!.description).toContain('{"id":"filter1.cutoff","value":1200}')

@@ -41,6 +41,10 @@ const PARAMETER_GROUPS = [...new Set(PARAMS.map(def => def.group))]
 /** Derived at module load so the vocabulary in errors and descriptions cannot drift from `MOD_SOURCES`. */
 const MOD_SOURCE_IDS = MOD_SOURCES.map(source => source.id)
 
+/** Filtering advice belongs on the property an agent is filling in, not in the prose. */
+const GROUP_PROPERTY_DESCRIPTION = 'Exact group id, matched case-insensitively; one of the ids returned in `groups`.'
+const SEARCH_PROPERTY_DESCRIPTION = 'Case-insensitive substring over parameter id, name, and group.'
+
 type Input = Record<string, unknown>
 type DecodeAudio = typeof decodeBase64Audio
 
@@ -208,6 +212,23 @@ function compactParameter(def: ParamDef): string {
   if (def.moddable === true) parts.push('mod')
   return parts.join(' ')
 }
+
+/**
+ * The interpretation a metric needs at the point its number is read.
+ *
+ * These sentences used to sit in the `render_audio` and `analyze_audio`
+ * descriptions, where they made the tool listing too big for a client to read
+ * whole — a discoverability eval truncated the listing and lost `play_notes`
+ * altogether. Each fact stays where an agent actually meets the number: in the
+ * response that carries it, as `metricNotes`.
+ */
+const METRIC_NOTES = {
+  peakDb: 'An instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels.',
+  decayT60Ms: "Measured from the rendered tail, not read back from `env1.decay`: the note's own `duration` and `env1.release` shape that tail, so the same patch reports a different T60 over a longer note. It is `null` — its most common value on short notes — whenever the buffer never falls the 20 dB the slope fit needs, or falls too abruptly for the envelope to resolve."
+} as const
+
+/** How the Base64 preview became mono; travels with the payload it describes. */
+const DOWNMIX_NOTE = '"sum" is the plain channel average; "left"/"right" means that average cancelled and the louder channel was sent alone.'
 
 /** One modulation source as a single line: `keytrack voice -1..1`. */
 function compactSource(def: ModSourceDef): string {
@@ -460,7 +481,8 @@ export function createWebMcpTools(
       source: 'scope' as const,
       sampleRate,
       channels: 2,
-      metrics: analyzeAudio([engine.scopeL, engine.scopeR], sampleRate)
+      metrics: analyzeAudio([engine.scopeL, engine.scopeR], sampleRate),
+      metricNotes: METRIC_NOTES
     }
   }
 
@@ -470,7 +492,8 @@ export function createWebMcpTools(
       sampleRate: session.lastRender.sampleRate,
       channels: session.lastRender.channels,
       url: session.lastRender.url,
-      metrics: session.lastRender.metrics
+      metrics: session.lastRender.metrics,
+      metricNotes: METRIC_NOTES
     }
     return scopeCandidate()
   }
@@ -478,19 +501,25 @@ export function createWebMcpTools(
   return [
     {
       name: 'get_synth_state',
-      description: 'Get live synth state. Call with `format: "compact"` to see every parameter that differs from its default as `id=formatted` lines — the cheapest way to verify a patch. Runtime, FX order, and the first modulation routes are returned by default under `patch.modulations.items` (with `total`, and `nextOffset` when more routes exist — raise `modulationLimit` to see them all); use group/search/offset for a detailed parameter page, or `lfo: 1` for one LFO shape, returned as `patch.lfoShape`.',
+      description: 'Get live synth state: runtime, FX order, and the modulation routes. One call with `format: "compact"` also returns every parameter that differs from its default as `id=formatted` lines — the cheapest way to verify a patch. Routes ship by default in `patch.modulations` (with `total`, and `nextOffset` when more exist — raise `modulationLimit`). `lfo: 1` returns one shape as `patch.lfoShape`.',
       inputSchema: {
         type: 'object', properties: {
           format: { type: 'string', enum: ['full', 'compact'] },
-          group: { type: 'string', maxLength: MAX_QUERY_LENGTH },
-          search: { type: 'string', maxLength: MAX_QUERY_LENGTH },
+          group: {
+            type: 'string', maxLength: MAX_QUERY_LENGTH,
+            description: GROUP_PROPERTY_DESCRIPTION
+          },
+          search: {
+            type: 'string', maxLength: MAX_QUERY_LENGTH,
+            description: SEARCH_PROPERTY_DESCRIPTION
+          },
           parameterOffset: {
             type: 'integer', minimum: 0,
-            description: 'Paging cursor into the filtered parameter list. Only needed for the full format, or to continue a compact page you limited yourself — omit it (and `parameterLimit`) with `format: "compact"` to get every non-default parameter at once.'
+            description: 'Full-format paging cursor; omit it with `format: "compact"`.'
           },
           parameterLimit: {
             type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE,
-            description: `Page size for the full format (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}). Omit it with \`format: "compact"\`, which then returns every non-default parameter in one response; an explicit limit pages the compact format too, so it costs several calls instead of one.`
+            description: `Full-format page size (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); omit it with \`format: "compact"\`, which needs none and returns every non-default parameter in one response.`
           },
           modulationOffset: { type: 'integer', minimum: 0 },
           modulationLimit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE },
@@ -577,19 +606,25 @@ export function createWebMcpTools(
     },
     {
       name: 'get_parameter_schema',
-      description: 'Discover parameter units, ranges, defaults, curves, choices, and modulation capabilities. Call once with `format: "compact"` to see every parameter as one line each (`filter1.cutoff Hz 20..20000 exp =8000 mod`); use group/search/offset for detail in the full format. Add `sourceLimit` to the same call to list every modulation source id `set_modulation` accepts. env1 is the amplitude envelope (VCA) and the only hardwired modulator: env2-env6 and lfo1-lfo8 do nothing until routed with `set_modulation`. `groupNotes` repeats such facts for the groups on the page.',
+      description: `Discover parameter units, ranges, defaults, curves, choices, and modulation capabilities. One unfiltered call with \`format: "compact"\` returns all ${PARAMS.length} parameters, one line each (\`filter1.cutoff Hz 20..20000 exp =8000 mod\`). env1 is the amplitude envelope (VCA) and the only hardwired modulator: env2-env6 and lfo1-lfo8 do nothing until routed with \`set_modulation\`; \`groupNotes\` repeats such facts for the groups on the page. Add \`sourceLimit\` for the modulation source ids \`set_modulation\` accepts.`,
       inputSchema: {
         type: 'object', properties: {
           format: { type: 'string', enum: ['full', 'compact'] },
-          group: { type: 'string', maxLength: MAX_QUERY_LENGTH },
-          search: { type: 'string', maxLength: MAX_QUERY_LENGTH },
+          group: {
+            type: 'string', maxLength: MAX_QUERY_LENGTH,
+            description: GROUP_PROPERTY_DESCRIPTION
+          },
+          search: {
+            type: 'string', maxLength: MAX_QUERY_LENGTH,
+            description: SEARCH_PROPERTY_DESCRIPTION
+          },
           offset: {
             type: 'integer', minimum: 0,
-            description: `Paging cursor into the filtered parameter list. Only needed for the full format, or to continue a compact page you limited yourself — omit it (and \`limit\`) with \`format: "compact"\` to get all ${PARAMS.length} parameters at once.`
+            description: 'Full-format paging cursor; omit it with `format: "compact"`.'
           },
           limit: {
             type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE,
-            description: `Page size for the full format (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}). Omit it with \`format: "compact"\`, which then returns all ${PARAMS.length} parameters in one response; an explicit limit pages the compact format too, so it costs several calls instead of one.`
+            description: `Full-format page size (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); omit it with \`format: "compact"\`, which needs none and returns all ${PARAMS.length} parameters in one response.`
           },
           sourceOffset: { type: 'integer', minimum: 0 },
           sourceLimit: { type: 'integer', minimum: 1, maximum: MAX_PAGE_SIZE }
@@ -710,24 +745,24 @@ export function createWebMcpTools(
     },
     {
       name: 'set_modulation',
-      description: `Add, update, remove, or clear validated modulation routes in the shared 32-slot matrix. \`add\` takes \`source\`+\`destination\`, and replaces any route already on that pair. \`update\` and \`remove\` address a route either by \`slot\` or by that same \`source\`+\`destination\` pair — one form or the other, never both, and a pair with no route on it is an error rather than a new route. \`depth\` is bipolar (-1..1): it is added to the destination parameter's normalized 0..1 value and the sum is clamped, so depth 0.5 on a parameter sitting at 0.5 sweeps it up to 1.0. \`source\` is one of ${MOD_SOURCE_IDS.join(', ')}; \`destination\` is any moddable parameter id. Examples: {"action":"add","source":"lfo1","destination":"filter1.cutoff","depth":0.4} then {"action":"update","source":"lfo1","destination":"filter1.cutoff","depth":0.2}`,
+      description: `Add, update, remove, or clear modulation routes in the shared ${MAX_MOD_SLOTS}-slot matrix. \`add\` takes \`source\`+\`destination\` and replaces any route on that pair; \`update\`/\`remove\` address a route by \`slot\` or by that same pair — never both, and a pair with no route is an error, not a new route. \`depth\` is bipolar (-1..1): added to the destination's normalized 0..1 value, then clamped, so depth 0.5 on a parameter at 0.5 sweeps it to 1.0. Example: {"action":"add","source":"lfo1","destination":"filter1.cutoff","depth":0.4}`,
       inputSchema: {
         type: 'object',
         properties: {
           action: { type: 'string', enum: ['add', 'update', 'remove', 'clear'] },
           source: {
             type: 'string',
-            description: 'Modulation source id. Required by `add`; on `update`/`remove` it addresses a route together with `destination`, instead of `slot`.'
+            description: `Source id: ${MOD_SOURCE_IDS.join(', ')}. Required by \`add\`; on \`update\`/\`remove\` it pairs with \`destination\` instead of \`slot\`.`
           },
           destination: {
             type: 'string',
-            description: 'Moddable parameter id. Required by `add`; on `update`/`remove` it addresses a route together with `source`, instead of `slot`.'
+            description: 'Moddable parameter id (`mod` in the compact schema). Required by `add`; pairs with `source` on `update`/`remove`.'
           },
           depth: { type: 'number', minimum: -1, maximum: 1 },
           enabled: { type: 'boolean' },
           slot: {
             type: 'integer', minimum: 0, maximum: MAX_MOD_SLOTS - 1,
-            description: 'Matrix slot, as returned in `route.slot`. The alternative to a `source`+`destination` pair on `update`/`remove`; passing both is rejected as ambiguous.'
+            description: 'Matrix slot from `route.slot`; the alternative to a `source`+`destination` pair on `update`/`remove` — passing both is ambiguous.'
           }
         },
         required: ['action'], additionalProperties: false
@@ -810,7 +845,7 @@ export function createWebMcpTools(
     },
     {
       name: 'play_notes',
-      description: 'Play a bounded sequence of MIDI notes with relative real-time start and duration values, in seconds. A repeated pitch retriggers its voice. Example: {"notes":[{"midi":60,"velocity":0.8,"start":0,"duration":0.5}]}. Requires runtime.running=true; otherwise click CLICK TO START AUDIO first.',
+      description: 'Play a bounded sequence of MIDI notes with relative start and duration values, in seconds. A repeated pitch retriggers its voice. Requires runtime.running=true; otherwise click CLICK TO START AUDIO first. Example: {"notes":[{"midi":60,"velocity":0.8,"start":0,"duration":0.5}]}',
       inputSchema: {
         type: 'object', properties: { notes: { type: 'array', minItems: 1, maxItems: MAX_NOTES, items: noteSchema } },
         required: ['notes'], additionalProperties: false
@@ -837,14 +872,20 @@ export function createWebMcpTools(
     },
     {
       name: 'render_audio',
-      description: 'Render a bounded note sequence and return audio metrics for it. Offline by default: repeatable scheduling, far faster than real time, and available before the human has started audio — only `play_notes` needs that gesture. Pass `mode: "realtime"` to capture the live AudioWorklet output instead (needs running audio); an offline request falls back to real time, and says so in `renderModeFallback`, on browsers without OfflineAudioContext. `format` selects the audio payload: "metrics" (default, metrics only), "url" (a page-local blob URL), or "base64" (mono 16-bit WAV, 22.05 kHz, first ' + BASE64_MAX_SECONDS + ' s, so an audio-capable agent can listen; its `downmix` is "sum", or "left"/"right" when the channels cancelled in mono and the louder one was sent alone). A single-pitch sequence also gets `metrics.harmonics`. `peakDb` is an instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels. `metrics.decayT60Ms` is measured from the rendered tail, not read back from `env1.decay`: the note\'s own `duration` and `env1.release` shape that tail, so the same patch reports a different T60 over a longer note. It is `null` — its most common value on short notes — whenever the buffer never falls the 20 dB the slope fit needs, or falls too abruptly for the envelope to resolve.',
+      description: 'Render a bounded note sequence and return `metrics` for it (plus `metricNotes`, which says how to read them). Offline by default: repeatable scheduling, far faster than real time, and available before the human has started audio — only `play_notes` needs that gesture. A single-pitch sequence also gets `metrics.harmonics`.',
       inputSchema: {
         type: 'object',
         properties: {
           notes: { type: 'array', minItems: 1, maxItems: MAX_NOTES, items: noteSchema },
           duration: { type: 'number', exclusiveMinimum: 0, maximum: MAX_RENDER_SECONDS },
-          mode: { type: 'string', enum: [...RENDER_MODES] },
-          format: { type: 'string', enum: [...RENDER_FORMATS] }
+          mode: {
+            type: 'string', enum: [...RENDER_MODES],
+            description: 'Default "offline". "realtime" captures the live AudioWorklet output and needs running audio; with no OfflineAudioContext an offline request falls back to real time via `renderModeFallback`.'
+          },
+          format: {
+            type: 'string', enum: [...RENDER_FORMATS],
+            description: `Payload beside the metrics: "metrics" (default), "url" (a page-local blob URL), or "base64" (mono 16-bit WAV an audio-capable agent can listen to, first ${BASE64_MAX_SECONDS} s; the returned \`audio\` object describes itself).`
+          }
         },
         required: ['notes'], additionalProperties: false
       },
@@ -881,8 +922,11 @@ export function createWebMcpTools(
               sampleRate: recording.sampleRate,
               channels: recording.channelData.length,
               metrics,
+              metricNotes: METRIC_NOTES,
               ...(format === 'url' ? { url } : {}),
-              ...(format === 'base64' ? { audio: monoWavBase64(recording.channelData, recording.sampleRate) } : {}),
+              ...(format === 'base64' ? {
+                audio: { ...monoWavBase64(recording.channelData, recording.sampleRate), downmixNote: DOWNMIX_NOTE }
+              } : {}),
               ...(renderModeFallback ? { renderModeFallback } : {}),
               ...(sequence.overlaps > 0 ? { retriggered: sequence.overlaps } : {})
             }
@@ -936,7 +980,7 @@ export function createWebMcpTools(
     },
     {
       name: 'analyze_audio',
-      description: 'Re-analyze the last `render_audio` result, or analyze the live output right now (`source: "scope"`) — useful while a human is playing. `render_audio` already returns the same metrics, so call this only when you need a fresh look without re-rendering. `peakDb` is an instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels.',
+      description: 'Re-analyze the last `render_audio` result, or analyze the live output right now (`source: "scope"`) — useful while a human is playing. `render_audio` already returns the same metrics and the same `metricNotes`, so call this only when you need a fresh look without re-rendering.',
       inputSchema: {
         type: 'object',
         properties: { source: { type: 'string', enum: ['scope', 'last-render'] } },
@@ -957,7 +1001,7 @@ export function createWebMcpTools(
     },
     {
       name: 'analyze_reference_audio',
-      description: 'Step 1 of matching a target sound: send the target as Base64 audio, which is decoded in memory and analyzed with the same metrics as synth output. Then render your patch and call compare_audio (step 2).',
+      description: 'Step 1 of matching a target sound: send the target as Base64 audio; it is decoded in memory and analyzed with the same metrics as synth output. Then render your patch and call compare_audio (step 2).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1011,7 +1055,7 @@ export function createWebMcpTools(
     },
     {
       name: 'compare_audio',
-      description: 'Step 2 of matching a target sound: compare the latest reference from analyze_reference_audio with the latest render (or the live scope when nothing has been rendered — the same candidate analyze_audio would return), and report per-metric and overall similarity.',
+      description: 'Step 2 of matching a target sound: report per-metric and overall similarity between the latest `analyze_reference_audio` reference and the latest render. With nothing rendered it falls back to the live scope — the same candidate `analyze_audio` returns.',
       inputSchema: emptySchema,
       annotations: { readOnlyHint: true },
       execute(input, options) {
@@ -1047,7 +1091,7 @@ export function createWebMcpTools(
     },
     {
       name: 'load_preset',
-      description: 'Load a named user preset previously saved to localStorage and return its verifiable resulting state. Factory presets from the UI dropdown are not included.',
+      description: 'Load a named user preset saved to localStorage and return its verifiable resulting state. Factory presets from the UI dropdown are not included.',
       inputSchema: {
         type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 80 } },
         required: ['name'], additionalProperties: false
@@ -1066,7 +1110,7 @@ export function createWebMcpTools(
     },
     {
       name: 'list_presets',
-      description: 'List the user presets saved to localStorage, newest storage order first, so you can see what save_preset and the human have stored. Factory presets from the UI dropdown are not included.',
+      description: 'List the user presets saved to localStorage, newest storage order first. Factory presets from the UI dropdown are not included.',
       inputSchema: emptySchema,
       annotations: { readOnlyHint: true },
       execute(input) {
