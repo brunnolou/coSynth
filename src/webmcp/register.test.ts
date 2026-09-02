@@ -20,7 +20,7 @@ describe('registerWebMcpTools', () => {
     expect(registration.errors).toEqual([])
   })
 
-  it('registers each of the eleven tools exactly once with a shared lifecycle signal', async () => {
+  it('registers each of the twelve tools exactly once with a shared lifecycle signal', async () => {
     const calls: Array<{ tool: WebMCP.ModelContextTool; signal?: AbortSignal }> = []
     const modelContext = context((tool, options) => {
       calls.push({ tool, signal: options?.signal })
@@ -33,11 +33,11 @@ describe('registerWebMcpTools', () => {
     expect(calls.map(({ tool }) => tool.name)).toEqual([
       'get_synth_state', 'get_parameter_schema', 'update_parameters',
       'set_modulation', 'play_notes', 'render_audio', 'analyze_audio',
-      'analyze_reference_audio', 'compare_audio', 'save_preset', 'load_preset'
+      'analyze_reference_audio', 'compare_audio', 'save_preset', 'load_preset', 'list_presets'
     ])
     expect(new Set(calls.map(call => call.signal)).size).toBe(1)
     expect(calls[0].signal?.aborted).toBe(false)
-    expect(registration.registeredCount).toBe(11)
+    expect(registration.registeredCount).toBe(12)
     registration.dispose()
     expect(calls[0].signal?.aborted).toBe(true)
   })
@@ -48,7 +48,7 @@ describe('registerWebMcpTools', () => {
     await registerWebMcpTools(engine, modelContext, { audioTools: 'exclude' }).ready
     expect(names).not.toContain('play_notes')
     expect(names).not.toContain('render_audio')
-    expect(names).toHaveLength(9)
+    expect(names).toHaveLength(10)
 
     names.length = 0
     await registerWebMcpTools(engine, modelContext, { audioTools: 'only' }).ready
@@ -62,9 +62,9 @@ describe('registerWebMcpTools', () => {
 
     const update = calls.find(tool => tool.name === 'update_parameters')!
     await expect(update.execute({ updates: [{ id: 'missing', value: 1 }] }, { signal: new AbortController().signal }))
-      .resolves.toEqual({ ok: false, error: { code: 'tool_error', message: 'Unknown parameter: missing' } })
+      .resolves.toMatchObject({ ok: false, error: { code: 'tool_error', message: expect.stringContaining("Unknown parameter 'missing'") } })
     expect(agentActivityFor(engine).snapshot().lastAction).toMatchObject({
-      tool: 'update_parameters', status: 'failed', summary: 'Unknown parameter: missing'
+      tool: 'update_parameters', status: 'failed', summary: expect.stringContaining("Unknown parameter 'missing'")
     })
 
     const controller = new AbortController()
@@ -85,14 +85,14 @@ describe('registerWebMcpTools', () => {
 
     const registration = registerWebMcpTools(engine, modelContext)
     await expect(registration.ready).resolves.toBeUndefined()
-    expect(registration.registeredCount).toBe(9)
+    expect(registration.registeredCount).toBe(10)
     expect(registration.available).toBe(true)
     expect(registration.pending).toBe(false)
     expect(registration.errors).toEqual(expect.arrayContaining([
       { tool: 'get_parameter_schema', message: 'sync failure' },
       { tool: 'set_modulation', message: 'async failure' }
     ]))
-    expect(attempted).toHaveLength(11)
+    expect(attempted).toHaveLength(12)
     expect(warn).toHaveBeenCalledTimes(2)
     warn.mockRestore()
   })
@@ -103,7 +103,7 @@ describe('registerWebMcpTools', () => {
     const guide = { show: vi.fn(() => ({ shown: true, stepCount: 1, warnings: [] })), listTargets: vi.fn(() => ({ items: [], total: 0, offset: 0, limit: 5 })) }
     const registration = registerWebMcpTools(engine, context(tool => { calls.push(tool) }), { audioTools: 'exclude', guide })
     await registration.ready
-    expect(registration.registeredCount).toBe(11)
+    expect(registration.registeredCount).toBe(12)
     const show = calls.find(t => t.name === 'show_ui_guide')!
     const get = calls.find(t => t.name === 'get_ui_targets')!
     expect(show.annotations?.readOnlyHint).toBe(false)

@@ -12,10 +12,10 @@ describe('registerLegacyWebMcpTools', () => {
     }
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
     await registration.ready
-    expect(calls).toHaveLength(9)
+    expect(calls).toHaveLength(10)
     expect(calls.map(call => call.name)).toContain('get_synth_state')
     await expect(calls.find(call => call.name === 'update_parameters')!.execute({ updates: [{ id: 'missing', value: 1 }] }))
-      .resolves.toEqual({ ok: false, error: { code: 'tool_error', message: 'Unknown parameter: missing' } })
+      .resolves.toMatchObject({ ok: false, error: { code: 'tool_error', message: expect.stringContaining("Unknown parameter 'missing'") } })
     registration.dispose()
     expect(disconnected).toBe(1)
     await expect(Promise.resolve().then(() => calls[0].execute({}))).rejects.toMatchObject({ name: 'AbortError' })
@@ -25,7 +25,7 @@ describe('registerLegacyWebMcpTools', () => {
     const legacy: LegacyWebMcp = { registerTool() {} }
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
     await registration.ready
-    expect(registration.registeredCount).toBe(9)
+    expect(registration.registeredCount).toBe(10)
     expect(registration.errors).toEqual([])
   })
 
@@ -39,7 +39,7 @@ describe('registerLegacyWebMcpTools', () => {
     }
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
     await registration.ready
-    expect(registration.registeredCount).toBe(8)
+    expect(registration.registeredCount).toBe(9)
     expect(registration.errors).toEqual([{ tool: 'get_synth_state', message: 'widget refused the tool' }])
   })
 
@@ -55,7 +55,7 @@ describe('registerLegacyWebMcpTools', () => {
     }
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy, { audioTools: 'exclude' })
     await registration.ready
-    expect(registration.registeredCount).toBe(8)
+    expect(registration.registeredCount).toBe(9)
     expect(registration.errors).toHaveLength(1)
     expect(registration.errors[0].tool).toBe('update_parameters')
     expect(registration.errors[0].message).toContain('update_parameters')

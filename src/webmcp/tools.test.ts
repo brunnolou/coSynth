@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { defaultValues, paramIndex } from '../shared/params'
+import { PARAMS, defaultValues, paramIndex } from '../shared/params'
 import { DEFAULT_FX_ORDER, FX_IDS, MAX_MOD_SLOTS, defaultLfoShape, modSourceIndex, type ModSlotState } from '../shared/messages'
 import type { PresetData, RecordedAudio, SynthEngine } from '../audio/engine'
 import { createWebMcpTools, type WebMcpToolDependencies } from './tools'
@@ -101,12 +101,12 @@ afterEach(() => {
 })
 
 describe('WebMCP tool metadata', () => {
-  it('exposes exactly eleven strict object schemas in composable workflow order', () => {
+  it('exposes exactly twelve strict object schemas in composable workflow order', () => {
     const { tools } = setup()
     expect(tools.map(tool => tool.name)).toEqual([
       'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
       'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
-      'compare_audio', 'save_preset', 'load_preset'
+      'compare_audio', 'save_preset', 'load_preset', 'list_presets'
     ])
     for (const tool of tools) {
       expect(tool.description.length).toBeGreaterThan(10)
@@ -115,7 +115,7 @@ describe('WebMCP tool metadata', () => {
     }
     expect(tools.filter(tool => tool.annotations?.readOnlyHint).map(tool => tool.name)).toEqual([
       'get_synth_state', 'get_parameter_schema', 'analyze_audio',
-      'compare_audio'
+      'compare_audio', 'list_presets'
     ])
     expect(tools.filter(tool => tool.annotations?.readOnlyHint === false).map(tool => tool.name)).toEqual([
       'update_parameters', 'set_modulation', 'play_notes', 'render_audio',
@@ -131,6 +131,116 @@ describe('WebMCP tool metadata', () => {
       }
     })
     expect((tools[7].inputSchema as any).properties.mimeType.pattern).toBe('^[aA][uU][dD][iI][oO]/')
+  })
+})
+
+describe('validation errors that carry the schema', () => {
+  it('names the accepted properties on an unexpected key', async () => {
+    const { execute } = setup()
+    await expect(execute('update_parameters', { changes: [] }))
+      .rejects.toThrow("Unexpected input property 'changes'. Accepted: updates")
+    await expect(execute('play_notes', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 1, name: 'C4' }] }))
+      .rejects.toThrow(/notes\[0\].*'name'/)
+  })
+
+  it('lists the required properties when one is missing', async () => {
+    await expect(setup().execute('analyze_reference_audio', {}))
+      .rejects.toThrow(/input\.audioBase64 is required\. Required: audioBase64\. Accepted: audioBase64, name, mimeType/)
+  })
+
+  it('suggests near parameter ids and lists the groups', async () => {
+    const { execute } = setup()
+    const failure = await execute('update_parameters', { updates: [{ id: 'filter.cutoff', value: 1000 }] })
+      .catch((error: Error) => error.message)
+    expect(failure).toContain("Unknown parameter 'filter.cutoff'")
+    expect(failure).toContain('Did you mean filter1.cutoff, filter2.cutoff?')
+    expect(failure).toContain('Groups: global, osc1')
+  })
+
+  it('caps suggestions at three and stays silent when nothing is close', async () => {
+    const { execute } = setup()
+    const many = await execute('update_parameters', { updates: [{ id: 'env', value: 1 }] })
+      .catch((error: Error) => error.message)
+    expect(many.match(/Did you mean ([^?]+)\?/)![1].split(', ')).toHaveLength(3)
+    const none = await execute('update_parameters', { updates: [{ id: 'zzzzzzzzzz', value: 1 }] })
+      .catch((error: Error) => error.message)
+    expect(none).not.toContain('Did you mean')
+    expect(none).toContain('Groups:')
+  })
+
+  it('lists every modulation source and suggests near destinations', async () => {
+    const { execute } = setup()
+    const source = await execute('set_modulation', { action: 'add', source: 'vel', destination: 'osc1.level', depth: 0.5 })
+      .catch((error: Error) => error.message)
+    expect(source).toContain("Unknown modulation source 'vel'")
+    expect(source).toContain('Did you mean velocity?')
+    expect(source).toMatch(/Valid: .*env1.*lfo1.*velocity/)
+
+    const destination = await execute('set_modulation', { action: 'add', source: 'lfo1', destination: 'filter1.cutof', depth: 0.5 })
+      .catch((error: Error) => error.message)
+    expect(destination).toContain("Unknown modulation destination 'filter1.cutof'")
+    expect(destination).toContain('Did you mean filter1.cutoff, filter2.cutoff?')
+  })
+
+  it('lists the choices for an unknown choice label', async () => {
+    const failure = await setup().execute('update_parameters', { updates: [{ id: 'filter1.type', value: 'Lowpass' }] })
+      .catch((error: Error) => error.message)
+    expect(failure).toContain("Unknown choice 'Lowpass' for filter1.type")
+    expect(failure).toContain('Choices: LP 12, LP 24, HP 12, HP 24, BP 12, BP 24, Notch, Comb, Formant')
+  })
+})
+
+describe('single-round-trip discovery', () => {
+  it('returns every parameter as one compact line without paging', async () => {
+    const { execute } = setup()
+    const result = await execute('get_parameter_schema', { format: 'compact' })
+    expect(result.parameters.total).toBe(result.parameters.items.length)
+    expect(result.parameters.items).toHaveLength(PARAMS.length)
+    expect(result.parameters).not.toHaveProperty('nextOffset')
+    expect(result.parameters.items).toContain('filter1.cutoff Hz 20..20000 exp =8000 mod')
+    expect(result.parameters.items).toContain(
+      'filter1.type {LP 12|LP 24|HP 12|HP 24|BP 12|BP 24|Notch|Comb|Formant} =1'
+    )
+    expect(result.parameters.items).toContain('master.bpm BPM 20..300 step1 =120')
+    expect(result.limits).toMatchObject({ modulationSlots: 32 })
+  })
+
+  it('accepts a limit of 60 in the full format and surfaces the unit hint', async () => {
+    const { execute } = setup()
+    const result = await execute('get_parameter_schema', { limit: 60 })
+    expect(result.parameters.items).toHaveLength(60)
+    expect(result.parameters.items[0]).toMatchObject({ id: 'master.volume', unit: '%' })
+    const envelope = await execute('get_parameter_schema', { search: 'env1.attack' })
+    expect(envelope.parameters.items[0]).toMatchObject({ id: 'env1.attack', unit: 'ms', curve: 'exp' })
+    await expect(execute('get_parameter_schema', { limit: 61 })).rejects.toThrow(/1\.\.60/)
+    await expect(execute('get_parameter_schema', { format: 'brief' })).rejects.toThrow(/format/i)
+  })
+
+  it('lists only non-default parameters when synth state is compact', async () => {
+    const { engine, execute } = setup()
+    await execute('update_parameters', { updates: [{ id: 'filter1.cutoff', value: 1200 }] })
+    const result = await execute('get_synth_state', { format: 'compact' })
+    expect(result.patch.parameters.items).toEqual(['filter1.cutoff=1.20 kHz'])
+    expect(result.patch.parameters.total).toBe(1)
+    expect(result.patch.parameters).not.toHaveProperty('nextOffset')
+    expect(engine.setParam).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('preset listing', () => {
+  it('lists saved presets by name', async () => {
+    const { engine, execute } = setup()
+    engine.toPreset.mockImplementation((name: string): PresetData => ({
+      name, version: 1, params: { 'master.volume': 0.5 }, mods: [],
+      lfoShapes: engine.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
+    }))
+    expect(await execute('list_presets')).toEqual({ presets: [], total: 0 })
+    await execute('save_preset', { name: 'Concert Grand' })
+    await execute('save_preset', { name: 'Rhodes' })
+    expect(await execute('list_presets')).toEqual({
+      presets: [{ name: 'Concert Grand' }, { name: 'Rhodes' }], total: 2
+    })
+    await expect(execute('list_presets', { name: 'x' })).rejects.toThrow(/unexpected/i)
   })
 })
 
@@ -450,6 +560,33 @@ describe('render and analysis tools', () => {
     expect(engine.noteOff).toHaveBeenCalledWith(64, expect.any(Symbol))
   })
 
+  it('selects the analysis source explicitly', async () => {
+    vi.useFakeTimers()
+    const { byName, execute } = setup()
+    expect((byName.get('analyze_audio')!.inputSchema as any).properties.source.enum).toEqual(['scope', 'last-render'])
+    await expect(execute('analyze_audio', { source: 'last-render' })).rejects.toThrow(/render_audio first/i)
+
+    const rendering = execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 })
+    await vi.advanceTimersByTimeAsync(30)
+    const render = await rendering
+    expect(await execute('analyze_audio', { source: 'last-render' })).toMatchObject({ source: 'last-render', metrics: render.metrics })
+    expect(await execute('analyze_audio', { source: 'scope' })).toMatchObject({ source: 'scope' })
+    expect(await execute('analyze_audio')).toMatchObject({ source: 'last-render' })
+    await expect(execute('analyze_audio', { source: 'nope' })).rejects.toThrow(/source/i)
+  })
+
+  it('documents the reference workflow as ordered steps and peakDb as instantaneous', () => {
+    const { byName } = setup()
+    expect(byName.get('analyze_reference_audio')!.description).toMatch(/^Step 1 /)
+    expect(byName.get('compare_audio')!.description).toMatch(/^Step 2/)
+    for (const name of ['render_audio', 'analyze_audio']) {
+      expect(byName.get(name)!.description).toContain('instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels')
+    }
+    expect(byName.get('play_notes')!.description).toContain('{"notes":[{"midi":60,"velocity":0.8,"start":0,"duration":0.5}]}')
+    expect(byName.get('update_parameters')!.description).toContain('{"id":"filter1.cutoff","value":1200}')
+    expect(byName.get('set_modulation')!.description).toMatch(/bipolar.*normalized.*clamp/i)
+  })
+
   it('falls back explicitly to current scope analysis, even before audio starts', async () => {
     const running = setup()
     const result = await running.execute('analyze_audio')
@@ -478,11 +615,12 @@ describe('render and analysis tools', () => {
       duration: 4 / 8000,
       sampleRate: 8000,
       channels: 1,
-      metrics: {
+      // objectContaining so new AudioMetrics fields do not break this assertion.
+      metrics: expect.objectContaining({
         peakDb: expect.any(Number), rmsDb: expect.any(Number), clippingCount: expect.any(Number),
         dcOffset: expect.any(Number), spectralCentroidHz: expect.any(Number), attackMs: expect.any(Number),
         stereoWidth: expect.any(Number)
-      }
+      })
     })
     expect(decodeAudio).toHaveBeenCalledWith(audioBase64, {
       context: engine.ctx,
@@ -536,10 +674,10 @@ describe('render and analysis tools', () => {
     expect(result.candidate).toEqual(analysis)
     expect(result.comparison.similarity).toBeGreaterThanOrEqual(0)
     expect(result.comparison.similarity).toBeLessThanOrEqual(1)
-    expect(Object.keys(result.comparison.details)).toEqual([
+    expect(Object.keys(result.comparison.details)).toEqual(expect.arrayContaining([
       'peakDb', 'rmsDb', 'clippingCount', 'dcOffset',
       'spectralCentroidHz', 'attackMs', 'stereoWidth'
-    ])
+    ]))
   })
 
   it('compares against the latest real render and retains only the latest reference analysis', async () => {

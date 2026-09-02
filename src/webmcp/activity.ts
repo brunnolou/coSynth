@@ -57,6 +57,7 @@ const TOOL_LABELS: Record<string, string> = {
   compare_audio: 'Compared audio',
   save_preset: 'Saved preset',
   load_preset: 'Loaded preset',
+  list_presets: 'Listed presets',
   get_ui_targets: 'Found teaching targets',
   show_ui_guide: 'Updated teaching guide',
   get_history: 'Read history',

@@ -64,9 +64,9 @@ const db = (v: number) => `${v.toFixed(1)} dB`
 
 // ---------------------------------------------------------------- global
 p({ id: 'master.volume', name: 'Master', group: 'global', min: 0, max: 1.5, def: 0.7, moddable: true, fmt: pct })
-p({ id: 'master.bpm', name: 'BPM', group: 'global', min: 20, max: 300, def: 120, step: 1 })
-p({ id: 'master.polyphony', name: 'Voices', group: 'global', min: 1, max: 16, def: 16, step: 1 })
-p({ id: 'master.bend_range', name: 'Bend Rng', group: 'global', min: 1, max: 48, def: 2, step: 1 })
+p({ id: 'master.bpm', name: 'BPM', group: 'global', min: 20, max: 300, def: 120, step: 1, unit: 'BPM' })
+p({ id: 'master.polyphony', name: 'Voices', group: 'global', min: 1, max: 16, def: 16, step: 1, unit: 'voices' })
+p({ id: 'master.bend_range', name: 'Bend Rng', group: 'global', min: 1, max: 48, def: 2, step: 1, unit: 'st' })
 
 // ---------------------------------------------------------------- oscillators
 for (let o = 1; o <= 3; o++) {
@@ -119,7 +119,7 @@ p({ id: 'dist.type', name: 'Type', group: 'dist', min: 0, max: DIST_TYPES.length
 p({ id: 'dist.drive', name: 'Drive', group: 'dist', min: 0, max: 1, def: 0.3, moddable: true, fmt: pct })
 p({ id: 'dist.mix', name: 'Mix', group: 'dist', min: 0, max: 1, def: 1, moddable: true, fmt: pct })
 p({ id: 'dist.bits', name: 'Bits', group: 'dist', min: 1, max: 16, def: 8, moddable: true, fmt: v => `${v.toFixed(1)} bit` })
-p({ id: 'dist.downsample', name: 'Rate', group: 'dist', min: 1, max: 64, def: 1, curve: 'exp', moddable: true, fmt: v => `÷${v.toFixed(1)}` })
+p({ id: 'dist.downsample', name: 'Rate', group: 'dist', min: 1, max: 64, def: 1, curve: 'exp', moddable: true, unit: 'x', fmt: v => `÷${v.toFixed(1)}` })
 
 // ---------------------------------------------------------------- envelopes (env1 = amp)
 for (let e = 1; e <= 6; e++) {
@@ -200,6 +200,45 @@ p({ id: 'fxdist.enabled', name: 'On', group: 'fxdist', min: 0, max: 1, def: 0, s
 p({ id: 'fxdist.drive', name: 'Drive', group: 'fxdist', min: 0, max: 1, def: 0.4, moddable: true, fmt: pct })
 p({ id: 'fxdist.tone', name: 'Tone', group: 'fxdist', min: 200, max: 18000, def: 8000, curve: 'exp', moddable: true, fmt: hz })
 p({ id: 'fxdist.mix', name: 'Mix', group: 'fxdist', min: 0, max: 1, def: 1, moddable: true, fmt: pct })
+
+// ---------------------------------------------------------------- units
+// `unit` is a short machine-readable hint for agents reading the parameter
+// schema. The authoritative unit of every parameter already lives inside its
+// `fmt` closure, so derive the hint from what `fmt` actually emits instead of
+// repeating it (and risking divergence) on every definition.
+const UNIT_RULES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/%$/, '%'],
+  [/k?Hz$/, 'Hz'],
+  [/\bct$/, 'ct'],
+  [/\bst$/, 'st'],
+  [/\bdB$/, 'dB'],
+  [/\bbit$/, 'bit'],
+  [/\boct$/, 'oct'],
+  [/\b(?:s|ms)$/, 'ms'],
+  [/°$/, '°'],
+  [/:1$/, ':1'],
+  [/\dv$/, 'voices'],
+  [/\dx$/, 'x']
+]
+
+function deriveUnit(d: ParamDef): string | undefined {
+  if (d.choices || !d.fmt) return undefined
+  let unit: string | undefined
+  for (const value of [d.min, d.def, d.max]) {
+    const formatted = d.fmt(value)
+    const match = UNIT_RULES.find(([pattern]) => pattern.test(formatted))?.[1]
+    if (!match || (unit !== undefined && unit !== match)) return undefined
+    unit = match
+  }
+  return unit
+}
+
+for (const d of defs) {
+  if (d.unit === undefined) {
+    const unit = deriveUnit(d)
+    if (unit) d.unit = unit
+  }
+}
 
 export const PARAMS: readonly ParamDef[] = defs
 export const NUM_PARAMS = PARAMS.length

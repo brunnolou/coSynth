@@ -6,7 +6,7 @@ import {
 } from '../shared/params'
 import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type ModSlotState } from '../shared/messages'
 import { analyzeAudio, compareAudioMetrics, type AudioMetrics, type AudioMetricsComparison } from '../shared/audio-analysis'
-import { loadPreset, savePreset, validatePresetData, validatePresetName } from '../shared/preset-store'
+import { listPresets, loadPreset, savePreset, validatePresetData, validatePresetName } from '../shared/preset-store'
 import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
 import { analyzeAudioAbortably } from './audio-analysis-task'
 import { PerformanceManager, performNotes, assertNotesAvailable, validatePerformanceNotes } from '../history/performance'
@@ -23,7 +23,8 @@ export const WEBMCP_TOOL_NAMES = [
   'analyze_reference_audio',
   'compare_audio',
   'save_preset',
-  'load_preset'
+  'load_preset',
+  'list_presets'
 ] as const
 
 const MAX_NOTES = 128
@@ -32,7 +33,10 @@ const MAX_RENDER_SECONDS = 15
 const MAX_QUERY_LENGTH = 100
 const MAX_REFERENCE_NAME_LENGTH = 255
 const MAX_MIME_TYPE_LENGTH = 127
-const MAX_PAGE_SIZE = 5
+const MAX_PAGE_SIZE = 60
+const COMPACT_PAGE_SIZE = PARAMS.length
+const DEFAULT_PAGE_SIZE = 5
+const PARAMETER_GROUPS = [...new Set(PARAMS.map(def => def.group))]
 
 type Input = Record<string, unknown>
 type DecodeAudio = typeof decodeBase64Audio
@@ -82,12 +86,57 @@ function sessionFor(engine: SynthEngine): WebMcpSessionState {
   return session
 }
 
+function accepted(allowed: readonly string[]): string {
+  return allowed.length === 0 ? 'Accepted: (no properties)' : `Accepted: ${allowed.join(', ')}`
+}
+
 function assertObject(value: unknown, label: string, allowed: readonly string[], required: readonly string[] = []): Input {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`${label} must be an object`)
   const input = value as Input
-  for (const key of Object.keys(input)) if (!allowed.includes(key)) throw new Error(`Unexpected ${label} property: ${key}`)
-  for (const key of required) if (!(key in input)) throw new Error(`${label}.${key} is required`)
+  for (const key of Object.keys(input)) {
+    if (!allowed.includes(key)) throw new Error(`Unexpected ${label} property '${key}'. ${accepted(allowed)}`)
+  }
+  for (const key of required) {
+    if (!(key in input)) throw new Error(`${label}.${key} is required. Required: ${required.join(', ')}. ${accepted(allowed)}`)
+  }
   return input
+}
+
+/** Edit distance capped at `limit`; returns limit + 1 once the budget is exceeded. */
+function editDistance(a: string, b: string, limit: number): number {
+  if (Math.abs(a.length - b.length) > limit) return limit + 1
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index)
+  for (let i = 1; i <= a.length; i++) {
+    const row = [i]
+    for (let j = 1; j <= b.length; j++) {
+      row[j] = Math.min(
+        previous[j] + 1,
+        row[j - 1] + 1,
+        previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+      )
+    }
+    if (Math.min(...row) > limit) return limit + 1
+    previous = row
+  }
+  return previous[b.length]
+}
+
+/** Up to three near candidates: prefix matches first, then edit distance <= 2. */
+function suggest(id: string, candidates: readonly string[], max = 3): string[] {
+  const needle = id.toLowerCase()
+  const prefix = candidates.filter(candidate => candidate.toLowerCase().startsWith(needle))
+  const near = candidates
+    .filter(candidate => !prefix.includes(candidate))
+    .map(candidate => ({ candidate, distance: editDistance(needle, candidate.toLowerCase(), 2) }))
+    .filter(entry => entry.distance <= 2)
+    .sort((a, b) => a.distance - b.distance)
+    .map(entry => entry.candidate)
+  return [...prefix, ...near].slice(0, max)
+}
+
+function didYouMean(id: string, candidates: readonly string[]): string {
+  const matches = suggest(id, candidates)
+  return matches.length === 0 ? '' : ` Did you mean ${matches.join(', ')}?`
 }
 
 function finite(value: unknown, label: string): number {
@@ -105,6 +154,27 @@ function parameterValue(def: ParamDef, normalized: number) {
     normalized: clean(normalized),
     formatted: formatValue(def, normalized)
   }
+}
+
+/** One parameter as a single line: `filter1.cutoff Hz 20..20000 exp =8000 mod`. */
+function compactParameter(def: ParamDef): string {
+  const parts = [def.id]
+  if (def.unit) parts.push(def.unit)
+  if (def.choices) parts.push(`{${def.choices.join('|')}}`)
+  else {
+    parts.push(`${def.min}..${def.max}`)
+    if (def.curve === 'exp') parts.push('exp')
+    if (def.step !== undefined) parts.push(`step${def.step}`)
+  }
+  parts.push(`=${def.def}`)
+  if (def.moddable === true) parts.push('mod')
+  return parts.join(' ')
+}
+
+function assertFormat(value: unknown): 'full' | 'compact' {
+  if (value === undefined) return 'full'
+  if (value !== 'full' && value !== 'compact') throw new Error("format must be 'full' or 'compact'")
+  return value
 }
 
 function routeValue(slot: number, route: ModSlotState) {
@@ -187,7 +257,9 @@ function canonicalRaw(def: ParamDef, value: unknown): number {
   if (typeof value === 'string') {
     if (!def.choices) throw new Error(`${def.id} does not accept a choice label`)
     const choice = def.choices.indexOf(value)
-    if (choice < 0) throw new Error(`Unknown choice for ${def.id}: ${value}`)
+    if (choice < 0) {
+      throw new Error(`Unknown choice '${value}' for ${def.id}.${didYouMean(value, def.choices)} Choices: ${def.choices.join(', ')}`)
+    }
     return choice
   }
   const raw = finite(value, `${def.id} value`)
@@ -295,14 +367,7 @@ export function createWebMcpTools(
     if (performance.active) throw new Error(`${action} is unavailable while a performance is in progress`)
   }
 
-  function currentCandidate() {
-    if (session.lastRender) return {
-      source: 'last-render' as const,
-      sampleRate: session.lastRender.sampleRate,
-      channels: session.lastRender.channels,
-      url: session.lastRender.url,
-      metrics: session.lastRender.metrics
-    }
+  function scopeCandidate() {
     const sampleRate = engine.ctx?.sampleRate ?? 48000
     return {
       source: 'scope' as const,
@@ -312,12 +377,24 @@ export function createWebMcpTools(
     }
   }
 
+  function currentCandidate() {
+    if (session.lastRender) return {
+      source: 'last-render' as const,
+      sampleRate: session.lastRender.sampleRate,
+      channels: session.lastRender.channels,
+      url: session.lastRender.url,
+      metrics: session.lastRender.metrics
+    }
+    return scopeCandidate()
+  }
+
   return [
     {
       name: 'get_synth_state',
-      description: 'Get compact live synth state. Runtime, modulation routes, and FX order are returned by default; request a filtered parameter page or one LFO shape when needed.',
+      description: 'Get live synth state. Call with `format: "compact"` to see every parameter that differs from its default as `id=formatted` lines — the cheapest way to verify a patch. Runtime, modulation routes, and FX order are returned by default; use group/search/offset for a detailed parameter page, or `lfo` for one LFO shape.',
       inputSchema: {
         type: 'object', properties: {
+          format: { type: 'string', enum: ['full', 'compact'] },
           group: { type: 'string', maxLength: MAX_QUERY_LENGTH },
           search: { type: 'string', maxLength: MAX_QUERY_LENGTH },
           parameterOffset: { type: 'integer', minimum: 0 },
@@ -332,9 +409,10 @@ export function createWebMcpTools(
       annotations: { readOnlyHint: true },
       execute(input) {
         const value = assertObject(input, 'input', [
-          'group', 'search', 'parameterOffset', 'parameterLimit', 'modulationOffset', 'modulationLimit',
+          'format', 'group', 'search', 'parameterOffset', 'parameterLimit', 'modulationOffset', 'modulationLimit',
           'lfo', 'lfoPointOffset', 'lfoPointLimit'
         ])
+        const format = assertFormat(value.format)
         if (value.group !== undefined && typeof value.group !== 'string') throw new Error('group must be a string')
         if (value.search !== undefined && typeof value.search !== 'string') throw new Error('search must be a string')
         const group = value.group as string | undefined
@@ -342,9 +420,9 @@ export function createWebMcpTools(
         if (group && group.length > MAX_QUERY_LENGTH) throw new Error(`group is limited to ${MAX_QUERY_LENGTH} characters`)
         if (search && search.length > MAX_QUERY_LENGTH) throw new Error(`search is limited to ${MAX_QUERY_LENGTH} characters`)
         const offset = boundedInteger(value.parameterOffset, 'parameterOffset', 0, 0, PARAMS.length)
-        const limit = boundedInteger(value.parameterLimit, 'parameterLimit', 5, 1, MAX_PAGE_SIZE)
+        const limit = boundedInteger(value.parameterLimit, 'parameterLimit', format === 'compact' ? COMPACT_PAGE_SIZE : DEFAULT_PAGE_SIZE, 1, format === 'compact' ? COMPACT_PAGE_SIZE : MAX_PAGE_SIZE)
         const matches = filteredParameters(group, search)
-        const includeParameters = group !== undefined || search !== undefined || value.parameterOffset !== undefined || value.parameterLimit !== undefined
+        const includeParameters = format === 'compact' || group !== undefined || search !== undefined || value.parameterOffset !== undefined || value.parameterLimit !== undefined
         const includeModulations = value.modulationOffset !== undefined || value.modulationLimit !== undefined
         const includeLfo = value.lfo !== undefined || value.lfoPointOffset !== undefined || value.lfoPointLimit !== undefined
         if (Number(includeParameters) + Number(includeModulations) + Number(includeLfo) > 1) {
@@ -361,6 +439,10 @@ export function createWebMcpTools(
         const lfoPointLimit = boundedInteger(value.lfoPointLimit, 'lfoPointLimit', 5, 1, MAX_PAGE_SIZE)
         const lfoPointPage = lfoPoints.slice(lfoPointOffset, lfoPointOffset + lfoPointLimit)
         const page = matches.slice(offset, offset + limit)
+        const changed = format !== 'compact' ? [] : matches.flatMap(def => {
+          const normalized = engine.values[paramIndex(def.id)]
+          return Math.abs(normalized - defaultNorm(def)) < 1e-6 ? [] : [`${def.id}=${formatValue(def, normalized)}`]
+        })
         return {
           runtime: runtimeSnapshot(engine),
           patch: {
@@ -371,11 +453,13 @@ export function createWebMcpTools(
               ...(modulationOffset + modulationPage.length < modulations.length ? { nextOffset: modulationOffset + modulationPage.length } : {})
             } } : {}),
             ...(includeParameters ? {
-              parameters: {
-                items: Object.fromEntries(page.map(def => [def.id, parameterValue(def, engine.values[paramIndex(def.id)])])),
-                offset, limit, total: matches.length,
-                ...(offset + page.length < matches.length ? { nextOffset: offset + page.length } : {})
-              }
+              parameters: format === 'compact'
+                ? { items: changed, total: changed.length, format: 'compact' as const }
+                : {
+                  items: Object.fromEntries(page.map(def => [def.id, parameterValue(def, engine.values[paramIndex(def.id)])])),
+                  offset, limit, total: matches.length,
+                  ...(offset + page.length < matches.length ? { nextOffset: offset + page.length } : {})
+                }
             } : {}),
             ...(!includeLfo || lfo === undefined ? {} : {
               lfoShape: {
@@ -392,9 +476,10 @@ export function createWebMcpTools(
     },
     {
       name: 'get_parameter_schema',
-      description: 'Discover parameter units, ranges, defaults, curves, choices, and modulation capabilities.',
+      description: 'Discover parameter units, ranges, defaults, curves, choices, and modulation capabilities. Call once with `format: "compact"` to see every parameter as one line each (`filter1.cutoff Hz 20..20000 exp =8000 mod`); use group/search/offset for detail in the full format.',
       inputSchema: {
         type: 'object', properties: {
+          format: { type: 'string', enum: ['full', 'compact'] },
           group: { type: 'string', maxLength: MAX_QUERY_LENGTH },
           search: { type: 'string', maxLength: MAX_QUERY_LENGTH },
           offset: { type: 'integer', minimum: 0 },
@@ -405,14 +490,15 @@ export function createWebMcpTools(
       },
       annotations: { readOnlyHint: true },
       execute(input) {
-        const value = assertObject(input, 'input', ['group', 'search', 'offset', 'limit', 'sourceOffset', 'sourceLimit'])
+        const value = assertObject(input, 'input', ['format', 'group', 'search', 'offset', 'limit', 'sourceOffset', 'sourceLimit'])
+        const format = assertFormat(value.format)
         if (value.group !== undefined && typeof value.group !== 'string') throw new Error('group must be a string')
         if (value.search !== undefined && typeof value.search !== 'string') throw new Error('search must be a string')
         if ((value.group as string | undefined)?.length && (value.group as string).length > MAX_QUERY_LENGTH) throw new Error(`group is limited to ${MAX_QUERY_LENGTH} characters`)
         if ((value.search as string | undefined)?.length && (value.search as string).length > MAX_QUERY_LENGTH) throw new Error(`search is limited to ${MAX_QUERY_LENGTH} characters`)
         const matches = filteredParameters(value.group as string | undefined, value.search as string | undefined)
         const offset = boundedInteger(value.offset, 'offset', 0, 0, PARAMS.length)
-        const limit = boundedInteger(value.limit, 'limit', 5, 1, MAX_PAGE_SIZE)
+        const limit = boundedInteger(value.limit, 'limit', format === 'compact' ? COMPACT_PAGE_SIZE : DEFAULT_PAGE_SIZE, 1, format === 'compact' ? COMPACT_PAGE_SIZE : MAX_PAGE_SIZE)
         const page = matches.slice(offset, offset + limit)
         const parameters = page.map(def => ({
           id: def.id, name: def.name, group: def.group,
@@ -430,8 +516,10 @@ export function createWebMcpTools(
         const sourceLimit = boundedInteger(value.sourceLimit, 'sourceLimit', 5, 1, MAX_PAGE_SIZE)
         const sources = sourceOffset === undefined ? [] : MOD_SOURCES.slice(sourceOffset, sourceOffset + sourceLimit)
         return {
-          groups: [...new Set(PARAMS.map(def => def.group))],
-          parameters: { items: parameters, offset, limit, total: matches.length, ...(offset + page.length < matches.length ? { nextOffset: offset + page.length } : {}) },
+          groups: [...PARAMETER_GROUPS],
+          parameters: format === 'compact'
+            ? { items: page.map(compactParameter), total: page.length, format: 'compact' as const }
+            : { items: parameters, offset, limit, total: matches.length, ...(offset + page.length < matches.length ? { nextOffset: offset + page.length } : {}) },
           ...(sourceOffset === undefined ? {} : {
             modulationSources: { items: sources.map(source => ({ ...source })), offset: sourceOffset, limit: sourceLimit, total: MOD_SOURCES.length, ...(sourceOffset + sources.length < MOD_SOURCES.length ? { nextOffset: sourceOffset + sources.length } : {}) }
           }),
@@ -448,7 +536,7 @@ export function createWebMcpTools(
     },
     {
       name: 'update_parameters',
-      description: 'Atomically validate and apply a batch of raw-unit parameter values or textual choice labels.',
+      description: 'Atomically validate and apply a batch of raw-unit parameter values or textual choice labels. Example: {"updates":[{"id":"filter1.cutoff","value":1200},{"id":"filter1.type","value":"LP 24"}]}',
       inputSchema: {
         type: 'object',
         properties: {
@@ -474,7 +562,9 @@ export function createWebMcpTools(
           if (typeof update.id !== 'string') throw new Error(`updates[${index}].id must be a string`)
           const id = update.id
           const def = PARAMS.find(candidate => candidate.id === id)
-          if (!def) throw new Error(`Unknown parameter: ${id}`)
+          if (!def) {
+            throw new Error(`Unknown parameter '${id}'.${didYouMean(id, PARAMS.map(candidate => candidate.id))} Groups: ${PARAMETER_GROUPS.join(', ')}`)
+          }
           if (seen.has(id)) throw new Error(`Duplicate parameter ID: ${id}`)
           seen.add(id)
           const raw = canonicalRaw(def, update.value)
@@ -493,7 +583,7 @@ export function createWebMcpTools(
     },
     {
       name: 'set_modulation',
-      description: 'Add, update, remove, or clear validated modulation routes in the shared 32-slot matrix.',
+      description: 'Add, update, remove, or clear validated modulation routes in the shared 32-slot matrix. `depth` is bipolar (-1..1): it is added to the destination parameter\'s normalized 0..1 value and the sum is clamped, so depth 0.5 on a parameter sitting at 0.5 sweeps it up to 1.0. Example: {"action":"add","source":"lfo1","destination":"filter1.cutoff","depth":0.4}',
       inputSchema: {
         type: 'object',
         properties: {
@@ -541,10 +631,16 @@ export function createWebMcpTools(
         assertObject(input, 'input', ['action', 'source', 'destination', 'depth', 'enabled'], ['action', 'source', 'destination', 'depth'])
         if (typeof value.source !== 'string') throw new Error('source must be a string')
         let source: number
-        try { source = modSourceIndex(value.source) } catch { throw new Error(`Unknown modulation source: ${value.source}`) }
+        const sourceIds = MOD_SOURCES.map(candidate => candidate.id)
+        try { source = modSourceIndex(value.source) } catch {
+          throw new Error(`Unknown modulation source '${value.source}'.${didYouMean(value.source, sourceIds)} Valid: ${sourceIds.join(', ')}`)
+        }
         if (typeof value.destination !== 'string') throw new Error('destination must be a string')
         const def = PARAMS.find(candidate => candidate.id === value.destination)
-        if (!def) throw new Error(`Unknown modulation destination: ${value.destination}`)
+        if (!def) {
+          const moddable = PARAMS.filter(candidate => candidate.moddable).map(candidate => candidate.id)
+          throw new Error(`Unknown modulation destination '${value.destination}'.${didYouMean(value.destination, moddable)} Destinations are moddable parameter ids; groups: ${PARAMETER_GROUPS.join(', ')}`)
+        }
         if (!def.moddable) throw new Error(`Destination is not moddable: ${def.id}`)
         const depth = finite(value.depth, 'depth')
         if (depth < -1 || depth > 1) throw new Error('depth must be in range -1..1')
@@ -567,7 +663,7 @@ export function createWebMcpTools(
     },
     {
       name: 'play_notes',
-      description: 'Play a bounded sequence of MIDI notes with relative real-time start and duration values. Requires runtime.running=true; otherwise click CLICK TO START AUDIO first.',
+      description: 'Play a bounded sequence of MIDI notes with relative real-time start and duration values, in seconds. A repeated pitch retriggers its voice. Example: {"notes":[{"midi":60,"velocity":0.8,"start":0,"duration":0.5}]}. Requires runtime.running=true; otherwise click CLICK TO START AUDIO first.',
       inputSchema: {
         type: 'object', properties: { notes: { type: 'array', minItems: 1, maxItems: MAX_NOTES, items: noteSchema } },
         required: ['notes'], additionalProperties: false
@@ -594,7 +690,7 @@ export function createWebMcpTools(
     },
     {
       name: 'render_audio',
-      description: 'Record the live AudioWorklet output in real time while playing a bounded note sequence; this is not offline or deterministic. Requires runtime.running=true; otherwise click CLICK TO START AUDIO first.',
+      description: 'Record the live AudioWorklet output in real time while playing a bounded note sequence, and return audio metrics for it; this is not offline or deterministic. `peakDb` is an instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels. Requires runtime.running=true; otherwise click CLICK TO START AUDIO first.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -656,17 +752,28 @@ export function createWebMcpTools(
     },
     {
       name: 'analyze_audio',
-      description: 'Analyze the most recent real-time render, or explicitly fall back to the current live scope buffers.',
-      inputSchema: emptySchema,
+      description: 'Re-analyze the last `render_audio` result, or analyze the live output right now (`source: "scope"`) — useful while a human is playing. `render_audio` already returns the same metrics, so call this only when you need a fresh look without re-rendering. `peakDb` is an instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels.',
+      inputSchema: {
+        type: 'object',
+        properties: { source: { type: 'string', enum: ['scope', 'last-render'] } },
+        additionalProperties: false
+      },
       annotations: { readOnlyHint: true },
       execute(input) {
-        assertObject(input, 'input', [])
+        const value = assertObject(input, 'input', ['source'])
+        if (value.source !== undefined && value.source !== 'scope' && value.source !== 'last-render') {
+          throw new Error("source must be 'scope' or 'last-render'")
+        }
+        if (value.source === 'scope') return scopeCandidate()
+        if (value.source === 'last-render' && !session.lastRender) {
+          throw new Error('No render is available yet. Call render_audio first, or pass source: "scope" to analyze the live output')
+        }
         return currentCandidate()
       }
     },
     {
       name: 'analyze_reference_audio',
-      description: 'Decode a short Base64 audio reference in memory and analyze it with the same metrics as synth output.',
+      description: 'Step 1 of matching a target sound: send the target as Base64 audio, which is decoded in memory and analyzed with the same metrics as synth output. Then render your patch and call compare_audio (step 2).',
       inputSchema: {
         type: 'object',
         properties: {
@@ -720,7 +827,7 @@ export function createWebMcpTools(
     },
     {
       name: 'compare_audio',
-      description: 'Compare the latest Base64 reference analysis with the same synth candidate selected by analyze_audio.',
+      description: 'Step 2 of matching a target sound: compare the latest reference from analyze_reference_audio with the latest render (or the live scope when nothing has been rendered — the same candidate analyze_audio would return), and report per-metric and overall similarity.',
       inputSchema: emptySchema,
       annotations: { readOnlyHint: true },
       execute(input, options) {
@@ -771,6 +878,20 @@ export function createWebMcpTools(
         const validated = validatePresetData(preset)
         engine.loadPreset(validated, 'ai')
         return { name, loaded: true }
+      }
+    },
+    {
+      name: 'list_presets',
+      description: 'List the user presets saved to localStorage, newest storage order first, so you can see what save_preset and the human have stored. Factory presets from the UI dropdown are not included.',
+      inputSchema: emptySchema,
+      annotations: { readOnlyHint: true },
+      execute(input) {
+        assertObject(input, 'input', [])
+        const presets = listPresets().map(preset => {
+          const savedAt = (preset as { savedAt?: unknown }).savedAt
+          return { name: preset.name, ...(typeof savedAt === 'number' ? { savedAt } : {}) }
+        })
+        return { presets, total: presets.length }
       }
     }
   ]
