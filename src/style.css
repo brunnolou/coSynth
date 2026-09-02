@@ -815,6 +815,10 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   cursor: pointer;
 }
 .key.black.held { background: var(--accent); }
+/* Keys the computer keyboard (Z / X octave window) cannot reach sit back visually. */
+.key.white.out-of-range { opacity: 0.55; filter: saturate(0.6) brightness(0.82); }
+.key.black.out-of-range { background: linear-gradient(#43464f, #2e313a); border-color: #23262d; }
+.key.out-of-range.held { opacity: 1; filter: none; background: var(--accent); }
 
 /* ------------------------------------------------ start overlay */
 #start-overlay {
