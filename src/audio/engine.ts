@@ -158,6 +158,8 @@ export class SynthEngine {
   private readonly fxOrderListeners = new Set<() => void>()
   private readonly soundListeners = new Set<(change: SoundChange) => void>()
   private batchDepth = 0
+  private startedOnce = false
+  private disposedOnce = false
   private noiseSample: SoundSnapshot['noiseSample'] = null
   private readonly tableCache = new Map<string, Wavetable>()
   private readonly customTables: (Wavetable | null)[] = [null, null, null]
@@ -190,6 +192,20 @@ export class SynthEngine {
   /** The worklet graph exists, in either mode. */
   get started(): boolean {
     return this.node !== null
+  }
+
+  /**
+   * The worklet graph was built at some point, whether or not it still exists.
+   * `started` goes back to false on `dispose()`; this does not, so a caller can
+   * still tell a render that ran from one that never got off the ground.
+   */
+  get everStarted(): boolean {
+    return this.startedOnce
+  }
+
+  /** `dispose()` has run: the graph is released and nothing more is posted. */
+  get disposed(): boolean {
+    return this.disposedOnce
   }
 
   /**
@@ -229,8 +245,47 @@ export class SynthEngine {
     node.connect(ctx.destination)
     this.ctx = ctx
     this.node = node
+    this.startedOnce = true
     if (!this.offlineMode) await (ctx as AudioContext).resume()
     this.syncAll()
+  }
+
+  /**
+   * Release the worklet graph. The engine goes back to being unstarted, and a
+   * disposed offline engine posts nothing further.
+   *
+   * For the scratch engine behind each offline render this is the only release
+   * available: `OfflineAudioContext` has **no** `close()` in Chromium
+   * (`typeof OfflineAudioContext.prototype.close === 'undefined'` — measured,
+   * not assumed), so a finished render context cannot be shut down on demand
+   * and can only be dropped and left to the collector. Disconnecting the node,
+   * clearing its handler and closing its port removes this object as a reason
+   * to keep any of it alive; it does not make the release deterministic,
+   * because the platform offers no way to.
+   *
+   * A live context does have `close()`, and gets it: there the release really
+   * is deterministic and it frees the audio device.
+   *
+   * Idempotent, and safe on an engine that was never started.
+   */
+  dispose(): void {
+    this.disposedOnce = true
+    const node = this.node
+    const ctx = this.ctx
+    this.node = null
+    this.ctx = null
+    if (node) {
+      // Every step is optional: a node may already be detached with its
+      // context, and a test double's port is only as complete as that test
+      // needs. Releasing what exists must never throw over what does not.
+      const port = node.port as Partial<MessagePort> | undefined
+      if (port) port.onmessage = null
+      try { node.disconnect() } catch { /* already detached with its context */ }
+      if (typeof port?.close === 'function') port.close()
+    }
+    const closable = ctx as (BaseAudioContext & { close?: () => Promise<void> }) | null
+    // Offline contexts have no `close()`; see this method's doc comment.
+    if (closable && typeof closable.close === 'function') void closable.close().catch(() => {})
   }
 
   private post(msg: ToWorklet, transfer?: Transferable[]): void {

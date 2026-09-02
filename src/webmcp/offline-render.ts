@@ -312,127 +312,138 @@ async function renderOnce(
     startRendering: () => Promise<AudioBuffer>
   }
 
-  // One scratch engine per render: `start()` is idempotent and an
-  // OfflineAudioContext is single-use, so this object is discarded afterwards.
+  // One scratch engine per render: an OfflineAudioContext is single-use, so it
+  // cannot be reused and this object is disposed afterwards. What survives
+  // between renders is the worklet module source, cached in memory by
+  // `src/shared/cached-script-url.ts` — the expensive part, and the only part
+  // that is safe to share, since a cached script carries no per-render state.
   const scratch = options.createEngine ? options.createEngine(ctx) : new SynthEngine({ context: ctx })
-  // `start()` awaits `audioWorklet.addModule()`, which is the one slow step
-  // before rendering. A cancel arriving inside that await must stop here, ahead
-  // of any suspension being scheduled or any note event being applied, rather
-  // than being left to the race further down.
-  await scratch.start()
-  if (signal?.aborted) throw abortError()
-  // A snapshot, not a preset: a preset carries only parameters, modulation, LFO
-  // shapes and FX order, so a round-trip through one silently swaps an imported
-  // Custom wavetable for a built-in and drops the imported noise sample
-  // entirely — the render would then measure a different sound than the one the
-  // human hears. `captureSoundState()` includes both PCM assets and
-  // `restoreSoundState()` re-posts them via `syncAll()`. Its other side effects
-  // (`notifyPatch`, `allNotesOff`, param/matrix/FX-order listeners, the
-  // enclosing `batchSoundChange` notification) are no-ops on a scratch engine:
-  // it holds no notes and has no listeners registered.
-  scratch.restoreSoundState(engine.captureSoundState())
-
-  // A context without `suspend` cannot place an event in time at all: every
-  // note would be struck and released before rendering starts, returning
-  // silence that looks like a successful render. `offlineRenderAvailable()`
-  // screens for this; refusing here keeps a caller that skipped it honest.
-  if (typeof suspendable.suspend !== 'function') {
-    throw new Error('Offline rendering is unavailable here: this OfflineAudioContext has no suspend()')
-  }
-
-  const syncTimeout = options.syncTimeoutMs ?? SYNC_TIMEOUT_MS
-  // Never longer than the pre-render budget: a caller that asked for a short
-  // barrier means it everywhere, and a test that shortens one wants both.
-  const midRenderSyncTimeout = options.midRenderSyncTimeoutMs
-    ?? Math.min(syncTimeout, MID_RENDER_SYNC_TIMEOUT_MS)
-  // Set false by any barrier that went unacknowledged; see the silence guard at
-  // the end of this function.
-  let synced = true
-  const player = new OfflineNotes(scratch)
-  const events = noteEvents(notes, duration, sampleRate)
-  const immediate = events.filter(event => event.frame === 0)
-  const scheduled = events.filter(event => event.frame > 0)
-  for (const event of immediate) player.apply(event)
-
-  // Register every suspension before rendering starts; one suspension per
-  // quantum boundary, because a second suspend at the same frame is rejected.
-  const pending: Promise<void>[] = []
-  const byFrame = new Map<number, NoteEvent[]>()
-  for (const event of scheduled) {
-    const bucket = byFrame.get(event.frame)
-    if (bucket) bucket.push(event)
-    else byFrame.set(event.frame, [event])
-  }
-  for (const [frame, bucket] of [...byFrame.entries()].sort((a, b) => a[0] - b[0])) {
-    pending.push(suspendable.suspend(frame / sampleRate).then(async () => {
-      try {
-        // Once cancelled, stop scheduling: no further note events are applied,
-        // so an abandoned render cannot keep mutating the scratch engine.
-        if (!signal?.aborted) {
-          for (const event of bucket) player.apply(event)
-          // Held suspended until the processor confirms it has these events, for
-          // the same reason as the barrier before `startRendering()`: resuming
-          // first would let the render outrun them and place the event late by
-          // however many quanta the queue took to drain. On its own budget,
-          // because this barrier only improves placement: see
-          // `MID_RENDER_SYNC_TIMEOUT_MS`.
-          //
-          // An abort here resolves the wait instead of rejecting it: this
-          // callback belongs to a render nobody is waiting for any more, and
-          // the one thing it still owes that render is the `resume()` below.
-          const acknowledged = await awaitSync(scratch, midRenderSyncTimeout, signal).catch(() => false)
-          if (!acknowledged) synced = false
-        }
-      } finally {
-        // Deliberately not awaited: resuming is what lets rendering continue.
-        // Still resumed after an abort, so the orphaned render below can finish
-        // and be collected instead of sitting suspended forever.
-        void suspendable.resume?.()
-      }
-    }))
-  }
-
-  // The barrier that closes the race this whole render turns on: everything
-  // above — the patch, the modulation, the wavetables, the frame-0 note-ons —
-  // reached the processor as port messages, and `startRendering()` does not
-  // wait for them. See `SynthEngine.awaitWorkletSync`.
-  // Cancellable: a `stop_performance` arriving while this barrier is open must
-  // not have to wait out the acknowledgement, or the whole timeout, first.
-  if (!await awaitSync(scratch, syncTimeout, signal)) synced = false
-  if (signal?.aborted) throw abortError()
-
-  // The Web Audio API offers no way to cancel an in-flight `startRendering()`.
-  // Racing it against the signal is therefore about the CALLER, not the CPU:
-  // `stop_performance` and a cancelled invocation return promptly instead of
-  // waiting out the render, while the orphaned render still runs to completion
-  // on its own and is then collected, with nothing consuming its buffer.
-  const abort = signal ? abortRejection(signal) : null
-  let buffer: AudioBuffer
+  // The scratch engine is disposed however this ends, including the abort
+  // path: an abandoned render is exactly the case where the graph would
+  // otherwise be left attached with nobody to drop it. See
+  // `SynthEngine.dispose` for what this can and cannot release.
   try {
-    buffer = abort
-      ? await Promise.race([suspendable.startRendering(), abort.promise])
-      : await suspendable.startRendering()
-  } finally {
-    abort?.dispose()
-  }
-  await Promise.allSettled(pending)
+    // `start()` awaits `audioWorklet.addModule()`, which is the one slow step
+    // before rendering. A cancel arriving inside that await must stop here, ahead
+    // of any suspension being scheduled or any note event being applied, rather
+    // than being left to the race further down.
+    await scratch.start()
+    if (signal?.aborted) throw abortError()
+    // A snapshot, not a preset: a preset carries only parameters, modulation, LFO
+    // shapes and FX order, so a round-trip through one silently swaps an imported
+    // Custom wavetable for a built-in and drops the imported noise sample
+    // entirely — the render would then measure a different sound than the one the
+    // human hears. `captureSoundState()` includes both PCM assets and
+    // `restoreSoundState()` re-posts them via `syncAll()`. Its other side effects
+    // (`notifyPatch`, `allNotesOff`, param/matrix/FX-order listeners, the
+    // enclosing `batchSoundChange` notification) are no-ops on a scratch engine:
+    // it holds no notes and has no listeners registered.
+    scratch.restoreSoundState(engine.captureSoundState())
 
-  const channelData: Float32Array[] = []
-  const channels = Math.max(1, buffer.numberOfChannels ?? 1)
-  for (let channel = 0; channel < channels; channel++) {
-    channelData.push(Float32Array.from(buffer.getChannelData(channel)))
-  }
-  const renderedRate = buffer.sampleRate ?? sampleRate
-  const wav = encodeWav(channelData, renderedRate)
-  return {
-    recording: {
-      blob: new Blob([wav], { type: 'audio/wav' }),
-      mimeType: 'audio/wav',
-      duration: (buffer.length ?? channelData[0]?.length ?? 0) / renderedRate,
-      sampleRate: renderedRate,
-      channelData
-    },
-    suspect: !synced && events.length > 0 && isSilent(channelData)
+    // A context without `suspend` cannot place an event in time at all: every
+    // note would be struck and released before rendering starts, returning
+    // silence that looks like a successful render. `offlineRenderAvailable()`
+    // screens for this; refusing here keeps a caller that skipped it honest.
+    if (typeof suspendable.suspend !== 'function') {
+      throw new Error('Offline rendering is unavailable here: this OfflineAudioContext has no suspend()')
+    }
+
+    const syncTimeout = options.syncTimeoutMs ?? SYNC_TIMEOUT_MS
+    // Never longer than the pre-render budget: a caller that asked for a short
+    // barrier means it everywhere, and a test that shortens one wants both.
+    const midRenderSyncTimeout = options.midRenderSyncTimeoutMs
+      ?? Math.min(syncTimeout, MID_RENDER_SYNC_TIMEOUT_MS)
+    // Set false by any barrier that went unacknowledged; see the silence guard at
+    // the end of this function.
+    let synced = true
+    const player = new OfflineNotes(scratch)
+    const events = noteEvents(notes, duration, sampleRate)
+    const immediate = events.filter(event => event.frame === 0)
+    const scheduled = events.filter(event => event.frame > 0)
+    for (const event of immediate) player.apply(event)
+
+    // Register every suspension before rendering starts; one suspension per
+    // quantum boundary, because a second suspend at the same frame is rejected.
+    const pending: Promise<void>[] = []
+    const byFrame = new Map<number, NoteEvent[]>()
+    for (const event of scheduled) {
+      const bucket = byFrame.get(event.frame)
+      if (bucket) bucket.push(event)
+      else byFrame.set(event.frame, [event])
+    }
+    for (const [frame, bucket] of [...byFrame.entries()].sort((a, b) => a[0] - b[0])) {
+      pending.push(suspendable.suspend(frame / sampleRate).then(async () => {
+        try {
+          // Once cancelled, stop scheduling: no further note events are applied,
+          // so an abandoned render cannot keep mutating the scratch engine.
+          if (!signal?.aborted) {
+            for (const event of bucket) player.apply(event)
+            // Held suspended until the processor confirms it has these events, for
+            // the same reason as the barrier before `startRendering()`: resuming
+            // first would let the render outrun them and place the event late by
+            // however many quanta the queue took to drain. On its own budget,
+            // because this barrier only improves placement: see
+            // `MID_RENDER_SYNC_TIMEOUT_MS`.
+            //
+            // An abort here resolves the wait instead of rejecting it: this
+            // callback belongs to a render nobody is waiting for any more, and
+            // the one thing it still owes that render is the `resume()` below.
+            const acknowledged = await awaitSync(scratch, midRenderSyncTimeout, signal).catch(() => false)
+            if (!acknowledged) synced = false
+          }
+        } finally {
+          // Deliberately not awaited: resuming is what lets rendering continue.
+          // Still resumed after an abort, so the orphaned render below can finish
+          // and be collected instead of sitting suspended forever.
+          void suspendable.resume?.()
+        }
+      }))
+    }
+
+    // The barrier that closes the race this whole render turns on: everything
+    // above — the patch, the modulation, the wavetables, the frame-0 note-ons —
+    // reached the processor as port messages, and `startRendering()` does not
+    // wait for them. See `SynthEngine.awaitWorkletSync`.
+    // Cancellable: a `stop_performance` arriving while this barrier is open must
+    // not have to wait out the acknowledgement, or the whole timeout, first.
+    if (!await awaitSync(scratch, syncTimeout, signal)) synced = false
+    if (signal?.aborted) throw abortError()
+
+    // The Web Audio API offers no way to cancel an in-flight `startRendering()`.
+    // Racing it against the signal is therefore about the CALLER, not the CPU:
+    // `stop_performance` and a cancelled invocation return promptly instead of
+    // waiting out the render, while the orphaned render still runs to completion
+    // on its own and is then collected, with nothing consuming its buffer.
+    const abort = signal ? abortRejection(signal) : null
+    let buffer: AudioBuffer
+    try {
+      buffer = abort
+        ? await Promise.race([suspendable.startRendering(), abort.promise])
+        : await suspendable.startRendering()
+    } finally {
+      abort?.dispose()
+    }
+    await Promise.allSettled(pending)
+
+    const channelData: Float32Array[] = []
+    const channels = Math.max(1, buffer.numberOfChannels ?? 1)
+    for (let channel = 0; channel < channels; channel++) {
+      channelData.push(Float32Array.from(buffer.getChannelData(channel)))
+    }
+    const renderedRate = buffer.sampleRate ?? sampleRate
+    const wav = encodeWav(channelData, renderedRate)
+    return {
+      recording: {
+        blob: new Blob([wav], { type: 'audio/wav' }),
+        mimeType: 'audio/wav',
+        duration: (buffer.length ?? channelData[0]?.length ?? 0) / renderedRate,
+        sampleRate: renderedRate,
+        channelData
+      },
+      suspect: !synced && events.length > 0 && isSilent(channelData)
+    }
+  } finally {
+    scratch.dispose()
   }
 }
 
