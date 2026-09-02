@@ -42,6 +42,32 @@ describe('teaching tool descriptors', () => {
     expect(schemaOf('get_ui_targets').required).toBeUndefined()
   })
 
+  it('leads with the occasion for teaching rather than the mechanism', () => {
+    const { leadOf } = setup()
+    // A human asking how to do something themselves.
+    expect(leadOf('get_ui_targets')).toMatch(/asks?|asking/i)
+    expect(leadOf('get_ui_targets')).toMatch(/themsel(f|ves)|their own/i)
+    // Showing beats doing, and beats describing in words.
+    expect(leadOf('show_ui_guide')).toMatch(/instead of|rather than/i)
+    expect(leadOf('show_ui_guide')).toMatch(/words|describing/i)
+  })
+
+  it('keeps both descriptors inside the per-tool listing budget', () => {
+    const { descriptionOf, leadOf, byName } = setup()
+    for (const name of ['get_ui_targets', 'show_ui_guide']) {
+      // Same ceilings the twelve core tools are held to in tools.test.ts.
+      expect(bytes(descriptionOf(name)), `${name} description`).toBeLessThanOrEqual(600)
+      expect(bytes(leadOf(name)), `${name} lead sentence`).toBeLessThanOrEqual(200)
+    }
+    // These two tools were 1710 B of listing before compact mode; naming the
+    // occasion and documenting `format` on the property itself costs ~800 B,
+    // most of it schema rather than the prose a truncating client renders
+    // first. That is the whole allowance - the next addition has to trade.
+    const listing = [...byName.values()].map(tool =>
+      ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema }))
+    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(2600)
+  })
+
   it('passes the format through to the controller unchanged', async () => {
     const { guide, byName } = setup()
     const input = { format: 'compact' }

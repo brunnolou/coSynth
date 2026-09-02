@@ -17,7 +17,7 @@ export function createGuideTools(guide: GuideService, lifecycle: AbortSignal): W
   }
   return [{
     name: 'get_ui_targets',
-    description: 'Discover currently mounted teaching targets by semantic ID, label, type, and visibility. Search for panels, tabs, parameters, sources, and buttons. Use a returned ID with show_ui_guide, or provide a precise CSS selector scoped to the app and its overlays.',
+    description: 'Step 1 of teaching, for when someone asks how to do something themselves: find the control to point at instead of changing it for them. Returns the mounted panels, tabs, parameters, sources, and buttons by semantic ID, label, type, and visibility. Pass a returned ID to show_ui_guide, or give that tool a precise CSS selector scoped to the app and its overlays.',
     inputSchema: {
       type: 'object', additionalProperties: false,
       properties: {
@@ -31,7 +31,7 @@ export function createGuideTools(guide: GuideService, lifecycle: AbortSignal): W
     execute(input, options) { check(options); return guide.listTargets(input) }
   }, {
     name: 'show_ui_guide',
-    description: 'Teach using interactive highlights and safe CommonMark instructions. Supply up to 20 sequential steps, each with at most ONE target: a semantic ID or a unique visible CSS selector. For actions involving two elements, create two linked steps and briefly describe the upcoming target. Omit target for text only; omit title/markdown for highlight only. Returns immediately; the human uses Next/Previous/Done/Close. Never changes sound or activates tabs. Replaces the active guide; steps: [] clears it. Missing targets display instructions with a warning.',
+    description: 'Step 2 of teaching: when someone asks how to do something themselves, highlight the real controls on their own screen instead of changing the patch for them or describing it in words. Up to 20 sequential steps of interactive highlights and safe CommonMark. Returns immediately; the human then uses Next/Previous/Done/Close. Never changes sound or activates tabs. Replaces the active guide; `steps: []` clears it.',
     inputSchema: {
       type: 'object', required: ['steps'], additionalProperties: false,
       properties: { steps: {
