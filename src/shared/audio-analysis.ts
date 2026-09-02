@@ -11,7 +11,11 @@ export interface AudioMetrics {
   stereoWidth: number
   /** Time of the global envelope peak. The old `attackMs` measured the rise to this point. */
   timeToPeakMs: number
-  /** -60 dB decay time extrapolated from the -5…-25 dB slope; null when the buffer never falls 20 dB. */
+  /**
+   * -60 dB decay time extrapolated from the -5…-25 dB slope of the energy decay curve.
+   * `null` whenever the buffer holds no decay that slope describes - a steady tone, a
+   * beating unison, a tremolo - rather than a number invented from the buffer's last cycle.
+   */
   decayT60Ms: number | null
   /** Envelope level at 80% of the buffer, relative to the peak. */
   sustainDb: number
@@ -282,6 +286,17 @@ const ATTACK_SLOPE_FRACTION = 0.25
  * short attacks sharp and long ones measurable.
  */
 const ATTACK_SPAN_FRACTION = 0.25
+/** The dB span of the decay curve the T60 line is fitted through, and its midpoint. */
+const DECAY_FIT_START_DB = -5
+const DECAY_FIT_MID_DB = -15
+const DECAY_FIT_END_DB = -25
+/**
+ * How far the two halves of the fit span may differ in duration. An exponential decay
+ * spends equal time in each 10 dB; a signal that only falls because the buffer ran out
+ * crams the second half into a fraction of the first, which is how a steady tone is told
+ * from a decaying one.
+ */
+const DECAY_CURVATURE_LIMIT = 4
 /** Envelope windows quieter than this are excluded from the gated loudness figure. */
 const LOUDNESS_GATE = 10 ** (-60 / 20)
 const ENVELOPE_FLOOR_DB = -100
@@ -385,40 +400,69 @@ function crossingIndex(values: Float32Array, target: number): number {
   return -1
 }
 
-/** Least-squares dB slope over the -5…-25 dB span below the first local maximum, read out at -60 dB. */
+/**
+ * -60 dB decay time read off the Schroeder energy decay curve, or `null` when the buffer
+ * holds no decay this line describes.
+ *
+ * The curve is the backward-integrated energy of the envelope from the first local
+ * maximum, so it is monotone by construction. Reading the raw envelope instead let a
+ * single amplitude null end the fit: two steady sines a hertz apart reported a 632 ms
+ * decay, a 2.5 Hz tremolo reported 106 ms, and a detuned-unison pluck read less than half
+ * its true T60 - the same beating that motivated Task 6, resurfacing in a new field.
+ *
+ * Monotonicity alone is not enough: the decay curve of a *steady* tone still falls away
+ * near the end of the buffer, simply because there is no energy left after it. That fall
+ * accelerates - it is `10·log10(1 - t/T)` - so its second 10 dB pass ten to twenty times
+ * faster than its first, while a real exponential decay spends equal time in each. Fits
+ * that curved are reported as no decay rather than as a decay that is not there.
+ */
 function measureDecayT60Ms(envelope: Envelope, startIndex: number, level: number): number | null {
   if (!(level > 0)) return null
   const { values, hopMs } = envelope
-  const relativeDb = (value: number) => value > 0 ? 20 * Math.log10(value / level) : -160
-  let spanStart = -1
-  let spanEnd = -1
-  for (let index = startIndex; index < values.length; index++) {
-    const db = relativeDb(values[index])
-    if (spanStart < 0 && db <= -5) spanStart = index
-    if (db <= -25) {
-      spanEnd = index
-      break
-    }
+  const count = values.length - startIndex
+  if (count < 2) return null
+  const curve = new Float64Array(count)
+  let energy = 0
+  for (let index = count - 1; index >= 0; index--) {
+    const value = values[startIndex + index]
+    energy += value * value
+    curve[index] = energy
   }
-  if (spanStart < 0 || spanEnd < 0) return null
+  const reference = curve[0]
+  if (!(reference > 0)) return null
 
-  let count = 0
+  const decayDb = (index: number) => curve[index] > 0 ? 10 * Math.log10(curve[index] / reference) : -160
+  const crossing = (target: number) => {
+    for (let index = 0; index < count; index++) if (decayDb(index) <= target) return index
+    return -1
+  }
+  const spanStart = crossing(DECAY_FIT_START_DB)
+  const spanMid = crossing(DECAY_FIT_MID_DB)
+  const spanEnd = crossing(DECAY_FIT_END_DB)
+  if (spanStart < 0 || spanEnd < 0) return null
+  const firstHalf = spanMid - spanStart
+  const secondHalf = spanEnd - spanMid
+  // Under one hop per 10 dB the decay is faster than the envelope can resolve.
+  if (firstHalf < 1 || secondHalf < 1) return null
+  if (Math.max(firstHalf / secondHalf, secondHalf / firstHalf) > DECAY_CURVATURE_LIMIT) return null
+
+  let points = 0
   let sumX = 0
   let sumY = 0
   let sumXY = 0
   let sumXX = 0
   for (let index = spanStart; index <= spanEnd; index++) {
     const x = (index - spanStart) * hopMs
-    const y = relativeDb(values[index])
-    count++
+    const y = decayDb(index)
+    points++
     sumX += x
     sumY += y
     sumXY += x * y
     sumXX += x * x
   }
-  const denominator = count * sumXX - sumX * sumX
+  const denominator = points * sumXX - sumX * sumX
   if (denominator <= 0) return null
-  const slope = (count * sumXY - sumX * sumY) / denominator
+  const slope = (points * sumXY - sumX * sumY) / denominator
   if (!Number.isFinite(slope) || slope >= 0) return null
   const t60 = -60 / slope
   return Number.isFinite(t60) && t60 > 0 ? t60 : null

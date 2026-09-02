@@ -226,6 +226,39 @@ describe('analyzeAudio', () => {
     expect(analyzeAudio([sine(440, sampleRate, 0.5, 0.5)], sampleRate).decayT60Ms).toBeNull()
   })
 
+  it('reports no T60 for signals that never decay but do pass through nulls', () => {
+    const sampleRate = 48000
+    // Every one of these is steady. Taking the first envelope hop past each threshold made
+    // a single amplitude null end the fit, so all three reported a decay that is not there.
+    const steadyBeat = Float32Array.from({ length: sampleRate * 3 }, (_, i) => {
+      const t = i / sampleRate
+      return 0.4 * (Math.sin(2 * Math.PI * 440 * t) + Math.sin(2 * Math.PI * 441 * t))
+    })
+    expect(analyzeAudio([steadyBeat], sampleRate).decayT60Ms).toBeNull()
+
+    const tremolo = Float32Array.from({ length: sampleRate * 3 }, (_, i) => {
+      const t = i / sampleRate
+      return 0.5 * (0.5 + 0.5 * Math.cos(2 * Math.PI * 2.5 * t)) * Math.sin(2 * Math.PI * 440 * t)
+    })
+    expect(analyzeAudio([tremolo], sampleRate).decayT60Ms).toBeNull()
+  })
+
+  it('measures the true T60 of a detuned-unison pluck through its beat nulls', () => {
+    const sampleRate = 48000
+    const decay = Math.log(1000) / 2
+    const signal = Float32Array.from({ length: sampleRate * 3 }, (_, i) => {
+      const t = i / sampleRate
+      const envelope = Math.min(1, t / 0.005) * Math.exp(-decay * t)
+      return 0.4 * envelope * (Math.sin(2 * Math.PI * 440 * t) + Math.sin(2 * Math.PI * 441.8 * t))
+    })
+    // The nulls halved this to 894 ms. The 1.8 Hz beat still biases the fit, because its
+    // period is a large fraction of the -5…-25 dB span, so the tolerance is wide.
+    const { decayT60Ms } = analyzeAudio([signal], sampleRate)
+    expect(decayT60Ms).not.toBeNull()
+    expect(decayT60Ms as number).toBeGreaterThan(1600)
+    expect(decayT60Ms as number).toBeLessThan(2600)
+  })
+
   it('reports strictly increasing gated loudness for the same tone at rising amplitudes', () => {
     const sampleRate = 8000
     const loudness = [0.25, 0.5, 1].map(amplitude => {
