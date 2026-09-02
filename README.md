@@ -177,7 +177,7 @@ The `/localhost_5173` path slug is hardcoded to the dev port. Serving the dev se
 
 `scripts/agent-ux-probe.mjs` keeps one live page open behind a small HTTP API so an evaluating agent can drive the tools one call at a time while session state persists. It exposes only what a real WebMCP client sees - each tool's `name`, `description`, `inputSchema` and `annotations` - and logs every call with its outcome and wall-clock cost, so "how many round trips did that cost" is measured rather than recalled. `GET /tools`, `POST /call`, `POST /start` (the human gesture), `GET /log`, `POST /reset`.
 
-It exists because the useful question is how the surface reads to an agent that has never seen the source, so an evaluating session must be given the descriptors and nothing else. Point it at a preview server, hand a fresh agent the task, and compare its `GET /log` summary against the field evidence above: calls to full discovery, calls before the first successful `update_parameters`, wall clock for a velocity sweep, and whether `attackMs` stays under 10 ms with a 7-cent detune.
+It exists because the useful question is how the surface reads to an agent that has never seen the source, so an evaluating session must be given the descriptors and nothing else. The method, the prompt and the results of every run so far live in [`docs/agent-ux-eval.md`](docs/agent-ux-eval.md) and [`docs/agent-ux-eval-prompt.md`](docs/agent-ux-eval-prompt.md) — re-run it after changing the tools, with at least two different models, since independent convergence is what separates an API fault from model variance.
 
 coSynth accepts both the current standards callback shape,
 `execute(input, { signal })`, and experimental clients that omit the execution
