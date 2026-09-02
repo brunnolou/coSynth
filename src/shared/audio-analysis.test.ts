@@ -804,7 +804,7 @@ describe('compareAudioMetrics', () => {
     expect(compareAudioMetrics(referenceMetrics, referenceMetrics).details.envelope.similarity).toBe(1)
   })
 
-  it('scores bandsDb by mean absolute dB difference on a 6 dB scale', () => {
+  it('scores bandsDb by per-band capped dB difference read linearly against the 20 dB cap', () => {
     const identical = compareAudioMetrics(referenceMetrics, { ...referenceMetrics })
     expect(identical.details.bands.similarity).toBe(1)
     expect(identical.details.bands.delta).toBe(0)
@@ -815,11 +815,53 @@ describe('compareAudioMetrics', () => {
     }
     const shifted = compareAudioMetrics(referenceMetrics, tilted).details.bands
     expect(shifted.delta).toBeCloseTo(-6, 5)
-    // A flat 6 dB offset is exactly one scale unit away.
-    expect(shifted.similarity).toBeCloseTo(Math.exp(-1), 5)
+    // A flat 6 dB offset is 6/20 of the way to "these bands share nothing".
+    expect(shifted.similarity).toBeCloseTo(0.7, 5)
 
+    // Six bands past the cap, four inside it: 0.2. Well under the 0.822 a one-parameter
+    // change scores below, which is the separation that matters, not the absolute figure.
     const brighter = { ...referenceMetrics, bandsDb: [-60, -50, -40, -30, -20, -10, -6, -6, -8, -12] }
-    expect(compareAudioMetrics(referenceMetrics, brighter).details.bands.similarity).toBeLessThan(0.1)
+    expect(compareAudioMetrics(referenceMetrics, brighter).details.bands.similarity).toBeCloseTo(0.2, 5)
+  })
+
+  /**
+   * Band vectors measured by `analyzeAudio`, not invented: the reference row is
+   * `docs/agent-match-eval-reference.wav`, the candidate rows are C4 patches - a plain
+   * sawtooth, the same sawtooth after one round of parameter edits, and a sine, which is as
+   * spectrally unlike the recording as a single note gets.
+   */
+  const WAV_REFERENCE_BANDS = [-4.4, -19.7, -16, -12, -9.2, -7.4, -8, -13.7, -17.8, -23.2]
+  const SAW_C4_BANDS = [-79, -72, -59, -2, -8, -9, -13, -18, -25, -100]
+  const SAW_C4_EDITED_BANDS = [-75, -69, -56, -1, -9, -15, -23, -22, -28, -100]
+  const SINE_C4_BANDS = [-76, -70, -57, 0, -57, -79, -90, -100, -100, -100]
+
+  it('keeps band similarity informative against a real recorded reference', () => {
+    const bandsOf = (bandsDb: number[]) =>
+      compareAudioMetrics({ ...referenceMetrics, bandsDb: WAV_REFERENCE_BANDS }, { ...referenceMetrics, bandsDb })
+        .details.bands.similarity
+
+    const saw = bandsOf(SAW_C4_BANDS)
+    const edited = bandsOf(SAW_C4_EDITED_BANDS)
+    const sine = bandsOf(SINE_C4_BANDS)
+
+    // Both plausible candidates must land somewhere an agent can read and steer by, rather
+    // than in the bottom hundredth where the eval found them (0.010 and 0.008).
+    expect(saw).toBeGreaterThan(0.25)
+    expect(edited).toBeGreaterThan(0.25)
+    expect(saw).toBeLessThan(0.75)
+    expect(edited).toBeLessThan(0.75)
+    // One round of edits must move the metric by more than the 0.002 it moved before.
+    expect(Math.abs(saw - edited)).toBeGreaterThan(0.05)
+    // And the scale must still put a genuinely unrelated spectrum far below both.
+    expect(sine).toBeLessThan(Math.min(saw, edited) - 0.2)
+
+    // Two candidates one parameter change apart still read as close to each other.
+    const near = compareAudioMetrics(
+      { ...referenceMetrics, bandsDb: SAW_C4_BANDS },
+      { ...referenceMetrics, bandsDb: SAW_C4_EDITED_BANDS }
+    ).details.bands.similarity
+    expect(near).toBeGreaterThan(0.7)
+    expect(near).toBeGreaterThan(Math.max(saw, edited) + 0.3)
   })
 
   it('rejects malformed band arrays', () => {

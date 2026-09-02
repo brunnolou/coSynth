@@ -124,7 +124,10 @@ export interface AudioMetricsComparison {
     & { decayT60Ms: NullableMetricComparisonDetail }
     /** Pearson correlation of the two `envelopeDb` curves; reference/candidate are their mean levels. */
     & { envelope: AudioMetricComparisonDetail }
-    /** Mean absolute dB difference across `bandsDb`; reference/candidate are their mean levels. */
+    /**
+     * Mean per-band dB difference across `bandsDb`, each band capped at 20 dB and read
+     * linearly against that cap; reference/candidate are their mean levels.
+     */
     & { bands: AudioMetricComparisonDetail }
     /**
      * Mean absolute octave difference across the `spectralWindows` centroid trajectories;
@@ -182,6 +185,12 @@ const SPECTRAL_FFT_MAX = 4096
 const SPECTRAL_WINDOW_COUNT = 4
 /** A window with a shorter FFT than this cannot resolve partials; `harmonicsDb` is omitted. */
 const SPECTRAL_WINDOW_MIN_HARMONIC_FFT = 256
+/**
+ * Largest per-band dB gap `bandsDetail` counts. See that function for the measurements
+ * behind the number; briefly, 20 dB is where a band stops carrying steerable information
+ * and starts reporting how deep `BAND_FLOOR_DB` is.
+ */
+const BAND_ERROR_CLAMP_DB = 20
 /** The per-window centroid trajectory is compared in octaves, on this scale. */
 const BRIGHTNESS_SCALE_OCTAVES = 0.5
 /** Added to both centroids before the ratio, so a silent window is not a divide by zero. */
@@ -259,18 +268,44 @@ function decayDetail(
   }
 }
 
-/** Mean absolute dB difference across the band vector, on a 6 dB scale. */
+/**
+ * Mean per-band dB difference, each band's error capped at `BAND_ERROR_CLAMP_DB` and the
+ * mean then read linearly against that cap.
+ *
+ * An uncapped mean on an exponential scale could not work here, and the reference-matching
+ * eval showed exactly how: across three iterations against a recorded target this scored
+ * 0.000, 0.000, 0.008 while eight other metrics moved. Measured against
+ * `docs/agent-match-eval-reference.wav`, every plausible synth patch sits 27-30 dB away and
+ * a *deliberately* unrelated one 40-62 dB, so a 6 dB scale put the entire reachable range
+ * inside the bottom hundredth of the metric.
+ *
+ * The distance was that large because `bandsDb` floors at -100: a C4 note has nothing at all
+ * at 31 Hz and 16 kHz where a recording has energy, and those empty bands alone supplied 74 %
+ * of the raw distance (28 % of it from bands within 10 dB of the floor). Capping each band's
+ * error bounds that: 20 dB down is 1 % of the power, at which point the two sounds share
+ * nothing in that band and further dB report the floor's depth rather than the sound.
+ *
+ * 20 dB is where the measurements put the boundary. Every pair one parameter change apart
+ * differs by at most 10 dB in its worst band, so the cap never blunts what an agent is
+ * steering by; genuinely unrelated pairs differ by 48-96 dB in their worst band, far above
+ * it, so the cap only ever truncates the uninformative tail. Reading the capped mean
+ * linearly rather than exponentially spends the resolution evenly: 1 dB of improvement is
+ * worth the same 0.05 anywhere, instead of concentrating it all at a distance of zero that
+ * an agent chasing an arbitrary recording never reaches.
+ */
 function bandsDetail(reference: readonly number[], candidate: readonly number[]): AudioMetricComparisonDetail {
   const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
-  let absoluteError = 0
-  for (let index = 0; index < reference.length; index++) absoluteError += Math.abs(candidate[index] - reference[index])
+  let cappedError = 0
+  for (let index = 0; index < reference.length; index++) {
+    cappedError += Math.min(BAND_ERROR_CLAMP_DB, Math.abs(candidate[index] - reference[index]))
+  }
   const referenceMean = mean(reference)
   const candidateMean = mean(candidate)
   return {
     reference: referenceMean,
     candidate: candidateMean,
     delta: candidateMean - referenceMean,
-    similarity: exponentialSimilarity(absoluteError / reference.length, 6)
+    similarity: clampSimilarity(1 - cappedError / reference.length / BAND_ERROR_CLAMP_DB)
   }
 }
 
