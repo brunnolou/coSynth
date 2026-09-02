@@ -769,8 +769,12 @@ export function createWebMcpTools(
             : finite(value.duration, 'duration')
           if (duration <= 0 || duration > MAX_RENDER_SECONDS) throw new Error(`Render duration must be > 0 and limited to ${MAX_RENDER_SECONDS} seconds`)
           if (duration < sequence.duration) throw new Error('Render duration must cover the complete note sequence')
-          const wantsOffline = requestedMode === undefined ? offlineRenderer !== null : requestedMode === 'offline'
-          const renderModeFallback = wantsOffline && offlineRenderer === null
+          // Whether offline works here is a property of the browser, not of the
+          // request: a default (mode-less) call on a browser without an offline
+          // renderer must not be told to retry with `mode: "offline"`.
+          const offlineUnavailable = offlineRenderer === null
+          const wantsOffline = requestedMode === undefined ? !offlineUnavailable : requestedMode === 'offline'
+          const renderModeFallback = wantsOffline && offlineUnavailable
             ? 'Offline rendering is unavailable here (no OfflineAudioContext or AudioWorklet); captured the live output in real time instead'
             : undefined
           const soundEntryId = dependencies.currentSoundEntryId?.()
@@ -804,7 +808,7 @@ export function createWebMcpTools(
           }
 
           if (!engine.running) {
-            throw new Error(renderModeFallback
+            throw new Error(offlineUnavailable
               ? 'Start audio with a user gesture before rendering audio: offline rendering is unavailable in this browser'
               : 'Start audio with a user gesture before rendering audio, or use mode: "offline"')
           }

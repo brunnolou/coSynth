@@ -993,13 +993,20 @@ describe('offline rendering', () => {
   })
 
   it('reports the missing gesture and the missing offline path separately', async () => {
-    const stopped = setup(); stopped.engine.running = false
+    // Offline works here, so real time is the only thing the gesture blocks.
+    const stopped = offlineSetup()
     await expect(stopped.execute('render_audio', {
       notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }], mode: 'realtime'
     })).rejects.toThrow(/mode: "offline"/)
-    await expect(stopped.execute('render_audio', {
-      notes: [{ midi: 60, velocity: 1, start: 0, duration: 1 }], mode: 'offline'
-    })).rejects.toThrow(/offline rendering is unavailable/i)
+
+    // No offline renderer: every failing path must say so instead of pointing
+    // the agent at the one mode this browser cannot run.
+    const noOffline = setup(); noOffline.engine.running = false
+    const notes = [{ midi: 60, velocity: 1, start: 0, duration: 1 }]
+    for (const mode of ['offline', 'realtime', undefined]) {
+      await expect(noOffline.execute('render_audio', { notes, ...(mode === undefined ? {} : { mode }) }))
+        .rejects.toThrow(/offline rendering is unavailable/i)
+    }
   })
 
   it('still renders in real time when the agent asks for it', async () => {
