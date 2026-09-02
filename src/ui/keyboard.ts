@@ -8,7 +8,7 @@ import { isTextEditing } from './history-bindings'
 const KEYMAP: Record<string, number> = {
   KeyA: 0, KeyW: 1, KeyS: 2, KeyE: 3, KeyD: 4, KeyF: 5, KeyT: 6,
   KeyG: 7, KeyY: 8, KeyH: 9, KeyU: 10, KeyJ: 11, KeyK: 12, KeyO: 13,
-  KeyL: 14, KeyP: 15, Semicolon: 16
+  KeyL: 14, KeyP: 15, Semicolon: 16, Quote: 17
 }
 
 const WHITE_OFFSETS = [0, 2, 4, 5, 7, 9, 11]
@@ -18,10 +18,11 @@ const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 
 const noteName = (note: number) => `${NOTE_NAMES[note % 12]}${Math.floor(note / 12) - 1}`
 
 /** Selectable widths of the drawn keyboard, in octaves. */
-const OCTAVE_CHOICES = [2, 3, 4, 5, 6]
+const OCTAVE_CHOICES = [2, 3, 4, 5, 6, 7]
 const DEFAULT_OCTAVES = 5
-/** Top of the drawn range; extra octaves extend downwards, so the played window stays on screen. */
+/** Extra octaves extend downwards from C6 — keeping the played window on screen — until C0, then upwards. */
 const TOP_NOTE = 84 // C6
+const BOTTOM_NOTE = 12 // C0
 
 export class Keyboard {
   readonly root: HTMLElement
@@ -62,7 +63,7 @@ export class Keyboard {
     })
 
     const bar = el('div', 'kb-bar')
-    bar.append(octDown, this.octLabel, octUp, range, el('span', 'kb-hint', 'Play: A W S E D F T G Y H U J K · octave Z / X'))
+    bar.append(octDown, this.octLabel, octUp, range, el('span', 'kb-hint', "Play: A W S E D F T G Y H U J K O L P ; ' · octave Z / X"))
 
     this.keys.addEventListener('pointerdown', e => {
       const note = this.noteFromEvent(e)
@@ -134,7 +135,7 @@ export class Keyboard {
   private buildKeys(): void {
     this.keys.replaceChildren()
     this.keyEls.clear()
-    const startNote = TOP_NOTE - this.octaves * 12
+    const startNote = Math.max(BOTTOM_NOTE, TOP_NOTE - this.octaves * 12)
     const numWhite = this.octaves * 7 + 1
     this.keys.style.setProperty('--kb-white', `${100 / numWhite}%`)
     for (let w = 0; w < numWhite; w++) {
