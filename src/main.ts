@@ -2,7 +2,8 @@ import 'driver.js/dist/driver.css'
 import './style.css'
 import { SynthEngine } from './audio/engine'
 import { buildApp } from './ui/app'
-import { registerWebMcpTools } from './webmcp/register'
+import { registerWebMcpTools, type WebMcpRegistrationOptions } from './webmcp/register'
+import { registerLegacyWebMcpTools, resolveModelContext, loadLegacyWebMcp, type LegacyWebMcp } from './webmcp/legacy'
 import { bindWebMcpLifecycle } from './webmcp/lifecycle'
 import { agentActivityFor } from './webmcp/activity'
 import { UiGuideController } from './ui/guide'
@@ -38,18 +39,38 @@ guideTarget(overlay.querySelector<HTMLButtonElement>('#start-btn')!, 'button.aud
 let starting = false
 let webMcp: ReturnType<typeof registerWebMcpTools> | null = null
 let audioWebMcp: ReturnType<typeof registerWebMcpTools> | null = null
+
+// Standard entry point first (`document.modelContext`, then the deprecated
+// `navigator` spelling). Only when neither exists do we pay to fetch the legacy
+// webmcp.dev widget chunk, and only then does its blue connect button appear.
+const modelContext = resolveModelContext()
+let legacyWebMcp: LegacyWebMcp | null = null
+let legacyLoading = !modelContext
+const legacyReady: Promise<LegacyWebMcp | null> = modelContext
+  ? Promise.resolve(null)
+  : loadLegacyWebMcp().then(widget => { legacyWebMcp = widget; legacyLoading = false; return widget })
+
+const registerTools = (options: WebMcpRegistrationOptions) => legacyWebMcp
+  ? registerLegacyWebMcpTools(engine, legacyWebMcp, options)
+  : registerWebMcpTools(engine, modelContext, options)
+
 const updateReadiness = () => agentActivity.setToolReadiness(
   (webMcp?.registeredCount ?? 0) + (audioWebMcp?.registeredCount ?? 0), !engine.running,
-  { available: webMcp?.available ?? false, registering: !!(webMcp?.pending || audioWebMcp?.pending),
+  { available: legacyLoading || (webMcp?.available ?? false),
+    registering: !!(legacyLoading || webMcp?.pending || audioWebMcp?.pending),
     errors: [...(webMcp?.errors ?? []), ...(audioWebMcp?.errors ?? [])] }
 )
+// Show the "registering" state while the legacy chunk is in flight.
+if (legacyLoading) updateReadiness()
+
 const start = async () => {
   if (starting) return
   starting = true
   try {
     await engine.start()
     if (!audioWebMcp) {
-      audioWebMcp = registerWebMcpTools(engine, undefined, { audioTools: 'only', services })
+      await legacyReady
+      audioWebMcp = registerTools({ audioTools: 'only', services })
       updateReadiness()
       void audioWebMcp.ready.then(updateReadiness)
     }
@@ -78,25 +99,32 @@ window.addEventListener('keydown', startFromKey)
 ;(window as unknown as { coSynth: SynthEngine }).coSynth = engine
 
 // Progressive enhancement: WebMCP registration must never block synth startup.
-try {
-  webMcp = registerWebMcpTools(engine, undefined, { audioTools: 'exclude', guide, services })
-  updateReadiness()
-  void webMcp.ready.then(updateReadiness)
-  bindWebMcpLifecycle({
-    ready: webMcp.ready,
-    dispose() {
-      webMcp?.dispose()
-      audioWebMcp?.dispose()
-      window.removeEventListener('keydown', startFromKey)
-      disposeInteractions()
-      disposeApp()
-      services.dispose()
-      guide.dispose()
-      agentActivity.dispose()
-    }
-  }, window, import.meta.hot)
-} catch (error) {
-  agentActivity.setToolReadiness(0, !engine.running, { available: !!document.modelContext,
-    errors: [{ tool: 'WebMCP', message: error instanceof Error ? error.message : String(error) }] })
-  console.warn('WebMCP is unavailable:', error)
+const registerPageTools = () => {
+  try {
+    webMcp = registerTools({ audioTools: 'exclude', guide, services })
+    updateReadiness()
+    void webMcp.ready.then(updateReadiness)
+    bindWebMcpLifecycle({
+      ready: webMcp.ready,
+      dispose() {
+        webMcp?.dispose()
+        audioWebMcp?.dispose()
+        window.removeEventListener('keydown', startFromKey)
+        disposeInteractions()
+        disposeApp()
+        services.dispose()
+        guide.dispose()
+        agentActivity.dispose()
+      }
+    }, window, import.meta.hot)
+  } catch (error) {
+    agentActivity.setToolReadiness(0, !engine.running, { available: !!modelContext,
+      errors: [{ tool: 'WebMCP', message: error instanceof Error ? error.message : String(error) }] })
+    console.warn('WebMCP is unavailable:', error)
+  }
 }
+
+// With a native entry point this runs synchronously, exactly as before. Without
+// one it waits for the legacy widget chunk so the same descriptors are reused.
+if (modelContext) registerPageTools()
+else void legacyReady.then(() => registerPageTools())

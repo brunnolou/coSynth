@@ -79,7 +79,7 @@ Factory patches included; save to localStorage, or export/import files.
 
 ## WebMCP agent tools
 
-coSynth progressively exposes the same live `SynthEngine` used by the UI through the current WebMCP API, `document.modelContext.registerTool(tool, { signal })`. Browsers without WebMCP continue to run the normal synth with no polyfill or runtime dependency.
+coSynth progressively exposes the same live `SynthEngine` used by the UI through the current WebMCP API, `document.modelContext.registerTool(tool, { signal })`. Chrome 146-149 origin-trial builds only expose the pre-2026-07-21 `navigator.modelContext` spelling, so both entry points are accepted. Where neither exists, it lazily imports the vendored legacy [webmcp.dev](https://webmcp.dev/) widget (`src/vendor/webmcp-widget.js`, taken from `@jason.today/webmcp@0.1.13`), which lets a user explicitly connect a local WebMCP bridge with a token. Browsers on the standard path never fetch that chunk. If neither path is available, the normal synth still runs without an agent integration.
 
 Seventeen semantic tools are available over the full audio-enabled lifecycle. Fifteen discovery, editing, teaching, and history tools register at page load; `play_notes` and `render_audio` register only after the human starts audio. The UI counts successful registrations rather than assuming every tool is available.
 
@@ -165,7 +165,7 @@ await replay_history({ entryId: saved.items.find(item => item.kind === 'performa
 
 For a restore, provide `action: 'restore'`, `entryId`, and a fresh `expectedRevision`. Stale navigation returns a retryable `history_conflict`; an active human gesture blocks AI edits with `history_busy`. Read history again before retrying. Discovery defaults to five entries and allows at most twenty per page. Comparison results attach to the sound version used for the render.
 
-WebMCP requires a secure context: deploy over HTTPS, or use `localhost` during development. At the time of writing it is an experimental browser feature; use a WebMCP-enabled Chrome build/flag and a compatible client such as ChatGPT's experimental browser integration. Audio still follows browser autoplay policy: a human user gesture must click **CLICK TO START AUDIO** before `play_notes` or `render_audio` can run.
+WebMCP requires a secure context: deploy over HTTPS, or use `localhost` during development. At the time of writing it is an experimental browser feature; use a WebMCP-enabled Chrome build/flag and a compatible client such as ChatGPT's experimental browser integration. In browsers without either entry point, the legacy webmcp.dev fallback adds its blue connection widget; run its local bridge at the version the widget was vendored from (`npx -y @jason.today/webmcp@0.1.13 --mcp`), generate a token, then paste it into the widget. The bridge listens on `ws://localhost:4797`, so it must be reachable from the browser itself - an MCP client running in a different sandbox or VM than the browser will fail to connect. Audio still follows browser autoplay policy: a human user gesture must click **CLICK TO START AUDIO** before `play_notes` or `render_audio` can run.
 
 coSynth accepts both the current standards callback shape,
 `execute(input, { signal })`, and experimental clients that omit the execution
