@@ -7,30 +7,22 @@ const browser = await chromium.launch({
   executablePath: process.env.CHROMIUM_PATH || undefined,
   args: ['--autoplay-policy=no-user-gesture-required']
 })
+// The cold-page phase proves `render_audio` works with no user gesture at all.
+// `--autoplay-policy=no-user-gesture-required` would let audio start on its own
+// and make that proof meaningless, so it gets a browser with stock policy.
+const coldBrowser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined })
 
-async function trackedPage() {
-  const page = await browser.newPage()
+async function trackedPage(instance = browser) {
+  const page = await instance.newPage()
   const errors = []
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
   page.on('pageerror', error => errors.push(String(error)))
   return { page, errors }
 }
 
-try {
-  // Progressive-enhancement path: the unmodified browser has no shim.
-  const normal = await trackedPage()
-  await normal.page.goto(url, { waitUntil: 'networkidle' })
-  const normalState = await normal.page.evaluate(() => ({
-    hasEngine: Boolean(window.coSynth),
-    hasOverlay: Boolean(document.getElementById('start-overlay')),
-    hasModelContext: Boolean(document.modelContext)
-  }))
-  if (!normalState.hasEngine || !normalState.hasOverlay) throw new Error('App did not boot without WebMCP')
-  if (normal.errors.length) throw new Error(`No-shim page errors:\n${normal.errors.join('\n')}`)
-  await normal.page.close()
-
-  const shimmed = await trackedPage()
-  await shimmed.page.addInitScript(() => {
+/** Standards-shaped `document.modelContext`, exposed to the test as `__webMcpTools`. */
+function installShim(page) {
+  return page.addInitScript(() => {
     const tools = new Map()
     const modelContext = {
       registerTool(tool, options = {}) {
@@ -50,15 +42,94 @@ try {
     })
     Object.defineProperty(window, '__webMcpTools', { value: tools })
   })
-  await shimmed.page.goto(url, { waitUntil: 'networkidle' })
-  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 15)
-  const toolsBeforeAudio = await shimmed.page.evaluate(() => [...window.__webMcpTools.keys()])
-  if (toolsBeforeAudio.includes('play_notes') || toolsBeforeAudio.includes('render_audio')) {
-    throw new Error('Audio tools were exposed before audio startup')
+}
+
+const TOOLS_AT_LOAD = 17
+const TOOLS_AFTER_AUDIO = 18
+
+try {
+  // Progressive-enhancement path: the unmodified browser has no shim.
+  const normal = await trackedPage()
+  await normal.page.goto(url, { waitUntil: 'networkidle' })
+  const normalState = await normal.page.evaluate(() => ({
+    hasEngine: Boolean(window.coSynth),
+    hasOverlay: Boolean(document.getElementById('start-overlay')),
+    hasModelContext: Boolean(document.modelContext)
+  }))
+  if (!normalState.hasEngine || !normalState.hasOverlay) throw new Error('App did not boot without WebMCP')
+  if (normal.errors.length) throw new Error(`No-shim page errors:\n${normal.errors.join('\n')}`)
+  await normal.page.close()
+
+  // Plan Task 10 step 6: a cold page, no Start click, offline render succeeds.
+  const cold = await trackedPage(coldBrowser)
+  await installShim(cold.page)
+  await cold.page.goto(url, { waitUntil: 'networkidle' })
+  await cold.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOLS_AT_LOAD)
+  const coldResult = await cold.page.evaluate(async () => {
+    const tools = window.__webMcpTools
+    const before = {
+      names: [...tools.keys()],
+      running: window.coSynth.running,
+      overlay: Boolean(document.getElementById('start-overlay'))
+    }
+    const render = await tools.get('render_audio').execute({
+      notes: [{ midi: 60, velocity: 0.9, start: 0, duration: 1 }], duration: 2
+    }, { signal: new AbortController().signal })
+    return {
+      before,
+      render,
+      runningAfter: window.coSynth.running,
+      overlayAfter: Boolean(document.getElementById('start-overlay'))
+    }
+  })
+  if (!coldResult.before.overlay || coldResult.before.running !== false) {
+    throw new Error(`Page was not cold: ${JSON.stringify(coldResult.before)}`)
   }
+  if (!coldResult.before.names.includes('render_audio')) throw new Error('render_audio was not registered at page load')
+  if (coldResult.before.names.includes('play_notes')) throw new Error('play_notes was exposed before the audio gesture')
+  if (coldResult.render?.ok === false) throw new Error(`Cold offline render failed: ${JSON.stringify(coldResult.render)}`)
+  if (coldResult.render.renderMode !== 'offline') {
+    throw new Error(`Cold render did not use the offline path: ${JSON.stringify({ renderMode: coldResult.render.renderMode, renderModeFallback: coldResult.render.renderModeFallback })}`)
+  }
+  const coldMetrics = coldResult.render.metrics ?? {}
+  if (!Number.isFinite(coldMetrics.decayT60Ms)) throw new Error(`Cold render has no decayT60Ms: ${JSON.stringify(coldMetrics)}`)
+  if (!Number.isFinite(coldMetrics.harmonics?.inharmonicity)) {
+    throw new Error(`Cold render has no harmonics.inharmonicity: ${JSON.stringify(coldMetrics.harmonics)}`)
+  }
+  if (!Number.isFinite(coldMetrics.peakDb) || coldMetrics.peakDb <= -80) {
+    throw new Error(`Cold offline render is silent: ${JSON.stringify(coldMetrics)}`)
+  }
+  if (!coldResult.overlayAfter || coldResult.runningAfter !== false) {
+    throw new Error(`Offline render started live audio: ${JSON.stringify({ running: coldResult.runningAfter, overlay: coldResult.overlayAfter })}`)
+  }
+  if (cold.errors.length) throw new Error(`Cold page errors:\n${cold.errors.join('\n')}`)
+  await cold.page.close()
+  console.log(JSON.stringify({
+    coldStart: {
+      toolsAtLoad: coldResult.before.names.length,
+      running: coldResult.before.running,
+      startOverlayPresent: coldResult.before.overlay,
+      playNotesRegistered: coldResult.before.names.includes('play_notes'),
+      renderMode: coldResult.render.renderMode,
+      duration: coldResult.render.duration,
+      sampleRate: coldResult.render.sampleRate,
+      channels: coldResult.render.channels,
+      peakDb: coldMetrics.peakDb,
+      rmsDb: coldMetrics.rmsDb,
+      decayT60Ms: coldMetrics.decayT60Ms,
+      inharmonicity: coldMetrics.harmonics.inharmonicity
+    }
+  }, null, 2))
+
+  const shimmed = await trackedPage()
+  await installShim(shimmed.page)
+  await shimmed.page.goto(url, { waitUntil: 'networkidle' })
+  await shimmed.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOLS_AT_LOAD)
+  const toolsBeforeAudio = await shimmed.page.evaluate(() => [...window.__webMcpTools.keys()])
+  if (toolsBeforeAudio.includes('play_notes')) throw new Error('play_notes was exposed before audio startup')
   await shimmed.page.click('#start-btn')
   await shimmed.page.waitForFunction(() => !document.getElementById('start-overlay'), { timeout: 10000 })
-  await shimmed.page.waitForFunction(() => window.__webMcpTools?.size === 17)
+  await shimmed.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOLS_AFTER_AUDIO)
 
   const result = await shimmed.page.evaluate(async () => {
     const tools = window.__webMcpTools
@@ -130,7 +201,8 @@ try {
       name: 'browser-reference.wav'
     })
     const render = await callWithoutSignal('render_audio', {
-      notes: [{ midi: 60, velocity: 0.9, start: 0, duration: 0.25 }], duration: 0.6
+      notes: [{ midi: 60, velocity: 0.9, start: 0, duration: 0.25 }], duration: 0.6,
+      mode: 'realtime', format: 'url'
     })
     const renderedBlob = await (await fetch(render.url)).blob()
     const analysis = await call('analyze_audio')
@@ -188,7 +260,7 @@ try {
   const expectedNames = [
     'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
     'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
-    'compare_audio', 'save_preset', 'load_preset', 'get_ui_targets', 'show_ui_guide',
+    'compare_audio', 'save_preset', 'load_preset', 'list_presets', 'get_ui_targets', 'show_ui_guide',
     'get_history', 'navigate_history', 'replay_history', 'stop_performance'
   ]
   if (JSON.stringify([...result.names].sort()) !== JSON.stringify([...expectedNames].sort())) throw new Error(`Unexpected tools: ${result.names}`)
@@ -204,7 +276,7 @@ try {
   if (result.expectedError?.ok !== false || !/unknown parameter/i.test(result.expectedError?.error?.message ?? '')) {
     throw new Error(`Structured error check failed: ${JSON.stringify(result.expectedError)}`)
   }
-  if (!result.activity.toolStatus?.startsWith('17 tools ready.') || !result.activity.undoEnabled ||
+  if (!result.activity.toolStatus?.startsWith(`${TOOLS_AFTER_AUDIO} tools ready.`) || !result.activity.undoEnabled ||
       !result.activity.retainedComparison || !result.activity.changedParameters.some(text => text === 'master.volume' || text.startsWith('master.volume:')) ||
       result.activity.soundCount < 5 || result.activity.replayCount !== 2) {
     throw new Error(`Agent activity check failed: ${JSON.stringify(result.activity)}`)
@@ -231,4 +303,5 @@ try {
   console.log('WEBMCP SMOKE OK')
 } finally {
   await browser.close()
+  await coldBrowser.close()
 }
