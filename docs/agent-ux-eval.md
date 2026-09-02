@@ -58,18 +58,24 @@ the end. Read the call log, not just the summary.
 Baseline is the field evidence in the plan: one agent session, before any of this
 work. Runs are against a production build, driven through the shim.
 
-| | Baseline | Claude r1 | Codex r1 | Claude r2 | Codex r2 | Claude r3 | Codex r3 |
-|---|---|---|---|---|---|---|---|
-| Calls to learn 224 parameters | 45 | 4 | 1 | 2 | 4 | 1 | 1 |
-| Calls before 1st good `update_parameters` | 3 | 5 | 2 | 2 | 5 | 2 | 2 |
-| Total / failed | — | 21 / 0 | 14 / 0 | 33 / 1 | 19 / 0 | 24 / 0 | 15 / 1 |
-| `attackMs` at 7-cent detune | 1277 ms | 5.8 | 8.2 | 7.0 | — | — | — |
-| 4-render velocity sweep | ~15 s | 0.79 s | 0.88 s | 0.80 s | 0.88 s | — | — |
-| Offline render before Start | impossible | yes | yes | yes | yes | yes | yes |
-| Silent renders | — | — | — | 1 seen | — | 0 | 0 |
+| | Baseline | C r1 | X r1 | C r2 | X r2 | C r3 | X r3 | C r4 | X r4 |
+|---|---|---|---|---|---|---|---|---|---|
+| Calls to learn 224 parameters | 45 | 4 | 1 | 2 | 4 | 1 | 1 | **1** | **1** |
+| Calls before 1st good `update_parameters` | 3 | 5 | 2 | 2 | 5 | 2 | 2 | **2** | **2** |
+| Total calls | — | 21 | 14 | 33 | 19 | 24 | 15 | **17** | **15** |
+| Failed calls | — | 0 | 0 | 1 | 0 | 0 | 1\* | **0** | **0** |
+| `attackMs` at 7-cent detune | 1277 ms | 5.8 | 8.2 | 7.0 | — | — | — | — | — |
+| 4-render velocity sweep | ~15 s | 0.79 s | 0.88 s | 0.80 s | 0.88 s | — | — | — | — |
+| Offline render before Start | impossible | yes | yes | yes | yes | yes | yes | yes | yes |
+| Silent renders | — | — | — | 1 seen | — | 0 | 0 | **0** | **0** |
 
-r2 followed the r1 fixes, r3 followed the r2 fixes. Codex r3's one failure is
-`play_notes` before the gesture, which is by design.
+C = Claude, X = Codex. Each round follows the previous round's fixes.
+\* `play_notes` before the gesture, which is by design.
+
+Round 4 is the first with **zero failed calls on both models and one-call
+discovery on both**. Neither hunted for the modulation sources, paged the
+compact format, read routes back, or hit the addressing asymmetry — the four
+things rounds 1-3 fixed. Claude's total went 21 -> 33 -> 24 -> 17.
 
 ## What each round found
 
@@ -105,6 +111,14 @@ The pattern worth keeping in mind: each round removes the top blocker and
 uncovers the next one, and the recurring class is **a description that promises
 something the code does not do**. `filterRouting`, `sourceLimit`,
 `get_synth_state`'s routes and `dec_curve` are all that same bug.
+
+Round 4 — clean on every metric the earlier rounds targeted. What is left is
+narrower and mostly about **stated behaviour rather than discoverability**: both
+models want the voice-allocation/retrigger policy declared up front (`retriggered`
+only tells you after the fact), the polarity and scaling of a unipolar source
+under a bipolar `depth` spelled out, and `inharmonicity` given a formula. Codex
+also notes `play_notes` is callable while absent from `GET /tools`, so its schema
+still has to be inferred from `render_audio`.
 
 ## Still open
 
