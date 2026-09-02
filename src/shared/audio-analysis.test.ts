@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { analyzeAudio, compareAudioMetrics, type AudioMetrics, type ComparedMetricKey } from './audio-analysis'
+import {
+  analyzeAudio, compareAudioMetrics,
+  type AudioMetrics, type ComparedMetricKey, type SpectralWindow
+} from './audio-analysis'
 
 function sine(frequency: number, sampleRate: number, seconds: number, amplitude = 1, phase = 0): Float32Array {
   return Float32Array.from({ length: Math.round(sampleRate * seconds) }, (_, i) =>
@@ -72,6 +75,40 @@ function stretchedPartials(
       value += Math.sin(2 * Math.PI * f0 * n * Math.sqrt(1 + inharmonicity * n * n) * t) / n
     }
     return 0.4 * envelope * value
+  })
+}
+
+/**
+ * One-pole low-pass whose cutoff falls exponentially from `startHz` to `endHz` across the
+ * buffer - a brightness decay, the `env -> cutoff` route an agent cannot otherwise verify.
+ */
+function sweepingLowpass(source: Float32Array, sampleRate: number, startHz: number, endHz: number): Float32Array {
+  const out = new Float32Array(source.length)
+  let state = 0
+  for (let i = 0; i < source.length; i++) {
+    const cutoff = startHz * (endHz / startHz) ** (i / (source.length - 1))
+    state += (1 - Math.exp(-2 * Math.PI * cutoff / sampleRate)) * (source[i] - state)
+    out[i] = state
+  }
+  return out
+}
+
+/**
+ * Twelve partials where partial n decays n times as fast as the fundamental - a piano's
+ * defining behaviour, and invisible in a whole-buffer `harmonics.amplitudesDb` snapshot.
+ */
+function fasterUpperPartialDecay(
+  f0: number,
+  sampleRate: number,
+  seconds: number,
+  t60Seconds: number
+): Float32Array {
+  const base = Math.log(1000) / t60Seconds
+  return Float32Array.from({ length: Math.round(sampleRate * seconds) }, (_, i) => {
+    const t = i / sampleRate
+    let value = 0
+    for (let n = 1; n <= 12; n++) value += Math.exp(-base * n * t) * Math.sin(2 * Math.PI * f0 * n * t) / n
+    return 0.3 * Math.min(1, t / 0.005) * value
   })
 }
 
@@ -416,6 +453,157 @@ describe('analyzeAudio', () => {
     expect(analyzeAudio([sine(440, sampleRate, 0.5, 0.5)], sampleRate, { f0Hz: Number.NaN }).harmonics).toBeUndefined()
   })
 
+  it('covers the buffer in order with four consecutive, equal, non-overlapping windows', () => {
+    const sampleRate = 48000
+    const { spectralWindows } = analyzeAudio([sawtooth(220, sampleRate, 2)], sampleRate)
+    expect(spectralWindows).toHaveLength(4)
+    expect(spectralWindows.map(window => [window.startMs, window.endMs])).toEqual([
+      [0, 500], [500, 1000], [1000, 1500], [1500, 2000]
+    ])
+  })
+
+  it('reports a falling per-window centroid for a closing filter and a flat one for a steady tone', () => {
+    const sampleRate = 48000
+    // Measured: 528.9 -> 433.3 -> 352.5 -> 292.8 Hz. The whole-buffer spectralCentroidHz
+    // collapses all of that to a single 414 Hz, which a steady tone can equally well produce.
+    const falling = analyzeAudio(
+      [sweepingLowpass(sawtooth(220, sampleRate, 2), sampleRate, 8000, 300)],
+      sampleRate
+    )
+    const brightness = falling.spectralWindows.map(window => window.spectralCentroidHz)
+    for (let index = 1; index < brightness.length; index++) {
+      // Strictly falling, and by enough that a whole-buffer computation - which would make
+      // every window identical - or a reversed window order cannot satisfy it.
+      expect(brightness[index]).toBeLessThan(brightness[index - 1] * 0.95)
+    }
+    expect(brightness[3]).toBeLessThan(brightness[0] * 0.6)
+    // The rolloff falls with it; the level barely moves, so this is brightness, not volume.
+    expect(falling.spectralWindows[3].spectralRolloffHz).toBeLessThan(falling.spectralWindows[0].spectralRolloffHz)
+    expect(falling.spectralWindows[3].levelDb).toBeGreaterThan(-6)
+
+    const steady = analyzeAudio([sawtooth(220, sampleRate, 2)], sampleRate)
+    const flat = steady.spectralWindows.map(window => window.spectralCentroidHz)
+    expect(new Set(flat).size).toBe(1)
+    expect(steady.spectralWindows.map(window => window.levelDb)).toEqual([0, 0, 0, 0])
+  })
+
+  it('reports per-window level relative to the loudest window', () => {
+    const sampleRate = 48000
+    const decaying = analyzeAudio([pluck(sampleRate, 2, 0.005, 1)], sampleRate)
+    const levels = decaying.spectralWindows.map(window => window.levelDb)
+    expect(levels[0]).toBe(0)
+    for (let index = 1; index < levels.length; index++) expect(levels[index]).toBeLessThan(levels[index - 1])
+    // A 1 s T60 is 60 dB/s, so consecutive 500 ms windows are about 30 dB apart.
+    expect(levels[1]).toBeLessThan(-25)
+    expect(levels[1]).toBeGreaterThan(-35)
+
+    // The loudest window is not always the first: a 2 s swell peaks at the end, and
+    // levelDb must be relative to that peak rather than to whatever came first.
+    const swelling = analyzeAudio([swell(2000, sampleRate, 2)], sampleRate)
+    const rising = swelling.spectralWindows.map(window => window.levelDb)
+    expect(rising[0]).toBeLessThan(-10)
+    expect(rising[3]).toBe(0)
+    for (let index = 1; index < rising.length; index++) expect(rising[index]).toBeGreaterThan(rising[index - 1])
+  })
+
+  it('shows the upper partials decaying faster than the fundamental, window by window', () => {
+    const sampleRate = 48000
+    const { spectralWindows, harmonics } = analyzeAudio(
+      [fasterUpperPartialDecay(220, sampleRate, 2, 1.5)],
+      sampleRate,
+      { f0Hz: 220 }
+    )
+    // The whole-buffer snapshot sees one set of partials and cannot express a decay rate.
+    expect(harmonics!.amplitudesDb).toHaveLength(12)
+
+    const partial = (index: number) => spectralWindows.map(window => window.harmonicsDb![index])
+    for (const window of spectralWindows) expect(window.harmonicsDb).toHaveLength(12)
+    // Partial 1 falls 20 dB per window (T60 1.5 s = 40 dB/s, windows are 500 ms).
+    const fundamental = partial(0)
+    expect(fundamental[0]).toBe(0)
+    expect(fundamental[1]).toBeCloseTo(-20, 0)
+    expect(fundamental[2]).toBeCloseTo(-40, 0)
+    expect(fundamental[3]).toBeCloseTo(-60, 0)
+    // Partial 2 decays twice as fast, so it loses twice as much between the first two
+    // windows. A per-window normalisation to each window's own loudest partial would make
+    // every window read 0 here and hide exactly this.
+    const second = partial(1)
+    expect(second[0] - second[1]).toBeGreaterThan(2 * (fundamental[0] - fundamental[1]) - 4)
+    // And by the last window the upper partials are gone while the fundamental is not.
+    expect(partial(7)[3]).toBeLessThan(fundamental[3] - 40)
+    for (const values of [fundamental, second, partial(3)]) {
+      for (let index = 1; index < values.length; index++) {
+        expect(values[index]).toBeLessThanOrEqual(values[index - 1])
+      }
+    }
+  })
+
+  it('omits per-window harmonicsDb exactly when the whole-buffer harmonics are omitted', () => {
+    const sampleRate = 48000
+    const signal = sawtooth(220, sampleRate, 1)
+    const without = analyzeAudio([signal], sampleRate)
+    expect(without.harmonics).toBeUndefined()
+    expect(without.spectralWindows.every(window => !('harmonicsDb' in window))).toBe(true)
+    expect(JSON.stringify(without.spectralWindows)).not.toContain('harmonics')
+
+    const withF0 = analyzeAudio([signal], sampleRate, { f0Hz: 220 })
+    expect(withF0.spectralWindows.every(window => window.harmonicsDb?.length === 12)).toBe(true)
+    // The whole-buffer field is untouched by the per-window pass.
+    expect(withF0.harmonics).toEqual(analyzeAudio([signal], sampleRate, { f0Hz: 220 }).harmonics)
+
+    for (const f0Hz of [0, -220, Number.NaN]) {
+      const rejected = analyzeAudio([signal], sampleRate, { f0Hz })
+      expect(rejected.harmonics).toBeUndefined()
+      expect(rejected.spectralWindows.every(window => window.harmonicsDb === undefined)).toBe(true)
+    }
+  })
+
+  it('reports identical spectral windows for mono, duplicated stereo, and anti-phase stereo', () => {
+    const sampleRate = 48000
+    const left = sweepingLowpass(sawtooth(220, sampleRate, 1), sampleRate, 8000, 300)
+    const mono = analyzeAudio([left], sampleRate, { f0Hz: 220 })
+    for (const right of [new Float32Array(left), Float32Array.from(left, value => -value)]) {
+      expect(analyzeAudio([left, right], sampleRate, { f0Hz: 220 }).spectralWindows).toEqual(mono.spectralWindows)
+    }
+  })
+
+  it('returns zeroed spectral windows rather than throwing for buffers too short to slice', () => {
+    for (const [length, sampleRate] of [[4, 1000], [8, 48000], [1, 48000]] as const) {
+      const { spectralWindows } = analyzeAudio([new Float32Array(length).fill(0.2)], sampleRate, { f0Hz: 220 })
+      expect(spectralWindows).toHaveLength(4)
+      for (const window of spectralWindows) {
+        expect(Object.values(window).every(Number.isFinite)).toBe(true)
+        expect(window.spectralCentroidHz).toBe(0)
+        expect(window.levelDb).toBe(0)
+        expect(window.harmonicsDb).toBeUndefined()
+      }
+    }
+
+    // 32 samples do slice into four 8-sample windows. Those carry a real (if useless)
+    // spectrum, which must still be finite, and an FFT far too small to resolve partials.
+    const sliced = analyzeAudio([new Float32Array(32).fill(0.2)], 48000, { f0Hz: 220 })
+    expect(sliced.spectralWindows).toHaveLength(4)
+    expect(sliced.spectralWindows.every(window => Object.values(window).every(Number.isFinite))).toBe(true)
+    expect(sliced.spectralWindows.every(window => window.harmonicsDb === undefined)).toBe(true)
+  })
+
+  it('keeps spectral windows finite for DC and for a buffer that falls to digital silence', () => {
+    const sampleRate = 48000
+    const dc = analyzeAudio([new Float32Array(sampleRate).fill(0.5)], sampleRate, { f0Hz: 220 })
+    for (const window of dc.spectralWindows) {
+      expect(Number.isFinite(window.spectralCentroidHz)).toBe(true)
+      expect(window.harmonicsDb!.every(Number.isFinite)).toBe(true)
+    }
+
+    // Half a note, then true zeros: the silent windows must read the floor, not -Infinity.
+    const half = new Float32Array(sampleRate)
+    half.set(sine(440, sampleRate, 0.4, 0.5), 0)
+    const gated = analyzeAudio([half], sampleRate, { f0Hz: 440 })
+    expect(gated.spectralWindows[3].levelDb).toBeLessThanOrEqual(-100)
+    expect(gated.spectralWindows.every(window => window.harmonicsDb!.every(Number.isFinite))).toBe(true)
+    expect(JSON.stringify(gated.spectralWindows)).not.toContain('null')
+  })
+
   it('handles silence and rejects malformed input', () => {
     const silence = analyzeAudio([new Float32Array(32)], 48000)
     expect(silence).toMatchObject({
@@ -433,6 +621,9 @@ describe('analyzeAudio', () => {
     })
     expect(silence.envelopeDb).toEqual(new Array(64).fill(0))
     expect(silence.bandsDb).toEqual(new Array(10).fill(-100))
+    expect(silence.spectralWindows).toHaveLength(4)
+    expect(silence.spectralWindows.map(window => window.spectralCentroidHz)).toEqual([0, 0, 0, 0])
+    expect(silence.spectralWindows.map(window => window.levelDb)).toEqual([0, 0, 0, 0])
     expect(() => analyzeAudio([], 48000)).toThrow(/channel/i)
     expect(() => analyzeAudio([new Float32Array(2)], 0)).toThrow(/sample rate/i)
   })
@@ -459,10 +650,11 @@ describe('analyzeAudio', () => {
 
   it('returns accepted metrics whose scalars are finite and never serialize as null', () => {
     const metrics = analyzeAudio([pluck(8000, 1.5, 0.005, 0.4)], 8000)
-    const { decayT60Ms, envelopeDb, bandsDb, harmonics, ...scalars } = metrics
+    const { decayT60Ms, envelopeDb, bandsDb, harmonics, spectralWindows, ...scalars } = metrics
     expect(Object.values(scalars).every(Number.isFinite)).toBe(true)
     expect(envelopeDb.every(Number.isFinite)).toBe(true)
     expect(bandsDb.every(Number.isFinite)).toBe(true)
+    expect(spectralWindows.every(window => Object.values(window).every(Number.isFinite))).toBe(true)
     expect(harmonics).toBeUndefined()
     expect(decayT60Ms).toBeGreaterThan(0)
     expect(JSON.stringify(metrics)).not.toContain('null')
@@ -479,11 +671,21 @@ const metricKeys: ComparedMetricKey[] = [
   'peakDb', 'rmsDb', 'clippingCount', 'dcOffset',
   'spectralCentroidHz', 'attackMs', 'stereoWidth', 'decayT60Ms'
 ]
-const detailKeys = [...metricKeys, 'envelope', 'bands'] as const
+const detailKeys = [...metricKeys, 'envelope', 'bands', 'brightness'] as const
 
 /** A decaying shape, so envelope correlation has something to correlate. */
 const rampEnvelope = (start: number, end: number): number[] =>
   Array.from({ length: 64 }, (_, i) => Math.round((start + (end - start) * i / 63) * 10) / 10)
+
+/** Four 250 ms windows carrying the given centroid trajectory. */
+const windowTrajectory = (centroids: readonly number[]): SpectralWindow[] =>
+  centroids.map((spectralCentroidHz, index) => ({
+    startMs: index * 250,
+    endMs: (index + 1) * 250,
+    spectralCentroidHz,
+    spectralRolloffHz: spectralCentroidHz * 2,
+    levelDb: index === 0 ? 0 : -3 * index
+  }))
 
 const referenceMetrics: AudioMetrics = {
   peakDb: -6,
@@ -500,7 +702,8 @@ const referenceMetrics: AudioMetrics = {
   loudnessDb: -14,
   bandsDb: [-40, -30, -20, -10, -6, -8, -14, -22, -30, -40],
   spectralRolloffHz: 3200,
-  spectralFlatness: 0.08
+  spectralFlatness: 0.08,
+  spectralWindows: windowTrajectory([2000, 1400, 1000, 700])
 }
 
 describe('compareAudioMetrics', () => {
@@ -550,14 +753,16 @@ describe('compareAudioMetrics', () => {
       spectralCentroidHz: 0, attackMs: 0, stereoWidth: 0,
       timeToPeakMs: 0, decayT60Ms: null, sustainDb: 0,
       envelopeDb: new Array(64).fill(0), loudnessDb: -160,
-      bandsDb: new Array(10).fill(-100), spectralRolloffHz: 0, spectralFlatness: 0
+      bandsDb: new Array(10).fill(-100), spectralRolloffHz: 0, spectralFlatness: 0,
+      spectralWindows: windowTrajectory([0, 0, 0, 0])
     }
     const changed: AudioMetrics = {
       peakDb: -159, rmsDb: -140, clippingCount: 1, dcOffset: 0,
       spectralCentroidHz: 20, attackMs: 1, stereoWidth: 0,
       timeToPeakMs: 1, decayT60Ms: 5, sustainDb: -3,
       envelopeDb: rampEnvelope(0, -12), loudnessDb: -140,
-      bandsDb: new Array(10).fill(-10), spectralRolloffHz: 20, spectralFlatness: 1
+      bandsDb: new Array(10).fill(-10), spectralRolloffHz: 20, spectralFlatness: 1,
+      spectralWindows: windowTrajectory([20, 18, 12, 0])
     }
     for (const result of [compareAudioMetrics(silence, silence), compareAudioMetrics(silence, changed)]) {
       expect(Number.isFinite(result.similarity)).toBe(true)
@@ -622,6 +827,50 @@ describe('compareAudioMetrics', () => {
       .toThrow(/bandsDb/i)
     expect(() => compareAudioMetrics({ ...referenceMetrics, bandsDb: new Array(10).fill(Number.NaN) }, referenceMetrics))
       .toThrow(/bandsDb/i)
+  })
+
+  it('separates a falling brightness trajectory from a rising one with the same mean', () => {
+    const identical = compareAudioMetrics(referenceMetrics, { ...referenceMetrics })
+    expect(identical.details.brightness.similarity).toBe(1)
+    expect(identical.details.brightness.delta).toBe(0)
+    expect(identical.details.brightness.reference).toBeCloseTo(1275, 5)
+
+    // Same four centroids in the opposite order: identical mean, identical whole-buffer
+    // spectralCentroidHz, opposite sound. This is the pair no other detail can tell apart.
+    const rising = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([700, 1000, 1400, 2000])
+    }
+    const reversed = compareAudioMetrics(referenceMetrics, rising)
+    expect(reversed.details.spectralCentroidHz.similarity).toBe(1)
+    expect(reversed.details.brightness.delta).toBeCloseTo(0, 5)
+    expect(reversed.details.brightness.similarity).toBeLessThan(0.3)
+    expect(reversed.similarity).toBeLessThan(1)
+
+    // A whole octave darker at every window is one scale unit of two.
+    const darker = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([1000, 700, 500, 350])
+    }
+    const dark = compareAudioMetrics(referenceMetrics, darker).details.brightness
+    expect(dark.delta).toBeLessThan(0)
+    expect(dark.similarity).toBeGreaterThan(0.1)
+    expect(dark.similarity).toBeLessThan(0.2)
+  })
+
+  it('rejects malformed spectral window arrays', () => {
+    expect(() => compareAudioMetrics(referenceMetrics, {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([1000, 500])
+    })).toThrow(/spectralWindows/i)
+    expect(() => compareAudioMetrics({
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([1000, 500, Number.NaN, 100])
+    }, referenceMetrics)).toThrow(/spectralWindows/i)
+    expect(() => compareAudioMetrics(referenceMetrics, {
+      ...referenceMetrics,
+      spectralWindows: [null, null, null, null] as unknown as SpectralWindow[]
+    })).toThrow(/spectralWindows/i)
   })
 
   it('rejects malformed envelope arrays', () => {
