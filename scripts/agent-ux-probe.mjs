@@ -66,6 +66,43 @@ await page.waitForFunction(() => (window.__webMcpTools?.size ?? 0) > 0, { timeou
 const log = []
 let gestureAt = null
 
+/**
+ * A few fields from each result, so the log alone shows what came back. Logging
+ * whole results would bury the file in 64-point envelopes and PCM, but logging
+ * none of them hid a render that returned pure silence with ok:true - the log
+ * said "ok, 210ms" and the failure was only visible in the agent's own notes.
+ */
+function digest(result) {
+  if (result === null || typeof result !== 'object') return result
+  const out = {}
+  const metrics = result.metrics
+  if (metrics && typeof metrics === 'object') {
+    for (const key of ['peakDb', 'rmsDb', 'loudnessDb', 'attackMs', 'decayT60Ms']) {
+      if (key in metrics) out[key] = metrics[key]
+    }
+    if (metrics.harmonics && typeof metrics.harmonics === 'object') {
+      out.inharmonicity = metrics.harmonics.inharmonicity
+    }
+    if (Array.isArray(metrics.spectralWindows)) {
+      out.windowCentroidsHz = metrics.spectralWindows.map(w => w?.spectralCentroidHz)
+    }
+    if (out.peakDb !== undefined && out.peakDb <= -159) out.SILENT = true
+  }
+  for (const key of ['renderMode', 'renderModeFallback', 'retriggered', 'completed', 'noteCount', 'saved', 'loaded']) {
+    if (key in result) out[key] = result[key]
+  }
+  if (Array.isArray(result.applied)) out.appliedCount = result.applied.length
+  if (result.route) out.route = result.route
+  if (result.parameters?.total !== undefined) {
+    out.parameters = { total: result.parameters.total, items: result.parameters.items?.length, nextOffset: result.parameters.nextOffset }
+  }
+  if (result.modulationSources?.total !== undefined) {
+    out.modulationSources = { total: result.modulationSources.total, items: result.modulationSources.items?.length }
+  }
+  if (Array.isArray(result.presets)) out.presetCount = result.presets.length
+  return Object.keys(out).length ? out : undefined
+}
+
 const summarise = () => {
   const calls = log.filter(entry => entry.kind === 'call')
   const failed = calls.filter(entry => !entry.ok)
@@ -87,6 +124,9 @@ const summarise = () => {
         return acc
       }, {})
     ).sort(([a], [b]) => a.localeCompare(b))),
+    // Renders that came back as an all-zero buffer. This must stay at zero;
+    // a nonzero count means the offline path silently produced nothing.
+    silentRenders: calls.filter(entry => entry.result?.SILENT).length,
     startGestureDispatchedAtCall: gestureAt,
     pageErrors: [...pageErrors]
   }
@@ -174,7 +214,8 @@ const server = createServer(async (request, response) => {
         input,
         ok: outcome.ok,
         ms,
-        ...(outcome.ok ? {} : { error: outcome.error ?? outcome.result?.error })
+        ...(outcome.ok ? {} : { error: outcome.error ?? outcome.result?.error }),
+        ...(outcome.ok ? { result: digest(outcome.result) } : {})
       }
       log.push(entry)
       return json(response, 200, { ok: outcome.ok, call: entry.call, ms, ...(outcome.ok ? { result: outcome.result } : { error: entry.error }) })
