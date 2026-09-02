@@ -79,6 +79,10 @@
 .agent-onboarding-prompts li {
   padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px;
   background: #ffffff08; color: var(--text); font-size: 12px;
+  /* These are meant to be copied into the chat, so opt out of the global select lock. */
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
 }
 @keyframes agent-orb { to { --ai-glow-angle: 360deg; } }
 @keyframes agent-feed-in { from { transform: translateY(100%); } to { transform: translateY(0); } }
