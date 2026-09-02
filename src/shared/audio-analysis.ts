@@ -36,8 +36,42 @@ export interface AudioMetrics {
   spectralRolloffHz: number
   /** Geometric over arithmetic mean of the power spectrum: 0 is tonal, 1 is noise. */
   spectralFlatness: number
+  /**
+   * Four consecutive, equal, non-overlapping slices of the buffer, earliest first, each
+   * analysed on its own samples. Every other spectral field above collapses the whole
+   * buffer into one number, so a sound whose brightness *falls* - a piano, anything with
+   * `env -> cutoff` - is indistinguishable from a steady one. Read the trend across these
+   * to see that.
+   */
+  spectralWindows: SpectralWindow[]
   /** Present only when `analyzeAudio` was given an `f0Hz`; never fabricated. */
   harmonics?: HarmonicMetrics
+}
+
+/** One time slice of the buffer. See `AudioMetrics.spectralWindows`. */
+export interface SpectralWindow {
+  /** Start of the analysed slice, ms from the buffer start. */
+  startMs: number
+  /** End of the analysed slice, ms from the buffer start. */
+  endMs: number
+  /** Spectral centroid of this slice alone - the brightness figure to read a trend from. */
+  spectralCentroidHz: number
+  /** Frequency below which 85% of this slice's power lies. */
+  spectralRolloffHz: number
+  /**
+   * RMS of this slice in dB relative to the loudest slice, so the loudest reads 0. Tells a
+   * brightness change apart from the level change that a closing filter also causes.
+   */
+  levelDb: number
+  /**
+   * The first 12 partials of this slice in dB relative to the loudest partial found in
+   * *any* slice, so both the overall decay and the per-partial decay rates are readable:
+   * a piano's eighth partial falls tens of dB while its fundamental barely moves.
+   *
+   * Present only when `analyzeAudio` was given a usable `f0Hz` and the slices are long
+   * enough to resolve partials; present on every slice or on none, never fabricated.
+   */
+  harmonicsDb?: number[]
 }
 
 export interface HarmonicMetrics {
@@ -92,6 +126,14 @@ export interface AudioMetricsComparison {
     & { envelope: AudioMetricComparisonDetail }
     /** Mean absolute dB difference across `bandsDb`; reference/candidate are their mean levels. */
     & { bands: AudioMetricComparisonDetail }
+    /**
+     * Mean absolute octave difference across the `spectralWindows` centroid trajectories;
+     * reference/candidate are their mean centroids. Unlike `envelope` this is not a pure
+     * shape score - absolute brightness is part of a timbre match - but it separates two
+     * sounds with the same mean brightness that arrive at it from opposite directions,
+     * which `spectralCentroidHz` alone cannot.
+     */
+    & { brightness: AudioMetricComparisonDetail }
 }
 
 const clampSimilarity = (value: number): number => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
@@ -110,10 +152,11 @@ const scalarMetricKeys: (keyof AudioMetrics)[] = [
 ]
 const ENVELOPE_POINTS = 64
 /**
- * Round to 0.1 dB and normalise -0, which reads as an oddity in JSON diffs. `|| 0` would
- * also turn NaN into 0, which would disarm the finiteness guards this module ends with.
+ * Round to a tenth (of a dB, a hertz, a millisecond) and normalise -0, which reads as an
+ * oddity in JSON diffs. `|| 0` would also turn NaN into 0, which would disarm the
+ * finiteness guards this module ends with.
  */
-const roundDb = (value: number): number => {
+const roundTenth = (value: number): number => {
   const rounded = Math.round(value * 10) / 10
   return rounded === 0 ? 0 : rounded
 }
@@ -127,6 +170,26 @@ const HARMONIC_FIT_FLOOR_DB = -60
 const HARMONIC_AMPLITUDE_FLOOR_DB = -120
 /** Half-width of the peak search around each predicted partial, as a fraction of it. */
 const HARMONIC_SEARCH_FRACTION = 0.03
+/** Largest FFT the whole-buffer spectral pass and each time window will use. */
+const SPECTRAL_FFT_MAX = 4096
+/**
+ * Four windows: three successive deltas, which is the least that tells a monotone fall
+ * ("brightness decays") from a dip and a recovery, and few enough that the whole
+ * trajectory - 4 x (2 bounds + 3 figures), plus 4 x 12 partials when `f0Hz` is known -
+ * stays the same order of magnitude as the 64-point `envelopeDb` already returned
+ * unconditionally. A spectrogram would be no harder to compute and useless to read.
+ */
+const SPECTRAL_WINDOW_COUNT = 4
+/** A window with a shorter FFT than this cannot resolve partials; `harmonicsDb` is omitted. */
+const SPECTRAL_WINDOW_MIN_HARMONIC_FFT = 256
+/** The per-window centroid trajectory is compared in octaves, on this scale. */
+const BRIGHTNESS_SCALE_OCTAVES = 0.5
+/** Added to both centroids before the ratio, so a silent window is not a divide by zero. */
+const BRIGHTNESS_FLOOR_HZ = 20
+/** Fields of a `SpectralWindow` that must always be finite numbers. */
+const SPECTRAL_WINDOW_SCALAR_FIELDS = [
+  'startMs', 'endMs', 'spectralCentroidHz', 'spectralRolloffHz', 'levelDb'
+] as const
 
 function assertNumberArray(label: string, field: string, values: unknown, expected: number): number[] {
   if (!Array.isArray(values) || values.length !== expected) {
@@ -142,6 +205,23 @@ const assertEnvelopeDb = (label: string, values: unknown): number[] =>
   assertNumberArray(label, 'envelopeDb', values, ENVELOPE_POINTS)
 const assertBandsDb = (label: string, values: unknown): number[] =>
   assertNumberArray(label, 'bandsDb', values, BAND_COUNT)
+
+function assertSpectralWindows(label: string, value: unknown): SpectralWindow[] {
+  if (!Array.isArray(value) || value.length !== SPECTRAL_WINDOW_COUNT) {
+    throw new Error(`${label}.spectralWindows must be an array of ${SPECTRAL_WINDOW_COUNT} windows`)
+  }
+  for (const window of value) {
+    if (!window || typeof window !== 'object') {
+      throw new Error(`${label}.spectralWindows must contain finite numbers`)
+    }
+    for (const field of SPECTRAL_WINDOW_SCALAR_FIELDS) {
+      if (!Number.isFinite((window as SpectralWindow)[field])) {
+        throw new Error(`${label}.spectralWindows.${field} must contain finite numbers`)
+      }
+    }
+  }
+  return value as SpectralWindow[]
+}
 
 /** Pearson correlation, so a shape match scores high regardless of overall level. */
 function correlation(left: readonly number[], right: readonly number[]): number {
@@ -194,6 +274,35 @@ function bandsDetail(reference: readonly number[], candidate: readonly number[])
   }
 }
 
+/**
+ * Mean absolute octave difference between the two centroid trajectories. A per-window
+ * Pearson correlation would be the obvious mirror of `envelopeDetail`, but four points of
+ * a *steady* tone's centroid have no variance to correlate, so two identical steady sounds
+ * would have scored 0.5. An octave distance scores those 1 and still separates a falling
+ * trajectory from a rising one with the same mean.
+ */
+function brightnessDetail(
+  reference: readonly SpectralWindow[],
+  candidate: readonly SpectralWindow[]
+): AudioMetricComparisonDetail {
+  const mean = (windows: readonly SpectralWindow[]) =>
+    windows.reduce((sum, window) => sum + window.spectralCentroidHz, 0) / windows.length
+  let absoluteError = 0
+  for (let index = 0; index < reference.length; index++) {
+    const left = Math.max(0, reference[index].spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
+    const right = Math.max(0, candidate[index].spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
+    absoluteError += Math.abs(Math.log2(right / left))
+  }
+  const referenceMean = mean(reference)
+  const candidateMean = mean(candidate)
+  return {
+    reference: referenceMean,
+    candidate: candidateMean,
+    delta: candidateMean - referenceMean,
+    similarity: exponentialSimilarity(absoluteError / reference.length, BRIGHTNESS_SCALE_OCTAVES)
+  }
+}
+
 function envelopeDetail(reference: readonly number[], candidate: readonly number[]): AudioMetricComparisonDetail {
   const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
   const identical = reference.every((value, index) => value === candidate[index])
@@ -220,6 +329,7 @@ export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMet
     }
     assertEnvelopeDb(label, metrics.envelopeDb)
     assertBandsDb(label, metrics.bandsDb)
+    assertSpectralWindows(label, metrics.spectralWindows)
   }
   for (const key of metricKeys) {
     if (key === 'decayT60Ms') continue
@@ -256,10 +366,14 @@ export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMet
     stereoWidth: detail('stereoWidth', exponentialSimilarity(candidate.stereoWidth - reference.stereoWidth, 0.35)),
     decayT60Ms: decayDetail(reference.decayT60Ms, candidate.decayT60Ms, logRatio),
     envelope: envelopeDetail(reference.envelopeDb, candidate.envelopeDb),
-    bands: bandsDetail(reference.bandsDb, candidate.bandsDb)
+    bands: bandsDetail(reference.bandsDb, candidate.bandsDb),
+    brightness: brightnessDetail(reference.spectralWindows, candidate.spectralWindows)
   }
 
-  const overallKeys = [...metricKeys.filter(key => key !== 'clippingCount'), 'envelope' as const, 'bands' as const]
+  const overallKeys = [
+    ...metricKeys.filter(key => key !== 'clippingCount'),
+    'envelope' as const, 'bands' as const, 'brightness' as const
+  ]
   const similarity = overallKeys.reduce((sum, key) => sum + details[key].similarity, 0) / overallKeys.length
   return { similarity: clampSimilarity(similarity), details }
 }
@@ -483,22 +597,23 @@ function measureDecayT60Ms(envelope: Envelope, startIndex: number, level: number
 }
 
 /**
- * Hann-windowed power spectrum summed over channels; index 0 is DC. Tiles the whole buffer
- * unless `singleWindowStart` asks for one window at a given offset.
+ * Hann-windowed power spectrum summed over channels; index 0 is DC. Tiles `[begin, end)`
+ * unless `singleWindowStart` asks for one window at a given offset inside it.
  */
 function accumulateSpectrum(
   channels: readonly Float32Array[],
-  length: number,
+  begin: number,
+  end: number,
   fftSize: number,
   singleWindowStart?: number
 ): Float64Array {
   const starts: number[] = []
   if (singleWindowStart !== undefined) {
-    starts.push(Math.max(0, Math.min(singleWindowStart, length - fftSize)))
+    starts.push(Math.max(begin, Math.min(singleWindowStart, end - fftSize)))
   } else {
-    for (let start = 0; start + fftSize <= length; start += fftSize) starts.push(start)
-    const finalStart = length - fftSize
-    if (starts[starts.length - 1] !== finalStart) starts.push(finalStart)
+    for (let start = begin; start + fftSize <= end; start += fftSize) starts.push(start)
+    const finalStart = end - fftSize
+    if (starts.length === 0 || starts[starts.length - 1] !== finalStart) starts.push(finalStart)
   }
 
   const spectrum = new Float64Array(fftSize / 2 + 1)
@@ -559,33 +674,35 @@ function measureBands(spectrum: Float64Array, binHz: number, totalPower: number)
   }
   return bandPower.map(power => {
     const db = power > 0 ? 10 * Math.log10(power / totalPower) : BAND_FLOOR_DB
-    return roundDb(Math.max(BAND_FLOOR_DB, db))
+    return roundTenth(Math.max(BAND_FLOOR_DB, db))
   })
 }
 
-/**
- * Locate the first 12 partials by peak-picking ±3 % around the predicted partial and fit
- * the stiffness coefficient B of `f_n = n·f0·√(1 + B·n²)`. The prediction carries the B
- * implied by the partials already found, so the window tracks the series as it stretches.
- *
- * The window is taken at the envelope peak and is as long as the buffer allows (up to
- * 32768 samples), because a decaying note only holds its partials near the onset and
- * because B is only visible with sub-bin frequency accuracy — hence the parabolic
- * interpolation over log magnitudes.
- */
-function analyzeHarmonics(
-  channels: readonly Float32Array[],
-  length: number,
-  sampleRate: number,
-  f0Hz: number,
-  peakSampleIndex: number
-): HarmonicMetrics | undefined {
-  if (!Number.isFinite(f0Hz) || f0Hz <= 0) return undefined
-  let size = 1
-  while ((size << 1) <= Math.min(length, 32768)) size <<= 1
-  if (size < 256) return undefined
+interface Partial {
+  frequency: number
+  amplitude: number
+}
 
-  const spectrum = accumulateSpectrum(channels, length, size, peakSampleIndex)
+/** Stand-in for a slice whose spectrum held no energy at all. */
+const SILENT_PARTIALS: readonly Partial[] =
+  Array.from({ length: HARMONIC_COUNT }, () => ({ frequency: 0, amplitude: 0 }))
+
+/**
+ * Locate the first 12 partials in one power spectrum by peak-picking ±3 % around the
+ * predicted partial. The prediction carries the stiffness B implied by the partials
+ * already found, so the search tracks the series as it stretches. Amplitudes come from
+ * parabolic interpolation over log magnitudes, which is what gives sub-bin frequency
+ * accuracy — the only way B is visible at all.
+ *
+ * `undefined` when the spectrum holds no energy: the caller decides whether that means
+ * "omit the field" or "this slice of the note has gone quiet".
+ */
+function pickPartials(
+  spectrum: Float64Array,
+  size: number,
+  sampleRate: number,
+  f0Hz: number
+): { partials: Partial[]; strongest: number } | undefined {
   const half = size / 2
   const magnitude = new Float64Array(half + 1)
   let strongest = 0
@@ -598,7 +715,7 @@ function analyzeHarmonics(
   const binsPerHz = size / sampleRate
   const logFloor = Math.log(Math.max(strongest * 1e-12, Number.MIN_VALUE))
   const logMagnitude = (bin: number) => magnitude[bin] > 0 ? Math.max(logFloor, Math.log(magnitude[bin])) : logFloor
-  const partials: { frequency: number; amplitude: number }[] = []
+  const partials: Partial[] = []
   // B is tracked as partials are found and steers the search for the next one. A fixed
   // window around n·f0 caps the measurable B at about 4e-4: beyond it the high partials
   // fall outside, the picked bin sits at the window edge, and because the fit weights by
@@ -645,12 +762,46 @@ function analyzeHarmonics(
     }
   }
 
+  return { partials, strongest }
+}
+
+/** Partial amplitudes in dB against a shared reference, floored so a null partial is not -Infinity. */
+const partialsDb = (partials: readonly Partial[], reference: number): number[] =>
+  partials.map(partial => {
+    const db = partial.amplitude > 0 && reference > 0
+      ? 20 * Math.log10(partial.amplitude / reference)
+      : HARMONIC_AMPLITUDE_FLOOR_DB
+    return roundTenth(Math.max(HARMONIC_AMPLITUDE_FLOOR_DB, db))
+  })
+
+/**
+ * Whole-buffer partial amplitudes and the stiffness coefficient B of `f_n = n·f0·√(1 + B·n²)`.
+ *
+ * The analysis window is taken at the envelope peak and is as long as the buffer allows (up
+ * to 32768 samples), because a decaying note only holds its partials near the onset.
+ */
+function analyzeHarmonics(
+  channels: readonly Float32Array[],
+  length: number,
+  sampleRate: number,
+  f0Hz: number,
+  peakSampleIndex: number
+): HarmonicMetrics | undefined {
+  if (!Number.isFinite(f0Hz) || f0Hz <= 0) return undefined
+  let size = 1
+  while ((size << 1) <= Math.min(length, 32768)) size <<= 1
+  if (size < 256) return undefined
+
+  const picked = pickPartials(
+    accumulateSpectrum(channels, 0, length, size, peakSampleIndex),
+    size, sampleRate, f0Hz
+  )
+  if (!picked) return undefined
+  const { partials } = picked
+
   const loudest = partials.reduce((best, partial) => Math.max(best, partial.amplitude), 0)
   if (!(loudest > 0)) return undefined
-  const amplitudesDb = partials.map(partial => {
-    const db = partial.amplitude > 0 ? 20 * Math.log10(partial.amplitude / loudest) : HARMONIC_AMPLITUDE_FLOOR_DB
-    return roundDb(Math.max(HARMONIC_AMPLITUDE_FLOOR_DB, db))
-  })
+  const amplitudesDb = partialsDb(partials, loudest)
 
   // (f_n / (n·f0))² - 1 = B·n², so B is a least-squares fit through the origin.
   let numerator = 0
@@ -669,6 +820,108 @@ function analyzeHarmonics(
     amplitudesDb,
     inharmonicity: Number.isFinite(inharmonicity) ? inharmonicity : 0
   }
+}
+
+/**
+ * Spectral evolution across four equal slices of the buffer, earliest first.
+ *
+ * Every slice is analysed *only* on its own samples - one FFT size, one tile count, chosen
+ * from the shared slice length - so a value can be compared with the same value in the
+ * slice before it. Slices are equal by construction rather than by dividing the buffer at
+ * rounded boundaries: unequal spans would change the tile count and shift the raw partial
+ * amplitudes that `harmonicsDb` compares across slices. The last few samples of a buffer
+ * that does not divide by four are therefore not analysed, which `endMs` states.
+ *
+ * Levels are relative to the loudest slice and partials to the loudest partial in any
+ * slice, so a decay reads as a fall towards the floor instead of every slice reading 0.
+ */
+function measureSpectralWindows(
+  channels: readonly Float32Array[],
+  length: number,
+  sampleRate: number,
+  f0Hz: number | undefined
+): SpectralWindow[] {
+  const span = Math.floor(length / SPECTRAL_WINDOW_COUNT)
+  const bounds = (index: number) => ({
+    startMs: roundTenth(index * span * 1000 / sampleRate),
+    endMs: roundTenth((index + 1) * span * 1000 / sampleRate)
+  })
+  let size = 1
+  while ((size << 1) <= Math.min(span, SPECTRAL_FFT_MAX)) size <<= 1
+  // A one-sample slice has no spectrum; report the timing and zeros rather than throwing.
+  if (span < 2 || size < 2) {
+    return Array.from({ length: SPECTRAL_WINDOW_COUNT }, (_, index) => ({
+      ...bounds(index),
+      spectralCentroidHz: 0,
+      spectralRolloffHz: 0,
+      levelDb: 0
+    }))
+  }
+
+  const binHz = sampleRate / size
+  const wantsHarmonics = f0Hz !== undefined && Number.isFinite(f0Hz) && f0Hz > 0 &&
+    size >= SPECTRAL_WINDOW_MIN_HARMONIC_FFT
+  const measured = Array.from({ length: SPECTRAL_WINDOW_COUNT }, (_, index) => {
+    const begin = index * span
+    const end = begin + span
+    const spectrum = accumulateSpectrum(channels, begin, end, size)
+
+    let weightedPower = 0
+    let totalPower = 0
+    for (let bin = 1; bin < spectrum.length; bin++) {
+      weightedPower += spectrum[bin] * bin * binHz
+      totalPower += spectrum[bin]
+    }
+    let spectralCentroidHz = 0
+    let spectralRolloffHz = 0
+    if (totalPower > 0) {
+      spectralCentroidHz = weightedPower / totalPower
+      let cumulative = 0
+      for (let bin = 1; bin < spectrum.length; bin++) {
+        cumulative += spectrum[bin]
+        if (cumulative >= 0.85 * totalPower) {
+          spectralRolloffHz = bin * binHz
+          break
+        }
+      }
+    }
+
+    let power = 0
+    for (const channel of channels) {
+      for (let i = begin; i < end; i++) power += channel[i] * channel[i]
+    }
+    const rms = Math.sqrt(power / (span * channels.length))
+
+    return {
+      ...bounds(index),
+      spectralCentroidHz,
+      spectralRolloffHz,
+      rms,
+      partials: wantsHarmonics ? pickPartials(spectrum, size, sampleRate, f0Hz as number)?.partials : undefined
+    }
+  })
+
+  const loudestRms = measured.reduce((best, window) => Math.max(best, window.rms), 0)
+  const loudestPartial = measured.reduce(
+    (best, window) => (window.partials ?? []).reduce((inner, partial) => Math.max(inner, partial.amplitude), best),
+    0
+  )
+  // Every slice carries `harmonicsDb` or none does, and none does when no slice held a
+  // partial at all - an absent field beats twelve floor values pretending to be a spectrum.
+  const reportHarmonics = wantsHarmonics && loudestPartial > 0
+
+  return measured.map(({ rms, partials, ...window }) => {
+    const slice: SpectralWindow = {
+      ...window,
+      spectralCentroidHz: roundTenth(window.spectralCentroidHz),
+      spectralRolloffHz: roundTenth(window.spectralRolloffHz),
+      // Mirrors `envelopeDb`: with nothing to be relative to, the level is 0, not the floor.
+      levelDb: loudestRms > 0 ? roundTenth(relativeToPeakDb(rms, loudestRms, ENVELOPE_FLOOR_DB)) : 0
+    }
+    // A slice that fell silent still gets its twelve entries, all at the floor.
+    if (reportHarmonics) slice.harmonicsDb = partialsDb(partials ?? SILENT_PARTIALS, loudestPartial)
+    return slice
+  })
 }
 
 export function analyzeAudio(
@@ -723,7 +976,7 @@ export function analyzeAudio(
 
     envelopeDb = Array.from({ length: ENVELOPE_POINTS }, (_, point) => {
       const index = Math.round(point * (envelopeValues.length - 1) / (ENVELOPE_POINTS - 1))
-      return roundDb(relativeToPeakDb(envelopeValues[index], envelopePeak, ENVELOPE_FLOOR_DB))
+      return roundTenth(relativeToPeakDb(envelopeValues[index], envelopePeak, ENVELOPE_FLOOR_DB))
     })
 
     const silenceFloor = envelopePeak * 10 ** (LOUDNESS_SILENCE_FLOOR_DB / 20)
@@ -745,13 +998,13 @@ export function analyzeAudio(
   }
 
   let fftSize = 1
-  while ((fftSize << 1) <= Math.min(length, 4096)) fftSize <<= 1
+  while ((fftSize << 1) <= Math.min(length, SPECTRAL_FFT_MAX)) fftSize <<= 1
   let spectralCentroidHz = 0
   let spectralRolloffHz = 0
   let spectralFlatness = 0
   let bandsDb = new Array<number>(BAND_COUNT).fill(BAND_FLOOR_DB)
   if (fftSize >= 2 && peak > 0) {
-    const spectrum = accumulateSpectrum(channels, length, fftSize)
+    const spectrum = accumulateSpectrum(channels, 0, length, fftSize)
     const binHz = sampleRate / fftSize
     let weightedPower = 0
     let totalPower = 0
@@ -807,7 +1060,8 @@ export function analyzeAudio(
     loudnessDb,
     bandsDb,
     spectralRolloffHz,
-    spectralFlatness
+    spectralFlatness,
+    spectralWindows: measureSpectralWindows(channels, length, sampleRate, options.f0Hz)
   }
   if (options.f0Hz !== undefined) {
     const peakSampleIndex = Math.round(envelope.peakIndex * hopMs * sampleRate / 1000)
@@ -834,6 +1088,15 @@ export function analyzeAudio(
     Number.isFinite(metrics.harmonics.inharmonicity)
   )) {
     throw new Error('Audio analysis produced nonfinite metric: harmonics')
+  }
+  // After the `harmonics` guard: the two share the peak-picking, so a buffer that overflows
+  // it overflows both, and the narrower message is the more useful one.
+  if (metrics.spectralWindows.length !== SPECTRAL_WINDOW_COUNT || !metrics.spectralWindows.every(window =>
+    SPECTRAL_WINDOW_SCALAR_FIELDS.every(field => Number.isFinite(window[field])) &&
+    (window.harmonicsDb === undefined ||
+      (window.harmonicsDb.length === HARMONIC_COUNT && window.harmonicsDb.every(Number.isFinite)))
+  )) {
+    throw new Error('Audio analysis produced nonfinite metric: spectralWindows')
   }
   if (!Number.isInteger(metrics.clippingCount) || metrics.clippingCount < 0) {
     throw new Error('Audio analysis produced invalid clippingCount; expected a nonnegative integer')
