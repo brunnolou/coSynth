@@ -153,7 +153,13 @@ function digest(result) {
   return Object.keys(out).length ? out : undefined
 }
 
-const EDIT_TOOLS = new Set(['update_parameters', 'set_modulation'])
+// Every tool that changes the sound. `apply_patch` and `set_fx_order` were added to the
+// app after this probe was written, and their absence here made a real eval run report
+// `editsBetweenComparisons: [0,0,0,...]` for an agent that had made 15 successful edits -
+// the run looked like it changed nothing. Anything that mutates the patch belongs here.
+const EDIT_TOOLS = new Set(['update_parameters', 'set_modulation', 'apply_patch', 'set_fx_order'])
+/** EDIT_TOOLS plus the ways a whole patch arrives at once. */
+const MUTATION_TOOLS = new Set([...EDIT_TOOLS, 'load_preset'])
 
 /**
  * Convergence view of the run: the similarity trajectory in call order, and how
@@ -199,10 +205,16 @@ const summarise = () => {
   const calls = log.filter(entry => entry.kind === 'call')
   const failed = calls.filter(entry => !entry.ok)
   const firstOkUpdate = calls.findIndex(entry => entry.tool === 'update_parameters' && entry.ok)
+  // Kept separate from the line above on purpose: the recorded runs in docs/ measured
+  // `update_parameters` specifically, so widening that field would silently make old and
+  // new numbers incomparable. This one answers "how long until the agent changed the sound
+  // at all", which is what the older field was being read as.
+  const firstOkEdit = calls.findIndex(entry => EDIT_TOOLS.has(entry.tool) && entry.ok)
   const discovery = calls.filter(entry => entry.tool === 'get_parameter_schema' || entry.tool === 'get_synth_state')
   return {
     totalCalls: calls.length,
     failedCalls: failed.length,
+    callsToFirstSuccessfulEdit: firstOkEdit === -1 ? null : firstOkEdit + 1,
     // The headline number: how many calls the agent spent before its first
     // parameter change stuck. The plan's target is 1.
     callsToFirstSuccessfulUpdateParameters: firstOkUpdate < 0 ? null : firstOkUpdate + 1,
@@ -222,7 +234,7 @@ const summarise = () => {
     // failure this measures - the agent did the job rather than explaining it.
     teaching: (() => {
       const guides = calls.filter(entry => entry.tool === 'show_ui_guide' && entry.ok)
-      const mutations = calls.filter(entry => ['update_parameters', 'set_modulation', 'load_preset'].includes(entry.tool) && entry.ok)
+      const mutations = calls.filter(entry => MUTATION_TOOLS.has(entry.tool) && entry.ok)
       const firstGuide = calls.findIndex(entry => entry.tool === 'show_ui_guide' && entry.ok)
       return {
         taught: guides.length > 0,
