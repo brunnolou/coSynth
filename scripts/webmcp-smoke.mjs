@@ -58,6 +58,7 @@ function installShim(page) {
 // agent that could not see it concluded playback was not a tool at all.
 const EXPECTED_TOOL_NAMES = [
   'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
+  'set_fx_order', 'apply_patch',
   'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
   'compare_audio', 'suggest_patch', 'save_preset', 'load_preset', 'list_presets',
   'get_ui_targets', 'show_ui_guide',

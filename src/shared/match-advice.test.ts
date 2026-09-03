@@ -1098,6 +1098,34 @@ describe('gated convergence', () => {
     expect(action.paramIds).toEqual(['osc1.morph', 'osc1.wavetable'])
   })
 
+  it('does not move a dist.drive whose own dist.type never reads it', () => {
+    // The same defect one level below the bypass switch. `voice.ts` branches on
+    // `dist.type` FIRST, and its bitcrush branch reads `dist.bits`,
+    // `dist.downsample` and `dist.mix` only - the `gain`/`comp` pair it computes
+    // from the drive belongs to the clip/wavefold branch and is never applied.
+    // So under Bitcrush a drive move is the guaranteed no-op in BOTH directions,
+    // and engaging the section does not rescue it.
+    const tiltDiff = (tilt: number) => {
+      const diff = zeroDiff()
+      diff.harmonics = { deltaDb: Array.from({ length: 12 }, () => 0), tiltDeltaDbPerOctave: tilt, oddEvenDeltaDb: 0, inharmonicityDelta: 0 }
+      return diff
+    }
+    for (const tilt of [-5, 5]) {
+      for (const enabled of [0, 1]) {
+        const patch = defaultPatch({ 'dist.enabled': enabled, 'dist.type': 'Bitcrush', 'dist.drive': 0.4 })
+        const [action] = adviseFromDiff(tiltDiff(tilt), patch, { maxActions: 50 })
+        const label = `tilt=${tilt} enabled=${enabled}`
+        expect(action.finding, label).toContain('Spectral tilt')
+        expect(action.suggested, label).toBeUndefined()
+        expect(action.finding, label).toContain('dist.bits')
+        expect(action.paramIds, label).toEqual(['osc1.morph', 'osc1.wavetable'])
+      }
+    }
+    // A dist.type whose branch does read the drive keeps the ordinary move.
+    const live = defaultPatch({ 'dist.enabled': 1, 'dist.type': 'Wavefold', 'dist.drive': 0.4 })
+    expect(adviseFromDiff(tiltDiff(-5), live)[0].suggested?.id).toBe('dist.drive')
+  })
+
   it('engages a bypassed filter1 only when engaging it can deliver the correction', () => {
     const tooBright = zeroDiff()
     tooBright.brightness = withBrightness([0.9, 0.92, 0.9, 0.91])
@@ -1138,6 +1166,165 @@ describe('gated convergence', () => {
     const diff = zeroDiff()
     diff.pitch.centsError = 700
     expect(adviseFromDiff(diff, defaultPatch())[0].suggested?.id).toBe('osc1.transpose')
+  })
+})
+
+describe('engaging a bypassed filter1', () => {
+  /**
+   * The whole cross-product of {too bright, too dark} x {every filter type},
+   * as a table, because the property being tested is CONDITIONAL and a
+   * conditional property read one case at a time is how the bug got in: the
+   * guard asked "is it too bright?" OR "is it a highpass?" and every too-bright
+   * candidate passed, bypassed highpass included. Engaging a highpass removes
+   * lows and drives the centroid UP, so that enable steered a too-bright patch
+   * further from the reference.
+   *
+   * `enable` is whether the rule should offer to switch filter1 on. It is `true`
+   * on exactly the cells where engaging that type moves the centroid the way
+   * that error needs it moved:
+   *
+   *   too bright (centroid must come DOWN)  ->  lowpass only
+   *   too dark   (centroid must go UP)      ->  highpass only
+   *
+   * Everything else is a REFUSAL, and each refusal is a decision with a reason,
+   * not an unhandled case:
+   *
+   * - Bandpass removes energy on both sides of its cutoff, so it drags the
+   *   centroid TOWARDS the cutoff - up from below, down from above. Notch
+   *   removes a band around the cutoff and splits the same way. Answering
+   *   either needs the candidate's ABSOLUTE centroid, and `MatchDiff.brightness`
+   *   carries `octaveDelta`, an error against the reference, and nothing else.
+   *   Not "unclassified pending more work": the fact needed to classify it is
+   *   not in the contract this module reads.
+   * - The comb in `worklet/dsp.ts` is `y = x + damped_delay * fb`, which ADDS a
+   *   resonant series rather than only attenuating, and its peaks track the
+   *   cutoff. The formant bank swaps the spectrum for three vowel resonances
+   *   placed by the cutoff. Neither has a direction that holds for every cutoff.
+   */
+  const FILTER_TYPE_EXPECTATIONS: ReadonlyArray<{ type: string; tooBright: boolean; tooDark: boolean }> = [
+    { type: 'LP 12', tooBright: true, tooDark: false },
+    { type: 'LP 24', tooBright: true, tooDark: false },
+    { type: 'HP 12', tooBright: false, tooDark: true },
+    { type: 'HP 24', tooBright: false, tooDark: true },
+    { type: 'BP 12', tooBright: false, tooDark: false },
+    { type: 'BP 24', tooBright: false, tooDark: false },
+    { type: 'Notch', tooBright: false, tooDark: false },
+    { type: 'Comb', tooBright: false, tooDark: false },
+    { type: 'Formant', tooBright: false, tooDark: false }
+  ]
+
+  /** Every action `filter-cutoff-static` produced: it is the only rule declaring `filter1.enabled`. */
+  function staticCutoffActions(dark: boolean, patch: PatchValues): MatchAction[] {
+    const diff = zeroDiff()
+    const d = dark ? -0.9 : 0.9
+    // Flat across the windows, so this is the static-cutoff rule's territory and
+    // the trend rule stays under its own silence threshold.
+    diff.brightness = withBrightness([d, d + 0.02, d, d + 0.01])
+    return adviseFromDiff(diff, patch, { maxActions: 50 }).filter(a => a.paramIds.includes('filter1.enabled'))
+  }
+
+  it('answers the four cases that decide the guard', () => {
+    // The whole conditional, in four rows, asserting nothing but whether the
+    // enable is offered. Row 2 is the regression: the guard used to read
+    // `tooBright || isHighpass`, so every too-bright candidate passed on the
+    // first term alone and a bypassed HIGHPASS got offered the switch -
+    // engaging it removes lows, lifts the centroid, and makes the measured
+    // error larger.
+    const CASES = [
+      { type: 'LP 24', dark: false, enable: true },  // engaging darkens: correct
+      { type: 'HP 24', dark: false, enable: false }, // engaging brightens: the bug
+      { type: 'HP 24', dark: true, enable: true },
+      { type: 'LP 24', dark: true, enable: false }   // already correct; keep it correct
+    ]
+    for (const { type, dark, enable } of CASES) {
+      const patch = defaultPatch({ 'filter1.enabled': 0, 'filter1.type': type })
+      const actions = staticCutoffActions(dark, patch)
+      const offered = actions.some(a => a.suggested?.id === 'filter1.enabled')
+      expect(offered, `${type}, too ${dark ? 'dark' : 'bright'}`).toBe(enable)
+    }
+  })
+
+  it('covers every filter type params.ts declares', () => {
+    // Pins the table to the registry: a tenth filter type fails HERE, loudly,
+    // rather than falling into whichever branch happens to catch it.
+    expect(FILTER_TYPE_EXPECTATIONS.map(e => e.type)).toEqual(PARAM_BY_ID.get('filter1.type')!.choices)
+  })
+
+  it('offers the enable only where engaging that type moves the centroid the right way', () => {
+    for (const { type, tooBright, tooDark } of FILTER_TYPE_EXPECTATIONS) {
+      for (const [dark, shouldEnable] of [[true, tooDark], [false, tooBright]] as const) {
+        const patch = defaultPatch({ 'filter1.enabled': 0, 'filter1.type': type })
+        const actions = staticCutoffActions(dark, patch)
+        const label = `${type}, too ${dark ? 'dark' : 'bright'}, bypassed`
+
+        if (shouldEnable) {
+          expect(actions.map(a => a.suggested?.id), label).toEqual(['filter1.enabled', 'filter1.cutoff'])
+          // Both halves have to be real moves, or the pair is the live-lock.
+          expect(applySuggestions(patch, actions).changed, label).toEqual(['filter1.enabled', 'filter1.cutoff'])
+          // And the cutoff goes the way the error asks: down for a bright
+          // candidate, up for a dark one.
+          const cutoff = actions[1].suggested!
+          expect(dark ? cutoff.to > cutoff.from : cutoff.to < cutoff.from, label).toBe(true)
+          continue
+        }
+
+        // Refusal: ONE finding, no move at all - not an enable, and not the
+        // cutoff move the enable would have unblocked.
+        expect(actions, label).toHaveLength(1)
+        expect(actions[0].suggested, label).toBeUndefined()
+        expect(actions[0].finding, label).toContain(type)
+        expect(actions[0].confidence, label).toBe('low')
+        expect(actions[0].direction, label).toBe(dark ? 'increase' : 'decrease')
+      }
+    }
+  })
+
+  it('leaves an already-engaged filter1 alone, whichever type it is', () => {
+    // The guard governs ENGAGING a bypassed filter. With the filter in circuit
+    // the cutoff move is live for every type, and there is no switch to flip.
+    for (const { type } of FILTER_TYPE_EXPECTATIONS) {
+      for (const dark of [true, false]) {
+        const patch = defaultPatch({ 'filter1.enabled': 1, 'filter1.type': type })
+        const actions = staticCutoffActions(dark, patch)
+        const label = `${type}, too ${dark ? 'dark' : 'bright'}, engaged`
+        expect(actions.map(a => a.suggested?.id), label).toEqual(['filter1.cutoff'])
+        expect(applySuggestions(patch, actions).changed, label).toEqual(['filter1.cutoff'])
+      }
+    }
+  })
+
+  it('names the type and the reason it cannot deliver the correction', () => {
+    // The bug case, in prose: a bypassed highpass under a too-bright candidate.
+    const [bright] = staticCutoffActions(false, defaultPatch({ 'filter1.enabled': 0, 'filter1.type': 'HP 24' }))
+    expect(bright.finding).toContain('HP 24')
+    expect(bright.finding).toMatch(/takes lows away/i)
+    expect(bright.finding).toMatch(/push the centroid UP/i)
+
+    // The mirror, which has always been right and stays right.
+    const [dark] = staticCutoffActions(true, defaultPatch({ 'filter1.enabled': 0, 'filter1.type': 'LP 24' }))
+    expect(dark.finding).toContain('cannot add high content')
+
+    // A type whose direction is a function of the cutoff says exactly that,
+    // rather than picking a side.
+    for (const type of ['BP 24', 'Notch', 'Comb', 'Formant']) {
+      for (const isDark of [true, false]) {
+        const [action] = staticCutoffActions(isDark, defaultPatch({ 'filter1.enabled': 0, 'filter1.type': type }))
+        expect(action.finding, `${type} too ${isDark ? 'dark' : 'bright'}`).toMatch(/not knowable from here/i)
+      }
+    }
+  })
+
+  it('withholds the enable when the patch does not carry filter1.type', () => {
+    // Same tri-state discipline as `switchState`: "I could not read that choice"
+    // is not a filter type, and it is certainly not a direction.
+    const patch: Record<string, number | string> = { ...defaultPatch({ 'filter1.enabled': 0 }) }
+    delete patch['filter1.type']
+    for (const dark of [true, false]) {
+      const actions = staticCutoffActions(dark, patch)
+      expect(actions).toHaveLength(1)
+      expect(actions[0].suggested).toBeUndefined()
+      expect(actions[0].finding).toMatch(/filter1\.type is not readable/i)
+    }
   })
 })
 

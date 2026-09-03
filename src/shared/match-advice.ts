@@ -50,6 +50,16 @@
  *   says in prose where the error really comes from. A finding with no move is
  *   honest; a move that does nothing is not.
  *
+ * Which of the two applies is a question about the SIGN of the error and the
+ * section TOGETHER, never about either on its own. A bypassed highpass is the
+ * right switch for a candidate that is too dark and the wrong one for a
+ * candidate that is too bright, so a guard that tests brightness and filter
+ * type independently gets one of those two cases backwards — it did, and
+ * `filter-cutoff-static` now asks the single conditional question instead.
+ * Where engaging cannot be RELIED ON to deliver what is asked — a bandpass or a
+ * notch, whose direction depends on a cutoff position no `MatchDiff` carries —
+ * the rule states the situation and moves nothing.
+ *
  * `switchState` is deliberately tri-state: `adviseFromDiff(diff, {})` is a
  * supported call, and "I could not read that switch" must never be reported as
  * "that section is bypassed".
@@ -458,6 +468,29 @@ function enableMove(patch: PatchValues, id: string): MatchAction['suggested'] {
 }
 
 /**
+ * The `dist.type` index whose branch in `worklet/voice.ts` never reads
+ * `dist.drive`. Resolved from the parameter's own `choices` rather than written
+ * as a literal, so reordering `DIST_TYPES` cannot silently point this at
+ * Wavefold; `-1` when the label is gone, which matches no index and so makes
+ * `isBitcrush` answer `false` rather than guess.
+ */
+const BITCRUSH_DIST_TYPE = PARAM_BY_ID.get('dist.type')?.choices?.indexOf('Bitcrush') ?? -1
+
+/**
+ * Is `dist.type` the one setting under which `dist.drive` reaches nothing?
+ *
+ * Same shape of trap as a bypass switch, one level deeper: the section can be
+ * fully enabled and the knob still be arithmetically absent from the render,
+ * because the branch that runs never reads it. Unknown reads `false` — the
+ * tri-state discipline again, "I could not read that choice" is not "it is
+ * Bitcrush".
+ */
+function isBitcrush(patch: PatchValues): boolean {
+  const t = patchRaw(patch, 'dist.type')
+  return t !== undefined && Math.round(t) === BITCRUSH_DIST_TYPE
+}
+
+/**
  * A multiplicative probe factor that SHRINKS with the error.
  *
  * Returns `1` at zero error and `1 + maxExtra` once `|error|` reaches `scale`,
@@ -490,8 +523,58 @@ const MIN_SPREADING_UNISON = 3
 /** Where the detune probe starts when `osc1.detune` sits at zero and a ratio has no purchase. */
 const MIN_DETUNE_PROBE_CENTS = 4
 
-/** `FILTER_TYPES` indices whose cutoff raises the spectral centroid by removing lows. */
-const HIGHPASS_FILTER_TYPES: ReadonlySet<number> = new Set([2, 3])
+/**
+ * Which way ENGAGING a bypassed filter moves the spectral centroid, per
+ * `FILTER_TYPES` index, plus the one clause that says why.
+ *
+ * `shift` is `1` for up, `-1` for down, and `null` where the answer depends on
+ * where the cutoff sits and this module cannot find out. `null` is a VERDICT,
+ * not a gap: `MatchDiff.brightness` carries `octaveDelta`, a signed error
+ * against the reference, and never an absolute centroid, so "is the cutoff
+ * above or below the spectrum this filter would act on" is a question the
+ * contract this module reads cannot answer. Guessing it is exactly the
+ * confidently wrong move the bypass branch exists to withhold.
+ *
+ * Read off `worklet/dsp.ts` (`VoiceFilter.process`), which maps indices 0-1 to
+ * the SVF lowpass mode, 2-3 to highpass, 4-5 to bandpass, 6 to notch, 7 to a
+ * feedback comb and 8 to a three-band formant bank.
+ *
+ * A missing entry - an out-of-range index, or a type appended to `params.ts`
+ * and not classified here - reads as `undefined`, which is neither `1` nor
+ * `-1`, so an unclassified filter fails SAFE: the caller withholds.
+ */
+const FILTER_CENTROID_EFFECT: readonly { shift: 1 | -1 | null; why: string }[] = [
+  { shift: -1, why: 'a lowpass only ever takes highs away, so it can only pull the centroid DOWN' },
+  { shift: -1, why: 'a lowpass only ever takes highs away, so it can only pull the centroid DOWN' },
+  { shift: 1, why: 'a highpass only ever takes lows away, so it can only push the centroid UP' },
+  { shift: 1, why: 'a highpass only ever takes lows away, so it can only push the centroid UP' },
+  { shift: null, why: 'a bandpass removes energy on BOTH sides of its cutoff, so it drags the centroid towards that cutoff - up from below it, down from above it - and this diff carries a brightness DELTA rather than an absolute centroid, so which side the cutoff falls on is not knowable from here' },
+  { shift: null, why: 'a bandpass removes energy on BOTH sides of its cutoff, so it drags the centroid towards that cutoff - up from below it, down from above it - and this diff carries a brightness DELTA rather than an absolute centroid, so which side the cutoff falls on is not knowable from here' },
+  { shift: null, why: 'a notch removes a band around its cutoff, so the centroid moves whichever way that band was weighted, and a brightness DELTA says nothing about where the band lands - not knowable from here' },
+  { shift: null, why: 'a feedback comb ADDS a resonant series rather than only attenuating, and its peaks and nulls follow the cutoff, so its net effect on the centroid is not knowable from here' },
+  { shift: null, why: 'the formant bank replaces the spectrum with three vowel resonances placed by the cutoff, so whether that lands above or below the current centroid is not knowable from here' }
+]
+
+/**
+ * What engaging `id`'s filter would do to the centroid, with the label to call
+ * it by, or `undefined` when the patch does not carry the type.
+ *
+ * Tri-state for the same reason `switchState` is: "I could not read that
+ * choice" must never be reported as a filter type, and it must never be
+ * treated as one either.
+ */
+function filterCentroidEffect(
+  patch: PatchValues,
+  id: string
+): { label: string; shift: 1 | -1 | null; why: string } | undefined {
+  const raw = patchRaw(patch, id)
+  if (raw === undefined) return undefined
+  const index = Math.round(raw)
+  const effect = FILTER_CENTROID_EFFECT[index]
+  const label = PARAM_BY_ID.get(id)?.choices?.[index] ?? `type ${index}`
+  if (!effect) return { label, shift: null, why: `${label} is a filter type this advisor has never classified, so which way engaging it moves the centroid is not knowable from here` }
+  return { label, ...effect }
+}
 
 // ------------------------------------------------------------------ rules
 
@@ -661,6 +744,23 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const driveMove = suggest(patch, 'dist.drive', from => from - tilt * 0.05)
       const dist = switchState(patch, 'dist.enabled')
 
+      // `dist.enabled` is not the only thing that can make `dist.drive` inert.
+      // `voice.ts` branches on `dist.type` FIRST, and its bitcrush branch reads
+      // `dist.bits`, `dist.downsample` and `dist.mix` and never touches the
+      // drive gain at all — the `gain`/`comp` pair it computes is used only by
+      // the clip/wavefold branch. So under Bitcrush this rule's one
+      // quantitative move is the same guaranteed no-op the bypass produces,
+      // in BOTH directions, and no amount of enabling the section fixes it.
+      if (isBitcrush(patch)) {
+        return {
+          error: tilt,
+          finding: `${headline} dist.type is Bitcrush, whose branch in voice.ts never reads dist.drive - that quantizer is driven by dist.bits and dist.downsample alone - so a drive move changes nothing here, whichever way it goes.${dist === 'off' ? ' The section is bypassed on top of that, so none of it reaches the render.' : ''} ${darker ? 'Fewer dist.bits (or more dist.downsample) adds quantization noise across the top' : 'More dist.bits (or less dist.downsample) takes quantization noise off the top'}, or take the tilt at the oscillator with osc1.wavetable / osc1.morph, or pick a dist.type whose drive does something.`,
+          direction: darker ? 'increase' : 'decrease',
+          confidence: 'medium',
+          paramIds: ['osc1.morph', 'osc1.wavetable']
+        }
+      }
+
       // `dist.enabled` defaults to 0, so on a factory patch this rule's only
       // quantitative move was a guaranteed no-op: drive crept up round after
       // round while the tilt never budged.
@@ -751,21 +851,44 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       // cutoff move this rule has ever suggested is a no-op it will suggest
       // again next round.
       if (switchState(patch, 'filter1.enabled') === 'off') {
-        const type = patchRaw(patch, 'filter1.type')
-        // A filter only ever REMOVES energy. Engaging a lowpass, bandpass or
-        // notch can therefore only make a dark candidate darker; only a highpass
-        // raises the centroid, by taking lows away. So the enable move is
-        // offered when it can actually deliver the correction, and withheld —
-        // along with the inert cutoff move — when it cannot.
-        const engagingCanHelp = !dark || (type !== undefined && HIGHPASS_FILTER_TYPES.has(Math.round(type)))
-        const enable = engagingCanHelp ? enableMove(patch, 'filter1.enabled') : undefined
+        // ONE question, asked once: does engaging THIS filter type move the
+        // centroid the way THIS error needs it moved?
+        //
+        // Asking the two halves independently — "is it too bright" OR "is it a
+        // highpass" — is what made this wrong. Too bright counted as reason
+        // enough on its own, so a bypassed HIGHPASS was offered to a too-bright
+        // candidate; engaging that highpass takes lows away, pushes the centroid
+        // further UP, and steers the patch away from the reference. The relation
+        // is CONDITIONAL ON DIRECTION, so the guard has to be too:
+        //
+        // - too bright, centroid must come DOWN -> only a lowpass delivers it
+        // - too dark, centroid must go UP       -> only a highpass delivers it
+        //
+        // Everything else — bandpass, notch, comb, formant, an unreadable type,
+        // a type this table has not classified — moves the centroid a way that
+        // depends on the cutoff, and `FILTER_CENTROID_EFFECT` explains why the
+        // cutoff's position is not knowable from a `MatchDiff`. Those get the
+        // finding with no move at all, which is what the bypassed-lowpass case
+        // has always got.
+        const wantedShift = dark ? 1 : -1
+        const type = filterCentroidEffect(patch, 'filter1.type')
+        const enable = type?.shift === wantedShift ? enableMove(patch, 'filter1.enabled') : undefined
         if (!enable) {
+          // A lowpass in front of a dark candidate is the one case with a
+          // sharper thing to say than "it depends": no filter of any kind adds
+          // content the source never produced.
+          const cannot = type === undefined
+            ? 'filter1.type is not readable in this patch, so there is no telling which way engaging the filter would move the centroid'
+            : `engaging filter1.type ${type.label} cannot deliver it: ${type.why}${type.shift === null ? '' : ', the opposite of what this error asks for'}`
+          const elsewhere = dark
+            ? 'A filter cannot add high content that is not there: the darkness is upstream, in osc1.wavetable / osc1.morph, or in dist.drive with dist.enabled on.'
+            : 'Take the brightness out upstream instead, at osc1.wavetable / osc1.morph or at dist.drive.'
           return {
             error: m,
-            finding: `${headline} filter1 is bypassed (filter1.enabled is 0), so filter1.cutoff is inert, and engaging a lowpass or bandpass can only take MORE brightness away. A filter cannot add high content that is not there: the darkness is upstream, in osc1.wavetable / osc1.morph, or in dist.drive with dist.enabled on.`,
-            direction: 'increase',
+            finding: `${headline} filter1 is bypassed (filter1.enabled is 0), so filter1.cutoff is inert, and ${cannot}. ${elsewhere} If a filter is where you want to do this, set filter1.type to a ${dark ? 'highpass' : 'lowpass'} first and this rule will offer the switch.`,
+            direction: dark ? 'increase' : 'decrease',
             confidence: 'low',
-            paramIds: ['filter1.enabled', 'filter1.cutoff']
+            paramIds: ['filter1.enabled', 'filter1.cutoff', 'filter1.type']
           }
         }
         return [
@@ -835,7 +958,7 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const factor = dampedFactor(trend, BRIGHTNESS_TREND_SCALE, 0.5)
       return {
         error: trend,
-        finding: `Brightness error drifts ${n1(Math.abs(trend))} octaves across the buffer (${n1(first)} in the first window, ${n1(last)} in the last), so the candidate ${tooFast ? 'darkens too fast' : 'holds its brightness too long'}. This is envelope shape, not static cutoff: ${tooFast ? 'lengthen env2.decay / raise env2.sustain, or reduce' : 'shorten env2.decay / lower env2.sustain, or increase'} the depth of the env2 -> filter1.cutoff mod slot (set_modulation). That mod slot is the REAL fix and has no parameter id, so it can never appear as a suggested move; env2 reaches the sound through it and nothing else, and if the route does not exist in this patch then env2.decay is inert and set_modulation is the whole job. The suggested ${round(factor, 2)}x on env2.decay is a PROBE sized from the error, not a computed correction - apply it, re-measure, expect several rounds.`,
+        finding: `Brightness error drifts ${n1(Math.abs(trend))} octaves across the buffer (${n1(first)} in the first window, ${n1(last)} in the last), so the candidate ${tooFast ? 'darkens too fast' : 'holds its brightness too long'}. This is envelope shape, not static cutoff: ${tooFast ? 'lengthen env2.decay / raise env2.sustain, or reduce' : 'shorten env2.decay / lower env2.sustain, or increase'} the depth of the env2 -> filter1.cutoff mod slot (set_modulation). That mod slot is the REAL fix and has no parameter id, so it can never appear as a suggested move; env2 reaches the sound through it and nothing else, and if the route does not exist in this patch then env2.decay is inert and set_modulation is the whole job. The direction above assumes that slot has POSITIVE depth, the usual wiring: a mod slot carries no parameter id, so its sign is as unreadable from here as its existence, and with an inverted slot the same move lengthens the wrong stage. The suggested ${round(factor, 2)}x on env2.decay is a PROBE sized from the error, not a computed correction - apply it, re-measure, expect several rounds.`,
         direction: tooFast ? 'increase' : 'decrease',
         // The env -> cutoff route may not even exist in the patch, the step is
         // a probe rather than a fit, and the trend can also come from an
@@ -870,12 +993,17 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       // guaranteed no-op — and the finding did not even mention the bypass.
       // Unlike the filter, an EQ shelf cuts AND boosts, so engaging it serves
       // either sign of the error; the switch is always the right first move.
+      // That is what makes this rule's guard unconditional where
+      // `filter-cutoff-static`'s has to be conditional on the sign: `eq.high_gain`
+      // spans -18..18 dB around a 4 kHz high shelf (`Eq3` in `worklet/effects.ts`,
+      // the same 4 kHz this rule measures from), so the direction it can deliver
+      // is not a function of the error's direction.
       const enable = switchState(patch, 'eq.enabled') === 'off' ? enableMove(patch, 'eq.enabled') : undefined
       if (enable) {
         return [
           {
             error: upper,
-            finding: `${headline} The EQ is bypassed (eq.enabled is 0), so eq.high_gain is inert until this switch is on - that is what this action is. It is a no-op on its own unless the companion action moves the gain, so apply both.`,
+            finding: `${headline} The EQ is bypassed (eq.enabled is 0), so eq.high_gain is inert until this switch is on - that is what this action is. On its own it also puts eq.low_gain and eq.mid_gain into circuit at whatever they are already holding, so it is a no-op only while all three sit at 0 dB; the companion action sets the high shelf, so apply both.`,
             direction: 'increase',
             confidence: 'high',
             suggested: enable,
