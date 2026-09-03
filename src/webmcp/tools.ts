@@ -4,13 +4,16 @@ import {
   PARAMS, PARAM_GROUP_NOTES, defaultNorm, formatValue, normToValue, paramIndex, valueToNorm,
   type ParamDef
 } from '../shared/params'
-import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type ModSlotState, type ModSourceDef } from '../shared/messages'
+import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type FxId, type ModSlotState, type ModSourceDef } from '../shared/messages'
+import { describeMidi, toMidi, type NoteInput } from '../shared/note-input'
+import { midiToHz } from '../shared/notes'
+import { FACTORY_PRESETS, getFactoryPreset, listFactoryPresetNames } from '../shared/factory-presets'
 import { analyzeAudio, compareAudioMetrics, type AnalyzeAudioOptions, type AudioMetrics, type AudioMetricsComparison } from '../shared/audio-analysis'
 import { diffAudioMetrics } from '../shared/match-diff'
 import { adviseFromDiff, type AdviceCategory, type PatchValues } from '../shared/match-advice'
 import { formatDiff, formatMetrics } from '../shared/metrics-format'
 import type { MatchDiff } from '../shared/match-types'
-import { listPresets, loadPreset, savePreset, validatePresetData, validatePresetName } from '../shared/preset-store'
+import { listPresets, loadPreset, savePreset, validatePresetName } from '../shared/preset-store'
 import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
 import { analyzeAudioAbortably } from './audio-analysis-task'
 import { BASE64_MAX_SECONDS, monoWavBase64, offlineRenderAvailable, renderOffline, type OfflineRenderer } from './offline-render'
@@ -366,16 +369,139 @@ function assertRenderFormat(value: unknown): RenderFormat {
 }
 
 /**
- * A single-pitch sequence knows its own fundamental, so it is STATED rather
- * than measured (`pitch.source: "given"`). Anything else is left to detection,
- * which is on by default: a chord is then analysed exactly as an uploaded chord
- * would be, and `pitch.source`/`pitch.confidence` say how the number was got.
+ * The one pitch a sequence holds, or `null` when it holds none or several.
+ *
+ * This used to feed `analysisOptionsFor`, which handed that pitch to the analyzer
+ * as `f0Hz` - and `resolvePitch` takes a supplied `f0Hz` as `source: 'given'` at
+ * `confidence: 1` without reading a sample. The number was therefore the note ASKED
+ * FOR, never the note produced: `osc1.transpose`, `osc1.fine` or a mod route on
+ * either moves the render off that frequency and nothing said so. It is the same
+ * defect `candidateAnalysisOptions` describes for `compare_audio`, and it leaked
+ * back in through `compare_audio({autoRender: false})`, which scores whatever
+ * `render_audio` last measured. So nothing is stated any more; the pitch of a render
+ * is measured from the render, and this only says what was requested so the two can
+ * be shown side by side (`pitchCheck`).
  */
-function analysisOptionsFor(notes: readonly { midi: number }[]): { f0Hz?: number } {
+function singlePitch(notes: readonly { midi: number }[]): number | null {
   const pitches = new Set(notes.map(note => note.midi))
-  if (pitches.size !== 1) return {}
+  if (pitches.size !== 1) return null
   const [midi] = [...pitches]
-  return { f0Hz: 440 * Math.pow(2, (midi - 69) / 12) }
+  return midi
+}
+
+/** Distinct pitches echoed back, beyond which the list is summarised rather than printed. */
+const MAX_ECHOED_PITCHES = 12
+
+/**
+ * What the tool understood the notes to be, in words: `"D2 (MIDI 38, 73.4 Hz)"`.
+ *
+ * Returned by every tool that takes notes. A session measured a 37 Hz reference,
+ * wrote "D1", passed `midi: 38` - which is D2 at 73.4 Hz - and nothing in any
+ * response contradicted it, so an octave error survived the whole run while the
+ * scalar metrics stayed plausible. Reading the interpretation back in the same turn
+ * is what makes that visible while it can still be corrected.
+ */
+function pitchEcho(notes: readonly { midi: number }[]): { pitches: string[]; morePitches?: number } {
+  const distinct = [...new Set(notes.map(note => note.midi))]
+  const shown = distinct.slice(0, MAX_ECHOED_PITCHES)
+  return {
+    pitches: shown.map(describeMidi),
+    ...(distinct.length > shown.length ? { morePitches: distinct.length - shown.length } : {})
+  }
+}
+
+/** Cents beyond which a render is called detuned from the note that was asked for. */
+const PITCH_CHECK_CENTS = 25
+
+/**
+ * The requested note against the measured one, for a single-pitch render.
+ *
+ * The point of measuring rather than stating: a patch with `osc1.transpose: 12`
+ * renders an octave above the note named in the call, and this is where that shows
+ * up as a number instead of being absorbed into a `source: "given"` claim.
+ */
+function pitchCheckFor(midi: number, metrics: AudioMetrics) {
+  const requestedHz = midiToHz(midi)
+  const measured = metrics.pitch
+  if (!measured) {
+    return {
+      requested: describeMidi(midi),
+      measured: null,
+      note: 'No fundamental was measured in this render, so nothing here confirms it sounded at the note requested. An unpitched or near-silent patch reads this way; so does a render too short for detection.'
+    }
+  }
+  const cents = Math.round(1200 * Math.log2(measured.f0Hz / requestedHz))
+  const detuned = Math.abs(cents) >= PITCH_CHECK_CENTS
+  return {
+    requested: describeMidi(midi),
+    measured: {
+      f0Hz: clean(measured.f0Hz),
+      note: describeMidi(measured.midi),
+      centsOffset: clean(measured.centsOffset),
+      confidence: clean(measured.confidence),
+      source: measured.source
+    },
+    centsFromRequested: cents,
+    note: detuned
+      ? `This render sounds ${Math.abs(cents)} cents ${cents > 0 ? 'above' : 'below'} ${describeMidi(midi)} — the patch itself moves it (osc transpose/fine, or a mod route on either). Every metric below describes what was rendered, not what was requested.`
+      : 'The render sounds at the note requested, measured from its own samples rather than assumed.'
+  }
+}
+
+/**
+ * Normalize `{note: "D2"}` to `{midi: 38}` before `validatePerformanceNotes`, which
+ * accepts exactly `{midi, velocity, start, duration}` and rejects anything else.
+ *
+ * The parsing itself belongs to `note-input.ts` and stays there. What is here is the
+ * per-note bookkeeping the tool layer owns: exactly one of the two spellings, and an
+ * error that names the offending index.
+ */
+function resolveNoteInputs(value: unknown, label = 'notes'): unknown {
+  if (!Array.isArray(value)) return value
+  return value.map((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item
+    const note = item as Record<string, unknown>
+    const hasName = 'note' in note
+    const hasMidi = 'midi' in note
+    if (hasName && hasMidi) {
+      throw new Error(`${label}[${index}] has both 'midi' and 'note'. Pass exactly one — they are two spellings of the same field, and a disagreement between them is the octave error this accepts note names to prevent.`)
+    }
+    if (!hasName && !hasMidi) {
+      throw new Error(`${label}[${index}] needs a pitch: either 'midi' (an integer 0..127) or 'note' (a name with an octave, e.g. "D2").`)
+    }
+    if (!hasName) return item
+    const { note: name, ...rest } = note
+    try {
+      return { ...rest, midi: toMidi(name as NoteInput) }
+    } catch (error) {
+      throw new Error(`${label}[${index}].note: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+}
+
+/**
+ * How much buffer `compare_audio` leaves after note-off when it picks the note itself.
+ *
+ * The auto-render used to hold the note for the whole buffer: note-on at 0, note-off
+ * on the last sample. The candidate therefore never entered its release, and three
+ * parts of the diff quietly stopped meaning anything. `decayT60Ms` needs the tail to
+ * fall 20 dB, so it read `null` on every default comparison and `decayT60MsDelta`
+ * reported `n/a`; `sustainDb` is sampled at 80 % of the buffer, so it read a note that
+ * was still sounding against a reference that had already died away; and `loudnessDb`
+ * averaged a held note against a decayed one. A reference is nearly always a one-shot
+ * that has finished by the end of its file, so the candidate has to finish too.
+ *
+ * The rule: the note ends one release tail before the buffer does — 0.25 s, the same
+ * tail `render_audio` adds after a sequence, capped at 40 % of the buffer so a short
+ * reference keeps the majority of its windows on the sounding part of the note. The
+ * buffer length itself is untouched (it stays the reference's duration), because the
+ * spectral windows on both sides have to cover the same span to be comparable.
+ */
+const RELEASE_TAIL_SECONDS = 0.25
+const MAX_RELEASE_TAIL_SHARE = 0.4
+
+function heldSecondsWithin(buffer: number): number {
+  return clean(buffer - Math.min(RELEASE_TAIL_SECONDS, buffer * MAX_RELEASE_TAIL_SHARE))
 }
 
 /** Bounds `AnalyzeAudioOptions.windows` accepts; mirrored here for the schema and the errors. */
@@ -647,17 +773,173 @@ function canonicalRaw(def: ParamDef, value: unknown): number {
 }
 
 const emptySchema = { type: 'object', properties: {}, additionalProperties: false } as const
+
+/**
+ * Said on `note`, in four schemas, so it is kept to one line. The full grammar
+ * ships with every parse failure instead (`ACCEPTED_FORMS` in `note-input.ts`),
+ * where an agent that got it wrong is the one reading it.
+ */
+const NOTE_NAME_DESCRIPTION =
+  'Pitch as a name with an octave: "C4" is MIDI 60, "D2" is 73.4 Hz. Sharps "#", flats "b". Pass this or `midi`, never both.'
+
 const noteSchema = {
   type: 'object',
   properties: {
-    midi: { type: 'integer', minimum: 0, maximum: 127 },
+    midi: { type: 'integer', minimum: 0, maximum: 127, description: 'Pitch as a number. Pass this or `note`, never both.' },
+    note: { type: 'string', minLength: 2, maxLength: 5, description: NOTE_NAME_DESCRIPTION },
     velocity: { type: 'number', minimum: 0, maximum: 1 },
     start: { type: 'number', minimum: 0 },
     duration: { type: 'number', exclusiveMinimum: 0 }
   },
-  required: ['midi', 'velocity', 'start', 'duration'],
+  // `midi` left out of `required` and pinned by `oneOf` instead: an object naming
+  // both matches both branches, which `oneOf` rejects, so the schema says "exactly
+  // one" rather than "at least one". Runtime validation says it again, because a
+  // client that ignores `oneOf` must still get the error rather than a silent pick.
+  required: ['velocity', 'start', 'duration'],
+  oneOf: [{ required: ['midi'] }, { required: ['note'] }],
   additionalProperties: false
 } as const
+
+const PRESET_SOURCES = ['factory', 'user'] as const
+type PresetSource = (typeof PRESET_SOURCES)[number]
+
+/** Factory names as a set, built once: every save and load asks whether one collides. */
+const factoryNames = new Set(listFactoryPresetNames())
+
+function assertPresetSource(value: unknown): PresetSource | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || !PRESET_SOURCES.includes(value as PresetSource)) {
+    throw new Error(`source must be one of ${PRESET_SOURCES.join(', ')}`)
+  }
+  return value as PresetSource
+}
+
+/** User preset names without announcing a load: `loadPreset` notifies, `listPresets` does not. */
+function userPresetNames(): Set<string> {
+  return new Set(listPresets().map(preset => preset.name))
+}
+
+/**
+ * "Not found" that says which space was searched and names the near misses in it.
+ * A bare `Preset not found: X` sent an agent to `list_presets` to find out whether
+ * the name was wrong or the space was.
+ */
+function presetNotFound(name: string, source: PresetSource | undefined): string {
+  const factory = listFactoryPresetNames()
+  const user = [...userPresetNames()]
+  const candidates = source === 'factory' ? factory : source === 'user' ? user : [...factory, ...user]
+  const where = source === 'factory' ? 'among the factory presets'
+    : source === 'user' ? 'among this browser\'s user presets'
+    : 'in either the factory presets or this browser\'s user presets'
+  return `Preset not found ${where}: ${name}.${didYouMean(name, candidates)} list_presets returns every name with its source.`
+}
+
+interface ValidatedParameterUpdate {
+  id: string
+  index: number
+  def: ParamDef
+  raw: number
+  normalized: number
+}
+
+/**
+ * The parameter batch `update_parameters` and `apply_patch` both take.
+ *
+ * Shared rather than mirrored on purpose: two validators that disagree about which
+ * values a parameter accepts would be worse than having only one of the tools, since
+ * the difference would show up as a patch that applies through one call and not the
+ * other. `label` only names the property in the errors.
+ */
+function validateParameterUpdates(value: unknown, label: string): ValidatedParameterUpdate[] {
+  if (!Array.isArray(value) || value.length === 0) throw new Error(`${label} must be a non-empty array`)
+  const seen = new Set<string>()
+  return value.map((item, index) => {
+    const update = assertObject(item, `${label}[${index}]`, ['id', 'value'], ['id', 'value'])
+    if (typeof update.id !== 'string') throw new Error(`${label}[${index}].id must be a string`)
+    const id = update.id
+    const def = PARAMS.find(candidate => candidate.id === id)
+    if (!def) {
+      throw new Error(`Unknown parameter '${id}'.${didYouMean(id, PARAMS.map(candidate => candidate.id))} Groups: ${PARAMETER_GROUPS.join(', ')}`)
+    }
+    if (seen.has(id)) throw new Error(`Duplicate parameter ID: ${id}`)
+    seen.add(id)
+    const raw = canonicalRaw(def, update.value)
+    return { id, index: paramIndex(id), def, raw, normalized: valueToNorm(def, raw) }
+  })
+}
+
+function appliedParameter(update: ValidatedParameterUpdate) {
+  return {
+    id: update.id,
+    raw: update.raw,
+    normalized: clean(update.normalized),
+    formatted: formatValue(update.def, update.normalized)
+  }
+}
+
+/** How the fx chain is named in both schemas that take one; first in the list runs first. */
+const FX_ORDER_DESCRIPTION =
+  `All ${FX_IDS.length} effect ids exactly once, in processing order (default ${FX_IDS.join(', ')}). A missing, repeated or unknown id is an error, not a partial reorder.`
+
+/**
+ * An fx permutation as slot indices. A partial list is refused rather than
+ * completed: "move reverb first" and "the chain is exactly this" would then be the
+ * same call, and the second is the only one whose result an agent can predict.
+ */
+function validateFxOrder(value: unknown, label: string): number[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array of the ${FX_IDS.length} effect ids: ${FX_IDS.join(', ')}`)
+  if (value.length !== FX_IDS.length) {
+    throw new Error(`${label} must list all ${FX_IDS.length} effects exactly once (got ${value.length}). Effects: ${FX_IDS.join(', ')}`)
+  }
+  const seen = new Set<string>()
+  return value.map((entry, index) => {
+    if (typeof entry !== 'string') throw new Error(`${label}[${index}] must be a string`)
+    const slot = FX_IDS.indexOf(entry as FxId)
+    if (slot < 0) throw new Error(`Unknown effect '${entry}'.${didYouMean(entry, FX_IDS)} Effects: ${FX_IDS.join(', ')}`)
+    if (seen.has(entry)) throw new Error(`Duplicate effect '${entry}': ${label} must be a permutation of ${FX_IDS.join(', ')}, each exactly once`)
+    seen.add(entry)
+    return slot
+  })
+}
+
+interface ValidatedRoute {
+  source: number
+  destination: number
+  depth: number
+  enabled?: boolean
+}
+
+/** `apply_patch`'s modulation block, validated with the same helpers `set_modulation` uses. */
+function validateModulationInput(value: unknown): { replace: boolean; routes: ValidatedRoute[] } {
+  const input = assertObject(value, 'modulations', ['replace', 'routes'])
+  if (input.replace !== undefined && typeof input.replace !== 'boolean') throw new Error('modulations.replace must be boolean')
+  const replace = input.replace === true
+  if (input.routes !== undefined && !Array.isArray(input.routes)) throw new Error('modulations.routes must be an array')
+  const raw = (input.routes ?? []) as unknown[]
+  if (raw.length === 0 && !replace) {
+    throw new Error('modulations needs `routes`, or `replace: true` on its own to clear the matrix')
+  }
+  if (raw.length > MAX_MOD_SLOTS) throw new Error(`modulations.routes is limited to ${MAX_MOD_SLOTS} entries`)
+  const seen = new Set<string>()
+  return {
+    replace,
+    routes: raw.map((item, index) => {
+      const label = `modulations.routes[${index}]`
+      const route = assertObject(item, label, ['source', 'destination', 'depth', 'enabled'], ['source', 'destination', 'depth'])
+      const source = assertModSource(route.source)
+      const destination = assertModDestination(route.destination)
+      const depth = finite(route.depth, `${label}.depth`)
+      if (depth < -1 || depth > 1) throw new Error(`${label}.depth must be in range -1..1`)
+      if (route.enabled !== undefined && typeof route.enabled !== 'boolean') throw new Error(`${label}.enabled must be boolean`)
+      const pair = `${source}:${destination}`
+      if (seen.has(pair)) {
+        throw new Error(`Duplicate modulation route ${String(route.source)} -> ${String(route.destination)} at ${label}: one route per source+destination pair, as set_modulation's 'add' resolves it`)
+      }
+      seen.add(pair)
+      return { source, destination, depth, ...(route.enabled === undefined ? {} : { enabled: route.enabled as boolean }) }
+    })
+  }
+}
 
 /** Build WebMCP descriptors over the exact live engine used by the UI. */
 export function createWebMcpTools(
@@ -742,6 +1024,47 @@ export function createWebMcpTools(
 
   function assertPerformanceIdle(action: string): void {
     if (performance.active) throw new Error(`${action} is unavailable while a performance is in progress`)
+  }
+
+  /**
+   * Where `apply_patch`'s routes will land, decided against a COPY of the matrix
+   * before a single slot is written.
+   *
+   * Slot choice is the same rule `set_modulation`'s `add` uses - an existing
+   * source+destination pair is replaced in place, otherwise the first free slot -
+   * so a route means the same thing through either tool. Resolving it on a copy is
+   * what makes "the matrix is full" a validation error instead of a partial apply:
+   * `set_modulation` can only discover it on the route that overflows, after the
+   * earlier ones have already been written.
+   */
+  function planModulations(input: { replace: boolean; routes: ValidatedRoute[] } | null) {
+    if (!input) return null
+    const simulated: (ModSlotState | null)[] = engine.modSlots.map(route => route ? { ...route } : null)
+    const clearSlots: number[] = []
+    if (input.replace) {
+      simulated.forEach((route, slot) => {
+        if (route) {
+          clearSlots.push(slot)
+          simulated[slot] = null
+        }
+      })
+    }
+    const assignments = input.routes.map(route => {
+      const existing = simulated.findIndex(candidate => candidate?.source === route.source && candidate.dest === route.destination)
+      const slot = existing >= 0 ? existing : simulated.findIndex(candidate => candidate === null)
+      if (slot < 0) {
+        throw new Error(`Modulation matrix is full: ${MOD_SOURCES[route.source].id} -> ${PARAMS[route.destination].id} needs a slot and all ${MAX_MOD_SLOTS} are taken. Nothing was applied. Free one with set_modulation({"action":"remove",...}), or pass modulations.replace: true to rebuild the matrix from these routes alone.`)
+      }
+      const state: ModSlotState = {
+        source: route.source,
+        dest: route.destination,
+        depth: route.depth,
+        enabled: route.enabled ?? simulated[slot]?.enabled ?? true
+      }
+      simulated[slot] = state
+      return { slot, state }
+    })
+    return { clearSlots, assignments, totalAfter: simulated.filter(Boolean).length }
   }
 
   function scopeCandidate(options: AnalyzeAudioOptions = {}) {
@@ -1089,30 +1412,9 @@ export function createWebMcpTools(
       execute(input) {
         assertPerformanceIdle('Parameter updates')
         const value = assertObject(input, 'input', ['updates'], ['updates'])
-        if (!Array.isArray(value.updates) || value.updates.length === 0) throw new Error('updates must be a non-empty array')
-        const seen = new Set<string>()
-        const validated = value.updates.map((item, index) => {
-          const update = assertObject(item, `updates[${index}]`, ['id', 'value'], ['id', 'value'])
-          if (typeof update.id !== 'string') throw new Error(`updates[${index}].id must be a string`)
-          const id = update.id
-          const def = PARAMS.find(candidate => candidate.id === id)
-          if (!def) {
-            throw new Error(`Unknown parameter '${id}'.${didYouMean(id, PARAMS.map(candidate => candidate.id))} Groups: ${PARAMETER_GROUPS.join(', ')}`)
-          }
-          if (seen.has(id)) throw new Error(`Duplicate parameter ID: ${id}`)
-          seen.add(id)
-          const raw = canonicalRaw(def, update.value)
-          return { id, index: paramIndex(id), def, raw, normalized: valueToNorm(def, raw) }
-        })
+        const validated = validateParameterUpdates(value.updates, 'updates')
         for (const update of validated) engine.setParam(update.index, update.normalized, 'ai')
-        return {
-          applied: validated.map(update => ({
-            id: update.id,
-            raw: update.raw,
-            normalized: clean(update.normalized),
-            formatted: formatValue(update.def, update.normalized)
-          }))
-        }
+        return { applied: validated.map(appliedParameter) }
       }
     },
     {
@@ -1216,8 +1518,277 @@ export function createWebMcpTools(
       }
     },
     {
+      name: 'set_fx_order',
+      description: `Reorder the effects chain — the one patch edit with no parameter behind it, so until now an agent could switch every effect on without being able to say which came first. \`order\` is all ${FX_IDS.length} effect ids exactly once, first processed first; whether an effect does anything is \`<id>.enabled\` in update_parameters. Example: {"order":["fxdist","chorus","phaser","flanger","delay","reverb","eq","comp"]}`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          order: {
+            type: 'array',
+            minItems: FX_IDS.length,
+            maxItems: FX_IDS.length,
+            items: { type: 'string', enum: [...FX_IDS] },
+            description: FX_ORDER_DESCRIPTION
+          }
+        },
+        required: ['order'], additionalProperties: false
+      },
+      annotations: { readOnlyHint: false },
+      execute(input) {
+        assertPerformanceIdle('FX order changes')
+        const value = assertObject(input, 'input', ['order'], ['order'])
+        const order = validateFxOrder(value.order, 'order')
+        const previous = fxOrder(engine).fxOrder
+        // Origin 'ai', like every other agent edit: `activity.ts` records the
+        // `{kind:'fx'}` mutation as a pending change, so the FX rack glows and
+        // Reject restores this exact array through `setFxOrder(change.before,
+        // 'restore')`. A 'human' origin here would apply the change and leave the
+        // human no way to undo it from the AI-changes panel.
+        engine.setFxOrder(order, 'ai')
+        const applied = fxOrder(engine).fxOrder
+        return {
+          fxOrder: applied,
+          previous,
+          changed: previous.join() !== applied.join()
+        }
+      }
+    },
+    {
+      name: 'apply_patch',
+      description: 'Build a whole sound in one call: parameters, modulation routes and FX order applied together, then optionally saved and auditioned. Everything is validated before anything is applied and the patch lands all or nothing, using the same validation `update_parameters` and `set_modulation` use. `dryRun: true` reports what would change and touches nothing. `auditionNotes` RENDERS the result rather than playing it, so it needs no Start gesture. `rollbackId` in the result is the history version that undoes the whole call.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          parameters: {
+            type: 'array', minItems: 1,
+            items: {
+              type: 'object',
+              properties: { id: { type: 'string' }, value: { anyOf: [{ type: 'number' }, { type: 'string' }] } },
+              required: ['id', 'value'], additionalProperties: false
+            },
+            description: 'What `update_parameters` takes: raw-unit values or choice labels.'
+          },
+          modulations: {
+            type: 'object',
+            description: 'Routes as `set_modulation`\'s `add` resolves them. `replace: true` clears the matrix first, so `routes` becomes all of it; on its own it just clears.',
+            properties: {
+              replace: { type: 'boolean' },
+              routes: {
+                type: 'array', maxItems: MAX_MOD_SLOTS,
+                items: {
+                  type: 'object',
+                  properties: {
+                    source: { type: 'string', description: `One of: ${MOD_SOURCE_IDS.join(', ')}.` },
+                    destination: { type: 'string', description: 'Moddable parameter id.' },
+                    depth: { type: 'number', minimum: -1, maximum: 1 },
+                    enabled: { type: 'boolean' }
+                  },
+                  required: ['source', 'destination', 'depth'], additionalProperties: false
+                }
+              }
+            },
+            additionalProperties: false
+          },
+          fxOrder: {
+            type: 'array',
+            minItems: FX_IDS.length,
+            maxItems: FX_IDS.length,
+            items: { type: 'string', enum: [...FX_IDS] },
+            description: FX_ORDER_DESCRIPTION
+          },
+          presetName: {
+            type: 'string', minLength: 1, maxLength: 80,
+            description: 'Save the applied patch under this name, as save_preset would.'
+          },
+          auditionNotes: {
+            type: 'array', minItems: 1, maxItems: MAX_NOTES, items: noteSchema,
+            description: 'Render these against the new patch and return its metrics: the render_audio step without a second round trip.'
+          },
+          dryRun: { type: 'boolean', description: 'Validate and report what would change, applying, saving and rendering nothing.' }
+        },
+        additionalProperties: false
+      },
+      annotations: { readOnlyHint: false },
+      async execute(input, options) {
+        // ---------------------------------------------------------------------
+        // Everything up to the audition is deliberately SYNCHRONOUS, with no
+        // `await` before the last engine write. `register.ts` runs this tool
+        // inside `services.history.runAi(...)`, and `runAi` is synchronous: it
+        // ends its transaction as soon as the callback returns. An `await`
+        // anywhere above the apply would hand back a pending promise, close the
+        // transaction early, and split one patch into a string of separate
+        // history versions attributed to the human. Keep the awaits below the
+        // apply.
+        // ---------------------------------------------------------------------
+        assertPerformanceIdle('Patch changes')
+        const value = assertObject(input, 'input', ['parameters', 'modulations', 'fxOrder', 'presetName', 'auditionNotes', 'dryRun'])
+        if (value.dryRun !== undefined && typeof value.dryRun !== 'boolean') throw new Error('dryRun must be boolean')
+        const dryRun = value.dryRun === true
+
+        // Validate everything first, so a bad mod destination cannot be found out
+        // after the parameters have already moved.
+        const parameters = value.parameters === undefined ? [] : validateParameterUpdates(value.parameters, 'parameters')
+        const modulations = value.modulations === undefined ? null : validateModulationInput(value.modulations)
+        const order = value.fxOrder === undefined ? null : validateFxOrder(value.fxOrder, 'fxOrder')
+        const presetName = value.presetName === undefined ? undefined : validatePresetName(value.presetName)
+        const audition = value.auditionNotes === undefined
+          ? null
+          : validatePerformanceNotes(resolveNoteInputs(value.auditionNotes, 'auditionNotes'), MAX_RENDER_SECONDS)
+        if (parameters.length === 0 && !modulations && !order) {
+          throw new Error('apply_patch needs at least one of parameters, modulations or fxOrder. presetName saves the patch as it already is (save_preset), and auditionNotes renders it (render_audio); neither is a change on its own.')
+        }
+        // Slot assignment, and the matrix-full check with it, happen against the
+        // live matrix before anything is written: `set_modulation` can only find
+        // out it is full on the route that overflows, by which point earlier
+        // routes have already landed.
+        const plan = planModulations(modulations)
+        const rollbackId = dependencies.currentSoundEntryId?.()
+
+        if (dryRun) {
+          return {
+            dryRun: true,
+            applied: false,
+            wouldApply: {
+              ...(parameters.length === 0 ? {} : {
+                parameters: parameters.map(update => ({
+                  ...appliedParameter(update),
+                  from: formatValue(update.def, engine.values[update.index]),
+                  willChange: Math.abs(engine.values[update.index] - update.normalized) > 1e-9
+                }))
+              }),
+              ...(plan === null ? {} : {
+                modulations: {
+                  cleared: plan.clearSlots.length,
+                  routes: plan.assignments.map(assignment => routeValue(assignment.slot, assignment.state)),
+                  totalAfter: plan.totalAfter
+                }
+              }),
+              ...(order === null ? {} : { fxOrder: { from: fxOrder(engine).fxOrder, to: order.map(index => FX_IDS[index]) } }),
+              ...(presetName === undefined ? {} : { presetName }),
+              ...(audition === null ? {} : { audition: pitchEcho(audition.notes) })
+            },
+            note: 'Nothing was changed, saved or rendered. Everything above validated; call again without dryRun to apply it.'
+          }
+        }
+
+        // What has to go back if a write throws part-way. Only the fields this call
+        // writes are captured, which is exactly the fields it can damage.
+        const beforeParameters = parameters.map(update => ({ index: update.index, normalized: engine.values[update.index] }))
+        const touchedSlots = plan === null ? [] : [...new Set([...plan.clearSlots, ...plan.assignments.map(assignment => assignment.slot)])]
+        const beforeSlots = touchedSlots.map(slot => ({ slot, state: engine.modSlots[slot] ? { ...engine.modSlots[slot]! } : null }))
+        const beforeOrder = engine.fxOrder.slice()
+
+        // One batch: `batchSoundChange` emits a single atomic sound change for the
+        // whole patch, so it is one history version whether or not `runAi` is
+        // wrapping this call. A revert inside the batch leaves the captured state
+        // identical, so a failed apply records no version at all.
+        engine.batchSoundChange('Apply patch', () => {
+          try {
+            for (const update of parameters) engine.setParam(update.index, update.normalized, 'ai')
+            if (plan) {
+              for (const slot of plan.clearSlots) engine.setModSlot(slot, null, 'ai')
+              for (const assignment of plan.assignments) engine.setModSlot(assignment.slot, assignment.state, 'ai')
+            }
+            if (order) engine.setFxOrder(order, 'ai')
+          } catch (error) {
+            // Rolled back with the same 'ai' origin the writes used, so the
+            // agent-change ledger nets to zero: `activity.ts` drops a pending
+            // change whose value returns to what it was before, and the human is
+            // not left with a half-patch to Keep or Reject.
+            for (const parameter of beforeParameters) engine.setParam(parameter.index, parameter.normalized, 'ai')
+            for (const slot of beforeSlots) engine.setModSlot(slot.slot, slot.state, 'ai')
+            if (order) engine.setFxOrder(beforeOrder, 'ai')
+            throw new Error(`apply_patch applied nothing: ${error instanceof Error ? error.message : String(error)}. Every write this call had made was rolled back, so the patch is exactly as it was before the call.`)
+          }
+        })
+
+        const applied = {
+          ...(parameters.length === 0 ? {} : { parameters: parameters.map(appliedParameter) }),
+          ...(plan === null ? {} : {
+            modulations: {
+              cleared: plan.clearSlots.length,
+              routes: plan.assignments.map(assignment => routeValue(assignment.slot, assignment.state)),
+              total: engine.modSlots.filter(Boolean).length
+            }
+          }),
+          ...(order === null ? {} : fxOrder(engine))
+        }
+
+        // The patch is the deliverable and it is already live. A storage failure is
+        // reported rather than allowed to revert a good patch, and it is reported
+        // loudly rather than swallowed.
+        let preset: Record<string, unknown> | undefined
+        if (presetName !== undefined) {
+          try {
+            savePreset(engine.toPreset(presetName))
+            preset = {
+              name: presetName, saved: true, storage: 'localStorage',
+              ...(factoryNames.has(presetName) ? { shadowsFactoryPreset: true } : {})
+            }
+          } catch (error) {
+            preset = {
+              name: presetName,
+              saved: false,
+              error: error instanceof Error ? error.message : String(error),
+              note: 'The patch IS applied and live; only writing it to localStorage failed. Call save_preset again to retry the save, or read it back with get_synth_state.'
+            }
+          }
+        }
+
+        const result = {
+          applied,
+          ...(preset === undefined ? {} : { preset }),
+          ...(rollbackId === undefined ? {} : { rollbackId }),
+          rollback: rollbackId === undefined
+            ? 'This build registers no sound history, so there is no rollback id. Reject in the AI-changes panel still reverts everything this call changed.'
+            : `Everything above landed as ONE sound-history version. To undo the whole call: read \`revision\` from get_history({"view":"sounds"}), then navigate_history({"action":"restore","entryId":"${rollbackId}","expectedRevision":<revision>}). That id is the version this call started from, so restoring it also undoes nothing else.`
+        }
+        if (audition === null) return result
+
+        // The first `await` in this tool, and deliberately the last thing it does.
+        // Render, never play: playing needs the human's Start gesture and this tool
+        // has to work before it. The render also measures its own pitch, so a
+        // transposed patch is visible here rather than in the next call.
+        const duration = Math.min(MAX_RENDER_SECONDS, clean(audition.duration + 0.25))
+        try {
+          const rendered = await runPerformance(invocationSignal(options), operationSignal => renderSequence(
+            audition.notes, duration, undefined, operationSignal, 'AI patch audition', {}
+          ))
+          const requested = singlePitch(audition.notes)
+          return {
+            ...result,
+            audition: {
+              rendered: true,
+              renderMode: rendered.renderMode,
+              duration: rendered.recording.duration,
+              sampleRate: rendered.recording.sampleRate,
+              channels: rendered.recording.channelData.length,
+              ...pitchEcho(audition.notes),
+              ...(requested === null ? {} : { pitchCheck: pitchCheckFor(requested, rendered.metrics) }),
+              metrics: rendered.metrics,
+              metricNotes: METRIC_NOTES,
+              ...(rendered.renderModeFallback ? { renderModeFallback: rendered.renderModeFallback } : {}),
+              ...(audition.overlaps > 0 ? { retriggered: audition.overlaps } : {})
+            }
+          }
+        } catch (error) {
+          if ((error as Error | undefined)?.name === 'AbortError') throw error
+          // The patch landed. Throwing here would report a failed call for a
+          // successful patch, and an agent would apply it a second time.
+          return {
+            ...result,
+            audition: {
+              rendered: false,
+              error: error instanceof Error ? error.message : String(error),
+              note: 'The patch IS applied; only the audition render failed. Call render_audio to hear it, or get_synth_state to verify the patch.'
+            }
+          }
+        }
+      }
+    },
+    {
       name: 'play_notes',
-      description: 'Play a bounded MIDI note sequence live; start/duration relative, in seconds. Runs only once a human clicks CLICK TO START AUDIO (runtime.running=true); before that use `render_audio`, which needs no gesture. A repeated pitch retriggers. Example: {"notes":[{"midi":60,"velocity":0.8,"start":0,"duration":0.5}]}',
+      description: 'Play a bounded note sequence live; start/duration relative, in seconds. Each note names its pitch as `note` ("D2") or `midi` (38), never both, and `pitches` in the result echoes back what each resolved to. Runs only once a human clicks CLICK TO START AUDIO (runtime.running=true); before that use `render_audio`, which needs no gesture. A repeated pitch retriggers. Example: {"notes":[{"note":"C4","velocity":0.8,"start":0,"duration":0.5}]}',
       inputSchema: {
         type: 'object', properties: { notes: { type: 'array', minItems: 1, maxItems: MAX_NOTES, items: noteSchema } },
         required: ['notes'], additionalProperties: false
@@ -1226,7 +1797,7 @@ export function createWebMcpTools(
       async execute(input, options) {
         return runPerformance(invocationSignal(options), async operationSignal => {
           const value = assertObject(input, 'input', ['notes'], ['notes'])
-          const sequence = validatePerformanceNotes(value.notes, MAX_PLAY_SECONDS)
+          const sequence = validatePerformanceNotes(resolveNoteInputs(value.notes), MAX_PLAY_SECONDS)
           if (!engine.running) throw new Error('Start audio with a user gesture before playing notes; render_audio needs no gesture and renders the same notes offline')
           assertNotesAvailable(engine, sequence.notes)
           throwIfAborted(operationSignal)
@@ -1234,7 +1805,13 @@ export function createWebMcpTools(
           try {
             await performance.trackPlayback(() => performNotes(engine, sequence.notes, operationSignal), 'ai')
             if (replayId) dependencies.replays!.finishPerformance(replayId, 'completed')
-            return { noteCount: sequence.notes.length, duration: sequence.duration, completed: true, ...(sequence.overlaps > 0 ? { retriggered: sequence.overlaps } : {}) }
+            return {
+              noteCount: sequence.notes.length,
+              duration: sequence.duration,
+              completed: true,
+              ...pitchEcho(sequence.notes),
+              ...(sequence.overlaps > 0 ? { retriggered: sequence.overlaps } : {})
+            }
           } catch (error) {
             if (replayId) dependencies.replays!.finishPerformance(replayId, operationSignal.aborted ? 'cancelled' : 'failed')
             throw error
@@ -1244,7 +1821,7 @@ export function createWebMcpTools(
     },
     {
       name: 'render_audio',
-      description: 'Render a bounded note sequence and return `metrics` for it (plus `metricNotes`, which says how to read them). Offline by default: repeatable scheduling, far faster than real time, and available before the human starts audio. A single-pitch sequence also gets `metrics.harmonics`.',
+      description: 'Render a bounded note sequence and return `metrics` for it (plus `metricNotes`, which says how to read them). Offline by default: repeatable scheduling, far faster than real time, and available before the human starts audio. Each note names its pitch as `note` ("D2") or `midi` (38), never both. The fundamental is MEASURED from the render, never assumed from the note asked for, so a transposed or detuned patch shows up as a real number: `pitchCheck` puts the requested note and the measured one side by side.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1265,7 +1842,7 @@ export function createWebMcpTools(
       async execute(input, options) {
         return runPerformance(invocationSignal(options), async operationSignal => {
           const value = assertObject(input, 'input', ['notes', 'duration', 'mode', 'format'], ['notes'])
-          const sequence = validatePerformanceNotes(value.notes, MAX_RENDER_SECONDS)
+          const sequence = validatePerformanceNotes(resolveNoteInputs(value.notes), MAX_RENDER_SECONDS)
           const requestedMode = assertRenderMode(value.mode)
           const format = assertRenderFormat(value.format)
           const duration = value.duration === undefined
@@ -1273,17 +1850,25 @@ export function createWebMcpTools(
             : finite(value.duration, 'duration')
           if (duration <= 0 || duration > MAX_RENDER_SECONDS) throw new Error(`Render duration must be > 0 and limited to ${MAX_RENDER_SECONDS} seconds`)
           if (duration < sequence.duration) throw new Error('Render duration must cover the complete note sequence')
+          // No `f0Hz`: the render's own samples settle its pitch. See `singlePitch`
+          // for what stating it instead cost, and `pitchCheck` below for what
+          // measuring it buys.
           const rendered = await renderSequence(
             sequence.notes, duration, requestedMode, operationSignal,
-            'AI rendered sequence', analysisOptionsFor(sequence.notes)
+            'AI rendered sequence', {}
           )
           const { recording, metrics } = rendered
+          const requested = singlePitch(sequence.notes)
           return {
             renderMode: rendered.renderMode,
             mimeType: recording.mimeType,
             duration: recording.duration,
             sampleRate: recording.sampleRate,
             channels: recording.channelData.length,
+            ...pitchEcho(sequence.notes),
+            // Only for a single-pitch sequence: a chord has no one requested
+            // fundamental to check the measured one against.
+            ...(requested === null ? {} : { pitchCheck: pitchCheckFor(requested, metrics) }),
             metrics,
             metricNotes: METRIC_NOTES,
             ...(format === 'url' ? { url: rendered.url } : {}),
@@ -1487,7 +2072,7 @@ export function createWebMcpTools(
     },
     {
       name: 'compare_audio',
-      description: 'Step 2 of matching a target sound: the signed, per-dimension error between the reference and your sound (`diff`). It also returns ranked moves in this synth\'s parameter ids (`diff.actions`) and the unchanged `comparison` score. It renders the candidate first by default, at the reference\'s OWN detected pitch and duration, so you never compare an octave-off render whose scalars still look plausible. Falls back to the last render or the live scope with `autoRender: false`, and refuses a silent scope rather than scoring against silence.',
+      description: 'Step 2 of matching a target sound: the signed, per-dimension error between the reference and your sound (`diff`). It also returns ranked moves in this synth\'s parameter ids (`diff.actions`) and the `comparison` score. It renders the candidate first by default, at the reference\'s own detected pitch and duration, releasing the note a tail before the buffer ends so its decay is measurable — never an octave-off render whose scalars still look plausible. Falls back to the last render or the live scope with `autoRender: false`, and refuses a silent scope rather than scoring against silence.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1527,13 +2112,18 @@ export function createWebMcpTools(
             ? Math.min(MAX_RENDER_SECONDS, Math.max(0.05, clean(reference.duration)))
             : finite(value.duration, 'duration')
           if (duration <= 0 || duration > MAX_RENDER_SECONDS) throw new Error(`Render duration must be > 0 and limited to ${MAX_RENDER_SECONDS} seconds`)
+          // Note-off lands one release tail before the buffer ends, so the candidate
+          // decays inside the window the way the reference does. See
+          // `RELEASE_TAIL_SECONDS`. Explicit `notes` are left exactly as written:
+          // choosing the note is the reason to pass them.
+          const held = heldSecondsWithin(duration)
           const sequence = value.notes === undefined
             ? {
-              notes: [{ midi: referencePitch!.midi, velocity: 1, start: 0, duration }],
-              duration,
+              notes: [{ midi: referencePitch!.midi, velocity: 1, start: 0, duration: held }],
+              duration: held,
               overlaps: 0
             }
-            : validatePerformanceNotes(value.notes, MAX_RENDER_SECONDS)
+            : validatePerformanceNotes(resolveNoteInputs(value.notes), MAX_RENDER_SECONDS)
           if (duration < sequence.duration) throw new Error('Render duration must cover the complete note sequence')
           try {
             // The candidate's fundamental is MEASURED here, never assumed - see
@@ -1671,41 +2261,103 @@ export function createWebMcpTools(
           storage: 'localStorage',
           // The motivating session: "which folder did you save it to?" cost
           // several calls to answer, because the answer was "none".
-          where: `Saved in this browser's localStorage, not to a file: no folder holds it. It is in the preset select under the "User" group as "${name}", and list_presets returns it.`
+          where: `Saved in this browser's localStorage, not to a file: no folder holds it. It is in the preset select under the "User" group as "${name}", and list_presets returns it.`,
+          // A user preset wins a name collision in `load_preset`, so saving over a
+          // factory name silently changes what that name loads. Said here, at the
+          // call that caused it, rather than left to be discovered later.
+          ...(factoryNames.has(name) ? {
+            shadowsFactoryPreset: true,
+            shadowNote: `A factory preset is also called "${name}". load_preset({"name":"${name}"}) now returns THIS patch, because a user preset is the only copy of deliberate work; the built-in one is untouched and still reachable with {"source":"factory"}.`
+          } : {})
         }
       }
     },
     {
       name: 'load_preset',
-      description: 'Load a named user preset saved to localStorage and return its verifiable resulting state. Factory presets from the UI dropdown are not included.',
+      description: 'Load a preset into the live engine: the factory patches the UI dropdown lists, and the user presets saved to this browser\'s localStorage. `list_presets` names both. On a name held by both, the USER preset wins — it is the only copy of deliberate work, and save_preset followed by load_preset must return the patch just saved — and the result says a factory preset was shadowed. Pass `source: "factory"` for the built-in one by name.',
       inputSchema: {
-        type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 80 } },
+        type: 'object',
+        properties: {
+          name: { type: 'string', minLength: 1, maxLength: 80 },
+          source: {
+            type: 'string', enum: [...PRESET_SOURCES],
+            description: 'Which space to load from. Omitted, a user preset of that name wins over a factory one; "factory" asks for the built-in patch by name even when a user preset shadows it.'
+          }
+        },
         required: ['name'], additionalProperties: false
       },
       annotations: { readOnlyHint: false },
       execute(input) {
         assertPerformanceIdle('Preset loading')
-        const value = assertObject(input, 'input', ['name'], ['name'])
+        const value = assertObject(input, 'input', ['name', 'source'], ['name'])
+        const source = assertPresetSource(value.source)
         const name = validatePresetName(value.name)
-        const preset = loadPreset(name)
-        if (!preset) throw new Error(`Preset not found: ${name}`)
-        const validated = validatePresetData(preset)
-        engine.loadPreset(validated, 'ai')
-        return { name, loaded: true }
+        // Only the space actually asked for is read: `loadPreset` announces a load to
+        // the preset-store listeners, so probing storage for a factory-only request
+        // would report a user preset load that never happened.
+        const isFactory = source !== 'user' && factoryNames.has(name)
+        const shadowed = isFactory && userPresetNames().has(name)
+        // A factory preset needs no storage to load. When storage is blocked and
+        // the name is a factory one, say so and load it rather than refusing a
+        // patch that is compiled into the page.
+        let storageError: string | undefined
+        let user: ReturnType<typeof loadPreset> = null
+        if (source !== 'factory') {
+          try {
+            user = loadPreset(name)
+          } catch (error) {
+            if (!isFactory) throw error
+            storageError = error instanceof Error ? error.message : String(error)
+          }
+        }
+        // Already validated twice on the way here - `readPresets` validates every
+        // stored entry and `loadPreset` re-validates the match - and `getFactoryPreset`
+        // runs `validatePresetData` itself. A third pass would only re-derive the same
+        // object.
+        const preset = user ?? (source === 'user' ? null : getFactoryPreset(name))
+        if (!preset) throw new Error(presetNotFound(name, source))
+        engine.loadPreset(preset, 'ai')
+        return {
+          name,
+          loaded: true,
+          source: user ? 'user' as const : 'factory' as const,
+          ...(shadowed ? {
+            shadowedFactoryPreset: true,
+            note: `A factory preset is also called "${name}"; this loaded the USER preset. Pass {"source":"factory"} for the built-in patch.`
+          } : {}),
+          ...(storageError === undefined ? {} : {
+            note: `Loaded the factory preset. This browser's preset storage could not be read (${storageError}), so a user preset of the same name — if one exists — was not consulted.`
+          })
+        }
       }
     },
     {
       name: 'list_presets',
-      description: 'List the user presets saved to localStorage, newest storage order first. Factory presets from the UI dropdown are not included.',
+      description: `Every preset this page can load, as ONE ordered list: the ${FACTORY_PRESETS.length} factory patches first, in the dropdown's own order, then this browser's user presets in the order they were saved (oldest first). Each row carries \`source\`, and \`total\`/\`factory\`/\`user\` count them. A name held by both spaces appears twice, once per source — load_preset takes the user one unless asked for {"source":"factory"}.`,
       inputSchema: emptySchema,
       annotations: { readOnlyHint: true },
       execute(input) {
         assertObject(input, 'input', [])
-        const presets = listPresets().map(preset => {
-          const savedAt = (preset as { savedAt?: unknown }).savedAt
-          return { name: preset.name, ...(typeof savedAt === 'number' ? { savedAt } : {}) }
-        })
-        return { presets, total: presets.length }
+        // One list, not two. Two arrays let a reader answer "what presets are there?"
+        // from the first one it meets, which is exactly how the factory patches stayed
+        // invisible to every agent: `list_presets` returned user presets only, and an
+        // empty array reads as "this synth has no presets". A single ordered list is
+        // read in one pass, and a collision is visible as two rows rather than hidden
+        // in the array the reader skipped.
+        const factory = listFactoryPresetNames().map(name => ({ name, source: 'factory' as const }))
+        const user = listPresets().map(preset => ({ name: preset.name, source: 'user' as const }))
+        const names = new Set(user.map(preset => preset.name))
+        const shadowed = factory.flatMap(preset => names.has(preset.name) ? [preset.name] : [])
+        return {
+          presets: [...factory, ...user],
+          total: factory.length + user.length,
+          factory: factory.length,
+          user: user.length,
+          ...(shadowed.length === 0 ? {} : {
+            shadowedFactoryPresets: shadowed,
+            note: `${shadowed.join(', ')} ${shadowed.length === 1 ? 'names' : 'name'} both a factory and a user preset. load_preset returns the user one; pass {"source":"factory"} for the built-in patch.`
+          })
+        }
       }
     }
   ]

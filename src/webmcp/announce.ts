@@ -24,7 +24,7 @@ export const AGENT_BRIEF_ID = 'cosynth-agent-brief'
 export const AGENT_BRIEF_JSON_ID = 'cosynth-agent-tools'
 
 /**
- * Every tool coSynth registers, in registration order: the thirteen synth tools
+ * Every tool coSynth registers, in registration order: the fifteen synth tools
  * from `createWebMcpTools`, the four from `createHistoryTools`, and the two
  * from `createGuideTools`.
  *
@@ -39,6 +39,8 @@ export const ANNOUNCED_TOOL_NAMES = [
   'get_parameter_schema',
   'update_parameters',
   'set_modulation',
+  'set_fx_order',
+  'apply_patch',
   'play_notes',
   'render_audio',
   'analyze_audio',

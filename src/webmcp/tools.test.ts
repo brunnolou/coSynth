@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { PARAMS, defaultValues, normToValue, paramDef, paramIndex } from '../shared/params'
 import { DEFAULT_FX_ORDER, FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, defaultLfoShape, modSourceIndex, type ModSlotState } from '../shared/messages'
+import { FACTORY_PRESETS } from '../shared/factory-presets'
 import type { PresetData, RecordedAudio, SynthEngine } from '../audio/engine'
 import { createWebMcpTools, type WebMcpToolDependencies } from './tools'
 import { encodeWav } from './offline-render'
@@ -32,8 +33,12 @@ class FakeEngine {
   heldNotes = new Set<number>()
   private readonly defaultNoteOwner = Symbol('human')
   private readonly noteOwners = new Map<number, Set<symbol>>()
-  setParam = vi.fn((index: number, value: number) => { this.values[index] = value })
-  setModSlot = vi.fn((slot: number, state: ModSlotState | null) => { this.modSlots[slot] = state })
+  // `origin` is declared on every mutator so a test can assert the 'ai' tag the
+  // AI-changes panel depends on, not only the value that was written.
+  setParam = vi.fn((index: number, value: number, _origin?: unknown) => { this.values[index] = value })
+  setModSlot = vi.fn((slot: number, state: ModSlotState | null, _origin?: unknown) => { this.modSlots[slot] = state })
+  setFxOrder = vi.fn((order: number[], _origin?: unknown) => { this.fxOrder = order.slice() })
+  batchSoundChange = vi.fn(<T>(_label: string, fn: () => T): T => fn())
   noteOn = vi.fn((note: number, _velocity = 1, owner = this.defaultNoteOwner) => {
     let owners = this.noteOwners.get(note)
     if (!owners) {
@@ -55,7 +60,7 @@ class FakeEngine {
     params: Object.fromEntries(Array.from(this.values, (value, index) => [`p${index}`, value])),
     mods: [], lfoShapes: this.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
   }))
-  loadPreset = vi.fn((preset: Partial<PresetData>) => {
+  loadPreset = vi.fn((preset: Partial<PresetData>, _origin?: unknown) => {
     if (preset.params?.['master.volume'] !== undefined) this.values[paramIndex('master.volume')] = preset.params['master.volume']
   })
   recordOutput = vi.fn(async (duration: number, _signal?: AbortSignal): Promise<RecordedAudio> => {
@@ -102,10 +107,13 @@ afterEach(() => {
 })
 
 describe('WebMCP tool metadata', () => {
-  it('exposes exactly thirteen strict object schemas in composable workflow order', () => {
+  it('exposes exactly fifteen strict object schemas in composable workflow order', () => {
     const { tools } = setup()
+    // The three patch-editing tools sit together, `apply_patch` last of them
+    // because it composes the other two plus the preset save.
     expect(tools.map(tool => tool.name)).toEqual([
       'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
+      'set_fx_order', 'apply_patch',
       'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
       'compare_audio', 'suggest_patch', 'save_preset', 'load_preset', 'list_presets'
     ])
@@ -123,11 +131,12 @@ describe('WebMCP tool metadata', () => {
     // `source: "reference"` with a corrected `f0Hz` or a raised `windows`
     // replaces the active reference and resets the best-so-far with it.
     expect(tools.filter(tool => tool.annotations?.readOnlyHint === false).map(tool => tool.name)).toEqual([
-      'update_parameters', 'set_modulation', 'play_notes', 'render_audio',
+      'update_parameters', 'set_modulation', 'set_fx_order', 'apply_patch', 'play_notes', 'render_audio',
       'analyze_audio', 'analyze_reference_audio', 'compare_audio', 'save_preset', 'load_preset'
     ])
-    expect(tools.find(tool => tool.name === 'analyze_reference_audio')?.annotations?.untrustedContentHint).toBe(true)
-    expect(tools[7].inputSchema).toMatchObject({
+    const reference = tools.find(tool => tool.name === 'analyze_reference_audio')!
+    expect(reference.annotations?.untrustedContentHint).toBe(true)
+    expect(reference.inputSchema).toMatchObject({
       required: ['audioBase64'],
       properties: {
         audioBase64: { type: 'string', maxLength: 16 * 1024 * 1024 },
@@ -135,7 +144,7 @@ describe('WebMCP tool metadata', () => {
         mimeType: { type: 'string' }
       }
     })
-    expect((tools[7].inputSchema as any).properties.mimeType.pattern).toBe('^[aA][uU][dD][iI][oO]/')
+    expect((reference.inputSchema as any).properties.mimeType.pattern).toBe('^[aA][uU][dD][iI][oO]/')
   })
 
   it('keeps the whole tool listing small enough to survive a client that truncates it', () => {
@@ -148,15 +157,20 @@ describe('WebMCP tool metadata', () => {
     // 4958 B of schema) after four rounds of per-tool clarity fixes, and the
     // budget was then held at 9900 B for twelve tools.
     //
-    // Thirteen tools now, and the matching three carry arguments an agent
-    // cannot guess (`f0Hz`, `windows`, `autoRender`, `format`, `maxActions`)
-    // plus the note sequence schema on `compare_audio`. The ceiling moves with
-    // the tool count rather than with the prose: ~1015 B per tool against
-    // ~825 B before, and the prose half — what a truncating client renders
-    // first — is capped separately and deliberately barely moved.
-    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(13200)
+    // Fifteen tools now. Three things moved the ceiling from 13200 B, and each
+    // is paid for in round trips rather than in prose: `apply_patch` carries the
+    // largest schema here (~2600 B) because it takes parameters, modulations, FX
+    // order, a preset name and an audition sequence in one call — the eight-call
+    // sequence it replaces cost far more of an agent's context than its schema
+    // does; `set_fx_order` adds the effect-chain vocabulary; and every note
+    // schema now advertises `note` beside `midi`, four times over, which is the
+    // point (an agent that only ever reads `midi` never learns names are
+    // accepted). ~1300 B per tool against ~1015 B before, and the prose half —
+    // what a truncating client renders first — moved from ~338 to ~415 B per
+    // tool, with the per-tool cap below unchanged at 600 B.
+    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(20000)
     const prose = listing.reduce((total, tool) => total + bytes(tool.description), 0)
-    expect(prose).toBeLessThanOrEqual(4400)
+    expect(prose).toBeLessThanOrEqual(6400)
     for (const tool of listing) {
       // No single tool may dominate the read: render_audio's description alone
       // was 1273 B, a tenth of the whole listing.
@@ -335,18 +349,40 @@ describe('single-round-trip discovery', () => {
 })
 
 describe('preset listing', () => {
-  it('lists saved presets by name', async () => {
+  it('lists factory and user presets as one ordered list, each tagged with its source', async () => {
     const { engine, execute } = setup()
     engine.toPreset.mockImplementation((name: string): PresetData => ({
       name, version: 1, params: { 'master.volume': 0.5 }, mods: [],
       lfoShapes: engine.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
     }))
-    expect(await execute('list_presets')).toEqual({ presets: [], total: 0 })
+    // The failure this replaces: `list_presets` returned only localStorage, so
+    // on a fresh profile it returned `{presets: [], total: 0}` — which reads as
+    // "this synth ships no presets" — while the UI dropdown listed 35 of them.
+    const empty = await execute('list_presets')
+    expect(empty.presets).toEqual(FACTORY_PRESETS.map(preset => ({ name: preset.name, source: 'factory' })))
+    expect(empty).toMatchObject({ total: FACTORY_PRESETS.length, factory: FACTORY_PRESETS.length, user: 0 })
+    expect(empty.presets[0]).toEqual({ name: 'Init', source: 'factory' })
+
     await execute('save_preset', { name: 'Concert Grand' })
     await execute('save_preset', { name: 'Rhodes' })
-    expect(await execute('list_presets')).toEqual({
-      presets: [{ name: 'Concert Grand' }, { name: 'Rhodes' }], total: 2
-    })
+    const listed = await execute('list_presets')
+    // One list, factory first in dropdown order, then user in save order.
+    expect(listed.presets.slice(-2)).toEqual([
+      { name: 'Concert Grand', source: 'user' }, { name: 'Rhodes', source: 'user' }
+    ])
+    expect(listed).toMatchObject({ total: FACTORY_PRESETS.length + 2, factory: FACTORY_PRESETS.length, user: 2 })
+    expect(listed).not.toHaveProperty('shadowedFactoryPresets')
+
+    // A collision is two rows, one per source — the thing separate arrays would hide.
+    const shadowing = await execute('save_preset', { name: 'Init' })
+    expect(shadowing.shadowsFactoryPreset).toBe(true)
+    expect(shadowing.shadowNote).toMatch(/factory preset is also called "Init"/)
+    const collided = await execute('list_presets')
+    expect(collided.presets.filter((preset: any) => preset.name === 'Init')).toEqual([
+      { name: 'Init', source: 'factory' }, { name: 'Init', source: 'user' }
+    ])
+    expect(collided.shadowedFactoryPresets).toEqual(['Init'])
+    expect(collided.note).toMatch(/load_preset returns the user one/)
     await expect(execute('list_presets', { name: 'x' })).rejects.toThrow(/unexpected/i)
   })
 })
@@ -476,7 +512,11 @@ describe('state and parameter tools', () => {
     expect(notes.peakDb).toContain('instantaneous peak')
     expect(schema.properties.mode.description).toContain('"realtime"')
     expect(schema.properties.mode.description).toContain('renderModeFallback')
-    expect(description).toContain('metrics.harmonics')
+    // The fact that replaced "a single-pitch sequence also gets
+    // `metrics.harmonics`": harmonics now follow whatever pitch was DETECTED,
+    // so what the description has to promise is that the pitch is measured.
+    expect(description).toMatch(/MEASURED/)
+    expect(description).toContain('pitchCheck')
     expect(description).toMatch(/metricNotes/)
   })
 
@@ -864,7 +904,7 @@ describe('render and analysis tools', () => {
       const result = await again
       expect(result.metricNotes.peakDb, name).toContain('instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels')
     }
-    expect(byName.get('play_notes')!.description).toContain('{"notes":[{"midi":60,"velocity":0.8,"start":0,"duration":0.5}]}')
+    expect(byName.get('play_notes')!.description).toContain('{"notes":[{"note":"C4","velocity":0.8,"start":0,"duration":0.5}]}')
     expect(byName.get('update_parameters')!.description).toContain('{"id":"filter1.cutoff","value":1200}')
     expect(byName.get('set_modulation')!.description).toMatch(/bipolar.*normalized.*clamp/i)
   })
@@ -1371,7 +1411,7 @@ describe('offline rendering', () => {
    * `detected` when the analyzer had to find one, with `pitch.confidence`
    * saying how much to trust the partials that came with it.
    */
-  it('detects rather than assumes the fundamental when the sequence holds more than one pitch', async () => {
+  it('detects rather than assumes the fundamental, for one pitch as well as for a chord', async () => {
     const { execute } = offlineSetup()
     const chord = await execute('render_audio', {
       notes: [
@@ -1389,16 +1429,112 @@ describe('offline rendering', () => {
     } else {
       expect(chord.metrics.harmonics).toBeUndefined()
     }
+    // Two pitches, so there is no single requested note to check a measured one against.
+    expect(chord).not.toHaveProperty('pitchCheck')
+    expect(chord.pitches).toEqual(['C4 (MIDI 60, 261.6 Hz)', 'E4 (MIDI 64, 329.6 Hz)'])
 
-    // The single-pitch case is unchanged: the tool knows the note, so the
-    // analyzer is told rather than left to measure.
+    // The single-pitch case is no longer the exception. It used to be told the
+    // note it had asked for, which `resolvePitch` accepts as `source: "given"`,
+    // `confidence: 1` without reading a sample — so `metrics.pitch` was the note
+    // REQUESTED however far the patch moved the render off it, and
+    // `compare_audio({autoRender: false})` scored a `centsError` of 0 against it.
     const single = await execute('render_audio', {
       notes: [{ midi: 60, velocity: 0.8, start: 0, duration: 0.5 }],
       duration: 1
     })
-    expect(single.metrics.pitch).toMatchObject({ source: 'given', confidence: 1 })
+    expect(single.metrics.pitch).toMatchObject({ source: 'detected', midi: 60 })
+    expect(single.metrics.pitch.f0Hz).toBeCloseTo(261.6, 0)
     expect(single.metrics.harmonics?.amplitudesDb).toHaveLength(12)
     expect(single.metricNotes.pitch).toMatch(/given.*detected/)
+    // The interpretation, echoed back: reading "D2 (MIDI 38, 73.4 Hz)" after
+    // asking for a 37 Hz reference is what makes an octave slip visible.
+    expect(single.pitches).toEqual(['C4 (MIDI 60, 261.6 Hz)'])
+    expect(single.pitchCheck.requested).toBe('C4 (MIDI 60, 261.6 Hz)')
+    expect(single.pitchCheck.measured.note).toBe('C4 (MIDI 60, 261.6 Hz)')
+    expect(Math.abs(single.pitchCheck.centsFromRequested)).toBeLessThan(10)
+    expect(single.pitchCheck.note).toMatch(/sounds at the note requested/)
+  })
+
+  it('accepts a note name instead of a MIDI number and echoes back what it resolved to', async () => {
+    const { execute, renderOffline } = offlineSetup()
+    // The motivating session: a 37 Hz reference, correctly called "D1", rendered
+    // as `midi: 38` — which is D2 at 73.4 Hz. The conversion step was the bug, so
+    // it is gone from the caller, and the interpretation is read back in the same
+    // turn the mistake is made.
+    const named = await execute('render_audio', {
+      notes: [{ note: 'D1', velocity: 0.8, start: 0, duration: 0.2 }],
+      duration: 0.4
+    })
+    expect(renderOffline.mock.calls[0][1]).toEqual([{ midi: 26, velocity: 0.8, start: 0, duration: 0.2 }])
+    expect(named.pitches).toEqual(['D1 (MIDI 26, 36.7 Hz)'])
+    expect(named.pitchCheck.requested).toBe('D1 (MIDI 26, 36.7 Hz)')
+
+    // Flats and lowercase resolve to the same pitch the sharp spelling does, and
+    // `play_notes` echoes the interpretation the same way `render_audio` does.
+    const live = setup()
+    for (const note of ['A#1', 'Bb1', 'a#1']) {
+      const result = await live.execute('play_notes', { notes: [{ note, velocity: 1, start: 0, duration: 0.005 }] })
+      expect(result.pitches, note).toEqual(['A#1 (MIDI 34, 58.3 Hz)'])
+    }
+
+    // Exactly one spelling per note, and the errors say which rule was broken.
+    await expect(execute('render_audio', { notes: [{ note: 'D1', midi: 26, velocity: 1, start: 0, duration: 0.1 }] }))
+      .rejects.toThrow(/notes\[0\] has both 'midi' and 'note'/)
+    await expect(execute('render_audio', { notes: [{ velocity: 1, start: 0, duration: 0.1 }] }))
+      .rejects.toThrow(/notes\[0\] needs a pitch/)
+    // The parse errors come from note-input.ts and are not reimplemented here.
+    await expect(execute('render_audio', { notes: [{ note: 'C', velocity: 1, start: 0, duration: 0.1 }] }))
+      .rejects.toThrow(/notes\[0\]\.note:.*has no octave/)
+    await expect(execute('render_audio', { notes: [{ note: 'H4', velocity: 1, start: 0, duration: 0.1 }] }))
+      .rejects.toThrow(/notes\[0\]\.note:.*Accepted forms/)
+    await expect(execute('render_audio', { notes: [{ note: 'A9', velocity: 1, start: 0, duration: 0.1 }] }))
+      .rejects.toThrow(/notes\[0\]\.note:.*out of range/)
+
+    // And the schema advertises the alternative, so an agent reading only the
+    // listing learns names are accepted at all.
+    const schema = (await Promise.resolve(offlineSetup().byName.get('render_audio')!.inputSchema)) as any
+    expect(schema.properties.notes.items.properties.note.type).toBe('string')
+    expect(schema.properties.notes.items.required).toEqual(['velocity', 'start', 'duration'])
+    expect(schema.properties.notes.items.oneOf).toEqual([{ required: ['midi'] }, { required: ['note'] }])
+  })
+
+  it('measures a transposed render at the pitch it actually sounds, not the note requested', async () => {
+    // `osc1.transpose` is the cheapest way to make the note asked for and the
+    // frequency produced two different numbers. Stating the requested f0 to the
+    // analyzer reported `source: "given"`, `confidence: 1` on a frequency the
+    // render did not contain — and `compare_audio({autoRender: false})` then
+    // scored that render as perfectly in tune.
+    const engine = new FakeEngine()
+    engine.running = false
+    const renderOffline = vi.fn(async (target: unknown, notes: readonly { midi: number }[], duration: number): Promise<RecordedAudio> => {
+      const length = Math.max(64, Math.round(duration * 8000))
+      const transpose = normToValue(paramDef('osc1.transpose'), (target as FakeEngine).values[paramIndex('osc1.transpose')])
+      const f0 = 440 * Math.pow(2, ((notes[0]?.midi ?? 69) + transpose - 69) / 12)
+      const channel = Float32Array.from({ length }, (_, index) => {
+        const t = index / 8000
+        return 0.5 * Math.exp(-2 * t) * Math.sin(2 * Math.PI * f0 * t)
+      })
+      const channelData = [channel, channel.slice()]
+      return { blob: new Blob([encodeWav(channelData, 8000)], { type: 'audio/wav' }), mimeType: 'audio/wav', duration, sampleRate: 8000, channelData }
+    })
+    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, { renderOffline })
+    const byName = new Map(tools.map(tool => [tool.name, tool]))
+    const execute = async (name: string, input: Record<string, unknown> = {}) =>
+      await byName.get(name)!.execute(input, { signal: new AbortController().signal }) as any
+
+    await execute('update_parameters', { updates: [{ id: 'osc1.transpose', value: 12 }] })
+    const result = await execute('render_audio', { notes: [{ note: 'C4', velocity: 1, start: 0, duration: 0.5 }], duration: 1 })
+
+    expect(result.pitchCheck.requested).toBe('C4 (MIDI 60, 261.6 Hz)')
+    expect(result.pitchCheck.measured.source).toBe('detected')
+    expect(result.pitchCheck.measured.f0Hz).toBeCloseTo(523.25, -1)
+    expect(result.pitchCheck.centsFromRequested).toBeGreaterThan(1150)
+    expect(result.pitchCheck.centsFromRequested).toBeLessThan(1250)
+    expect(result.pitchCheck.note).toMatch(/above C4 \(MIDI 60, 261\.6 Hz\)/)
+    expect(result.pitchCheck.note).toMatch(/describes what was rendered, not what was requested/)
+    // The metrics agree with the check: nothing here reports the requested note.
+    expect(result.metrics.pitch.midi).toBe(72)
+    expect(result.metrics.pitch.source).toBe('detected')
   })
 
   it('returns a blob URL or an inline mono WAV on request', async () => {
@@ -1500,7 +1636,7 @@ describe('preset tools', () => {
     engine.values[paramIndex('master.volume')] = 0.9
     const loaded = await execute('load_preset', { name: 'Agent Patch' })
     expect(engine.loadPreset).toHaveBeenCalledTimes(1)
-    expect(loaded).toEqual({ name: 'Agent Patch', loaded: true })
+    expect(loaded).toEqual({ name: 'Agent Patch', loaded: true, source: 'user' })
     const state = await execute('get_synth_state', { search: 'master.volume' })
     expect(state.patch.parameters.items['master.volume'].normalized).toBeCloseTo(0.25)
     await expect(execute('load_preset', { name: 'Missing' })).rejects.toThrow(/not found/i)
@@ -1516,6 +1652,320 @@ describe('preset tools', () => {
     await expect(execute('save_preset', { name: 'Blocked' })).rejects.toThrow(/storage.*unavailable/i)
     await expect(execute('load_preset', { name: 'Blocked' })).rejects.toThrow(/storage.*unavailable/i)
     expect(engine.loadPreset).not.toHaveBeenCalled()
+    // A factory patch is compiled into the page and needs no storage, so an
+    // unreadable localStorage must not make it unloadable.
+    const factory = await execute('load_preset', { name: 'Deep Saw Bass' })
+    expect(factory).toMatchObject({ name: 'Deep Saw Bass', loaded: true, source: 'factory' })
+    expect(factory.note).toMatch(/could not be read/)
+    expect(engine.loadPreset).toHaveBeenCalledTimes(1)
+  })
+
+  it('loads factory presets, prefers the user preset on a collision, and takes source: "factory" to override', async () => {
+    const { engine, execute } = setup()
+    // Factory presets were invisible to the tools: `load_preset` read
+    // localStorage only, so every one of the 35 patches the dropdown lists was
+    // unreachable and an agent had to read the DOM to learn a single name.
+    const loaded = await execute('load_preset', { name: 'Deep Saw Bass' })
+    expect(loaded).toEqual({ name: 'Deep Saw Bass', loaded: true, source: 'factory' })
+    const [preset, origin] = engine.loadPreset.mock.calls[0]
+    expect(origin).toBe('ai')
+    // `getFactoryPreset` returns a complete, already-validated preset.
+    expect(preset).toMatchObject({ name: 'Deep Saw Bass', version: 2, fxOrder: [...FX_IDS] })
+    expect(preset.mods).toEqual([{ source: 'env2', dest: 'filter1.cutoff', depth: 0.45, enabled: true }])
+    expect(preset.lfoShapes).toHaveLength(8)
+
+    // A user preset wins the name: save_preset then load_preset must return the
+    // patch just saved, and a factory preset can never be lost by being shadowed.
+    engine.toPreset.mockImplementation((name: string): PresetData => ({
+      name, version: 1, params: { 'master.volume': 0.125 }, mods: [],
+      lfoShapes: engine.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
+    }))
+    await execute('save_preset', { name: 'Deep Saw Bass' })
+    const shadowing = await execute('load_preset', { name: 'Deep Saw Bass' })
+    expect(shadowing).toMatchObject({ source: 'user', shadowedFactoryPreset: true })
+    expect(shadowing.note).toMatch(/{"source":"factory"}/)
+    expect(engine.loadPreset.mock.calls[1][0].params).toEqual({ 'master.volume': 0.125 })
+
+    // ...and the built-in one is still reachable by name.
+    const explicit = await execute('load_preset', { name: 'Deep Saw Bass', source: 'factory' })
+    expect(explicit).toMatchObject({ source: 'factory', shadowedFactoryPreset: true })
+    expect(engine.loadPreset.mock.calls[2][0].mods).toHaveLength(1)
+
+    // `source: "user"` never falls through to a factory patch of the same name.
+    await expect(execute('load_preset', { name: 'Init', source: 'user' }))
+      .rejects.toThrow(/among this browser's user presets: Init/)
+    await expect(execute('load_preset', { name: 'Deep Saw Bas', source: 'factory' }))
+      .rejects.toThrow(/among the factory presets.*Did you mean Deep Saw Bass\?/s)
+    await expect(execute('load_preset', { name: 'Nothing At All' }))
+      .rejects.toThrow(/in either the factory presets or this browser's user presets/)
+    await expect(execute('load_preset', { name: 'Init', source: 'both' })).rejects.toThrow(/source must be one of/)
+  })
+})
+
+describe('fx order tool', () => {
+  it('reorders the chain as an agent change, and refuses anything that is not a permutation', async () => {
+    const { engine, execute } = setup()
+    const reversed = [...FX_IDS].reverse()
+    const result = await execute('set_fx_order', { order: reversed })
+    expect(result).toEqual({ fxOrder: reversed, previous: [...FX_IDS], changed: true })
+    // Origin 'ai' is the whole point: `activity.ts` records the `{kind:'fx'}`
+    // mutation as a pending change and Reject restores it with
+    // `setFxOrder(change.before, 'restore')`. A 'human' origin would apply the
+    // reorder and leave no way to undo it from the AI-changes panel.
+    expect(engine.setFxOrder).toHaveBeenCalledWith(reversed.map(id => FX_IDS.indexOf(id as any)), 'ai')
+    // Verifiable through the state tool, like every other patch edit.
+    expect((await execute('get_synth_state')).patch.fxOrder).toEqual(reversed)
+    expect((await execute('set_fx_order', { order: reversed })).changed).toBe(false)
+
+    await expect(execute('set_fx_order', { order: [...FX_IDS].slice(1) }))
+      .rejects.toThrow(`order must list all ${FX_IDS.length} effects exactly once (got ${FX_IDS.length - 1})`)
+    await expect(execute('set_fx_order', { order: [...FX_IDS].slice(1).concat('reverb') }))
+      .rejects.toThrow(/Duplicate effect 'reverb'/)
+    await expect(execute('set_fx_order', { order: [...FX_IDS.slice(1), 'reverbs'] }))
+      .rejects.toThrow(/Unknown effect 'reverbs'.*Did you mean reverb\?/)
+    await expect(execute('set_fx_order', { order: 'reverb' })).rejects.toThrow(/order must be an array/)
+    await expect(execute('set_fx_order', {})).rejects.toThrow(/order is required/)
+    // The schema advertises the vocabulary, so the ids need no other lookup.
+    const schema = setup().byName.get('set_fx_order')!.inputSchema as any
+    expect(schema.properties.order.items.enum).toEqual([...FX_IDS])
+    expect(schema.properties.order.minItems).toBe(FX_IDS.length)
+  })
+})
+
+describe('apply_patch', () => {
+  const RATE = 8000
+  /** Tracks the requested note, so the audition's measured pitch is a real measurement. */
+  function auditionRenderer() {
+    return vi.fn(async (_engine: unknown, notes: readonly { midi: number }[], duration: number): Promise<RecordedAudio> => {
+      const length = Math.max(64, Math.round(duration * RATE))
+      const f0 = 440 * Math.pow(2, ((notes[0]?.midi ?? 69) - 69) / 12)
+      const channel = Float32Array.from({ length }, (_, index) => {
+        const t = index / RATE
+        return 0.4 * Math.exp(-3 * t) * Math.sin(2 * Math.PI * f0 * t)
+      })
+      const channelData = [channel, channel.slice()]
+      return { blob: new Blob([encodeWav(channelData, RATE)], { type: 'audio/wav' }), mimeType: 'audio/wav', duration, sampleRate: RATE, channelData }
+    })
+  }
+
+  function patchSetup(dependencies: WebMcpToolDependencies = {}) {
+    const engine = new FakeEngine()
+    engine.running = false
+    engine.toPreset.mockImplementation((name: string): PresetData => ({
+      name, version: 1, params: { 'master.volume': engine.values[paramIndex('master.volume')] }, mods: [],
+      lfoShapes: engine.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
+    }))
+    const renderOffline = auditionRenderer()
+    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, { renderOffline, ...dependencies })
+    const byName = new Map(tools.map(tool => [tool.name, tool]))
+    const execute = async (name: string, input: Record<string, unknown> = {}) =>
+      await byName.get(name)!.execute(input, { signal: new AbortController().signal }) as any
+    return { engine, byName, execute, renderOffline }
+  }
+
+  it('applies parameters, modulation and FX order as one change, then saves and auditions it', async () => {
+    // The motivating session needed separate calls for parameters, clearing
+    // modulation, five routes, a save, a render and a play. This is that in one.
+    const { engine, execute } = patchSetup({ currentSoundEntryId: () => 'sound-7' })
+    engine.modSlots[3] = { source: modSourceIndex('lfo2'), dest: paramIndex('osc1.morph'), depth: 0.1, enabled: true }
+    const reversed = [...FX_IDS].reverse()
+
+    const result = await execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }, { id: 'filter1.type', value: 'LP 24' }],
+      modulations: {
+        replace: true,
+        routes: [
+          { source: 'env2', destination: 'filter1.cutoff', depth: 0.45 },
+          { source: 'lfo1', destination: 'osc1.morph', depth: 0.3, enabled: false }
+        ]
+      },
+      fxOrder: reversed,
+      presetName: 'One Call Bass',
+      auditionNotes: [{ note: 'C2', velocity: 0.9, start: 0, duration: 0.4 }]
+    })
+
+    expect(result.applied.parameters).toEqual([
+      { id: 'filter1.cutoff', raw: 900, normalized: expect.any(Number), formatted: '900.0 Hz' },
+      { id: 'filter1.type', raw: 1, normalized: expect.any(Number), formatted: 'LP 24' }
+    ])
+    expect(result.applied.modulations).toMatchObject({ cleared: 1, total: 2 })
+    expect(result.applied.modulations.routes).toEqual([
+      { slot: 0, source: 'env2', destination: 'filter1.cutoff', depth: 0.45, enabled: true },
+      { slot: 1, source: 'lfo1', destination: 'osc1.morph', depth: 0.3, enabled: false }
+    ])
+    expect(result.applied.fxOrder).toEqual(reversed)
+    expect(engine.modSlots[3]).toBeNull()
+    expect(result.preset).toMatchObject({ name: 'One Call Bass', saved: true, storage: 'localStorage' })
+    expect((await execute('list_presets')).presets).toContainEqual({ name: 'One Call Bass', source: 'user' })
+
+    // Rendered, not played: playing needs a Start gesture and this engine has none.
+    expect(engine.running).toBe(false)
+    expect(result.audition).toMatchObject({ rendered: true, renderMode: 'offline' })
+    expect(result.audition.pitches).toEqual(['C2 (MIDI 36, 65.4 Hz)'])
+    expect(result.audition.pitchCheck.measured.source).toBe('detected')
+    expect(result.audition.metrics.pitch.midi).toBe(36)
+    expect(result.audition.metricNotes.peakDb).toContain('instantaneous peak')
+
+    // One batched sound change, so the whole call is one undoable version.
+    expect(engine.batchSoundChange).toHaveBeenCalledTimes(1)
+    expect(engine.batchSoundChange.mock.calls[0][0]).toBe('Apply patch')
+    expect(result.rollbackId).toBe('sound-7')
+    expect(result.rollback).toMatch(/navigate_history\({"action":"restore","entryId":"sound-7"/)
+    expect(result.rollback).toMatch(/get_history/)
+  })
+
+  it('says so honestly when no sound history is wired up', async () => {
+    const { execute } = patchSetup()
+    const result = await execute('apply_patch', { parameters: [{ id: 'filter1.cutoff', value: 900 }] })
+    expect(result).not.toHaveProperty('rollbackId')
+    expect(result.rollback).toMatch(/no rollback id/)
+    expect(result.rollback).toMatch(/Reject/)
+  })
+
+  it('validates everything before applying anything', async () => {
+    const { engine, execute } = patchSetup()
+    // A bad id late in the batch must not leave the good ones applied — the
+    // property `update_parameters` already had, extended across the whole patch.
+    await expect(execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }, { id: 'filter1.cutof', value: 1 }]
+    })).rejects.toThrow(/Unknown parameter 'filter1.cutof'/)
+    await expect(execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }],
+      modulations: { routes: [{ source: 'lfo1', destination: 'filter1.nope', depth: 0.4 }] }
+    })).rejects.toThrow(/Unknown modulation destination 'filter1.nope'/)
+    await expect(execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }],
+      fxOrder: [...FX_IDS].slice(1)
+    })).rejects.toThrow(/fxOrder must list all/)
+    await expect(execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }], presetName: ' '
+    })).rejects.toThrow(/preset name/i)
+    await expect(execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }],
+      auditionNotes: [{ note: 'C', velocity: 1, start: 0, duration: 0.2 }]
+    })).rejects.toThrow(/auditionNotes\[0\]\.note:.*has no octave/)
+    expect(engine.setParam).not.toHaveBeenCalled()
+    expect(engine.setModSlot).not.toHaveBeenCalled()
+    expect(engine.setFxOrder).not.toHaveBeenCalled()
+
+    // A full matrix is found on the plan, not on the route that overflows:
+    // `set_modulation` can only discover it after the earlier routes landed.
+    const full = patchSetup()
+    for (let slot = 0; slot < MAX_MOD_SLOTS; slot++) {
+      full.engine.modSlots[slot] = { source: modSourceIndex('lfo1'), dest: paramIndex('osc1.morph') + slot, depth: 0.1, enabled: true }
+    }
+    await expect(full.execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }],
+      modulations: { routes: [{ source: 'env2', destination: 'filter1.cutoff', depth: 0.4 }] }
+    })).rejects.toThrow(/Modulation matrix is full.*Nothing was applied/s)
+    expect(full.engine.setParam).not.toHaveBeenCalled()
+
+    await expect(execute('apply_patch', { presetName: 'Nothing To Apply' }))
+      .rejects.toThrow(/at least one of parameters, modulations or fxOrder/)
+    await expect(execute('apply_patch', { modulations: {} }))
+      .rejects.toThrow(/modulations needs `routes`, or `replace: true`/)
+  })
+
+  it('reports what a dry run would change and touches nothing', async () => {
+    const { engine, execute } = patchSetup()
+    const result = await execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }],
+      fxOrder: [...FX_IDS].reverse(),
+      presetName: 'Not Saved',
+      auditionNotes: [{ note: 'C2', velocity: 1, start: 0, duration: 0.2 }],
+      dryRun: true
+    })
+    expect(result).toMatchObject({ dryRun: true, applied: false })
+    expect(result.wouldApply.parameters[0]).toMatchObject({ id: 'filter1.cutoff', formatted: '900.0 Hz', willChange: true })
+    expect(result.wouldApply.parameters[0].from).toBe('8.00 kHz')
+    expect(result.wouldApply.fxOrder).toEqual({ from: [...FX_IDS], to: [...FX_IDS].reverse() })
+    expect(result.wouldApply.presetName).toBe('Not Saved')
+    expect(result.wouldApply.audition.pitches).toEqual(['C2 (MIDI 36, 65.4 Hz)'])
+    expect(engine.setParam).not.toHaveBeenCalled()
+    expect(engine.setFxOrder).not.toHaveBeenCalled()
+    expect((await execute('list_presets')).user).toBe(0)
+  })
+
+  it('rolls the whole patch back when a write fails part-way through', async () => {
+    const { engine, execute } = patchSetup()
+    const cutoff = paramIndex('filter1.cutoff')
+    const before = engine.values[cutoff]
+    let writes = 0
+    engine.setModSlot.mockImplementation((slot: number, state: ModSlotState | null) => {
+      // Fail on the second route, after the parameters have already landed.
+      if (++writes === 2) throw new Error('worklet post failed')
+      engine.modSlots[slot] = state
+    })
+    await expect(execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }],
+      modulations: {
+        routes: [
+          { source: 'env2', destination: 'filter1.cutoff', depth: 0.4 },
+          { source: 'lfo1', destination: 'osc1.morph', depth: 0.3 }
+        ]
+      }
+    })).rejects.toThrow(/apply_patch applied nothing: worklet post failed.*rolled back/s)
+    // Both halves are back: the parameter that landed and the route that landed.
+    expect(engine.values[cutoff]).toBe(before)
+    expect(engine.modSlots.filter(Boolean)).toEqual([])
+    // The revert used the same 'ai' origin the writes used, so the agent-change
+    // ledger nets to zero instead of leaving a half-patch to Keep or Reject.
+    expect(engine.setParam.mock.calls.map(call => call[2] ?? call[1])).not.toContain('restore')
+    expect(engine.setParam).toHaveBeenLastCalledWith(cutoff, before, 'ai')
+  })
+
+  it('keeps a good patch when only the save or the audition fails', async () => {
+    const { engine, execute } = patchSetup()
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      get() { throw new DOMException('blocked', 'SecurityError') }
+    })
+    const saved = await execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }], presetName: 'Blocked'
+    })
+    // Reverting a good patch because storage is full would be the wrong trade,
+    // and swallowing the failure would be worse. Applied, and said out loud.
+    expect(saved.applied.parameters).toHaveLength(1)
+    expect(saved.preset).toMatchObject({ name: 'Blocked', saved: false })
+    expect(saved.preset.error).toMatch(/storage/i)
+    expect(saved.preset.note).toMatch(/patch IS applied/)
+    expect(engine.setParam).toHaveBeenCalledTimes(1)
+
+    const failing = patchSetup()
+    failing.renderOffline.mockRejectedValue(new Error('offline context refused'))
+    const audition = await failing.execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }],
+      auditionNotes: [{ note: 'C2', velocity: 1, start: 0, duration: 0.2 }]
+    })
+    expect(audition.applied.parameters).toHaveLength(1)
+    expect(audition.audition).toMatchObject({ rendered: false })
+    expect(audition.audition.error).toMatch(/offline context refused/)
+    expect(failing.engine.setParam).toHaveBeenCalledTimes(1)
+  })
+
+  it('adds and updates routes without clearing when replace is omitted', async () => {
+    const { engine, execute } = patchSetup()
+    engine.modSlots[2] = { source: modSourceIndex('env2'), dest: paramIndex('filter1.cutoff'), depth: 0.1, enabled: false }
+    const result = await execute('apply_patch', {
+      parameters: [{ id: 'filter1.cutoff', value: 900 }],
+      modulations: {
+        routes: [
+          // Same pair as slot 2: updated in place, keeping `enabled` where it is,
+          // exactly as set_modulation's `add` resolves it.
+          { source: 'env2', destination: 'filter1.cutoff', depth: 0.6 },
+          { source: 'lfo1', destination: 'osc1.morph', depth: 0.3 }
+        ]
+      }
+    })
+    expect(result.applied.modulations.cleared).toBe(0)
+    expect(result.applied.modulations.routes).toEqual([
+      { slot: 2, source: 'env2', destination: 'filter1.cutoff', depth: 0.6, enabled: false },
+      { slot: 0, source: 'lfo1', destination: 'osc1.morph', depth: 0.3, enabled: true }
+    ])
+    // `replace: true` with no routes is how the matrix is emptied.
+    const cleared = await execute('apply_patch', { modulations: { replace: true } })
+    expect(cleared.applied.modulations).toMatchObject({ cleared: 2, total: 0 })
+    expect(engine.modSlots.filter(Boolean)).toEqual([])
   })
 })
 
@@ -1575,6 +2025,27 @@ describe('matching a reference: harmonics on both sides, a gradient, and advice'
         // Two partials only: darker than the reference's six, so the diff has a
         // real gradient for the advice to rank.
         return 0.3 * Math.exp(-4 * t) * (Math.sin(2 * Math.PI * f0 * t) + 0.2 * Math.sin(4 * Math.PI * f0 * t))
+      })
+      return wav([channel, channel.slice()], duration)
+    })
+  }
+
+  /**
+   * A patch that SUSTAINS while the note is held and releases after note-off —
+   * the ordinary case, and the one the auto-render used to make unmeasurable by
+   * holding the note to the last sample of the buffer.
+   */
+  function sustainingRenderer() {
+    return vi.fn(async (_engine: unknown, notes: readonly { midi: number }[], duration: number): Promise<RecordedAudio> => {
+      const length = Math.max(64, Math.round(duration * RATE))
+      const note = notes[0] as { midi: number; start?: number; duration?: number } | undefined
+      const f0 = 440 * Math.pow(2, ((note?.midi ?? 69) - 69) / 12)
+      const noteOff = (note?.start ?? 0) + (note?.duration ?? duration)
+      const channel = Float32Array.from({ length }, (_, index) => {
+        const t = index / RATE
+        // Flat while held, then a 50 ms release constant.
+        const level = t <= noteOff ? 1 : Math.exp(-(t - noteOff) / 0.05)
+        return 0.4 * level * (Math.sin(2 * Math.PI * f0 * t) + 0.2 * Math.sin(4 * Math.PI * f0 * t))
       })
       return wav([channel, channel.slice()], duration)
     })
@@ -1763,6 +2234,45 @@ describe('matching a reference: harmonics on both sides, a gradient, and advice'
     await execute('update_parameters', { updates: [{ id: 'osc1.transpose', value: 0 }, { id: 'osc1.fine', value: 0 }] })
     const inTuneAgain = await execute('compare_audio', { format: 'json' })
     expect(Math.abs(inTuneAgain.diff.pitch.centsError)).toBeLessThan(5)
+  })
+
+  it('releases the auto-rendered note before the buffer ends, so the candidate decays like the reference', async () => {
+    const { execute, renderOffline } = matchSetup(pitchedReference, sustainingRenderer())
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const result = await execute('compare_audio', { format: 'json' })
+
+    // Note-off used to land on the last sample of the buffer, so the candidate
+    // never entered its release at all.
+    const [, rendered, duration] = renderOffline.mock.calls[0]
+    const notes = rendered as readonly { midi: number; start: number; duration: number }[]
+    expect(notes).toHaveLength(1)
+    expect(notes[0].start + notes[0].duration).toBeLessThan(duration)
+    // 0.25 s of tail, capped at 40 % of the buffer: a 0.5 s reference holds the
+    // note for 0.3 s and leaves 0.2 s for the release.
+    expect(duration).toBeCloseTo(0.5, 2)
+    expect(notes[0].duration).toBeCloseTo(0.3, 2)
+
+    // The three metrics that were reading a still-sounding note: T60 is a real
+    // measurement again, and the comparison it feeds is no longer `n/a`.
+    expect(result.candidate.metrics.decayT60Ms).toBeGreaterThan(0)
+    // The candidate half of the T60 comparison exists again. Whether the delta
+    // resolves is then up to the reference, which is the honest dependency —
+    // before this, the candidate half was structurally absent on every default
+    // comparison however measurable the reference was.
+    expect(result.comparison.details.decayT60Ms.candidate).toBeGreaterThan(0)
+    // Sustain is sampled at 80 % of the buffer — inside the release now, as it is
+    // for a reference that has already died away by then.
+    expect(result.candidate.metrics.sustainDb).toBeLessThan(-10)
+
+    // Held for the whole buffer, the same patch has no measurable decay at all:
+    // that is exactly what the default path was doing to every comparison.
+    const held = await execute('compare_audio', {
+      format: 'json',
+      notes: [{ midi: REFERENCE_MIDI, velocity: 1, start: 0, duration: 0.5 }],
+      duration: 0.5
+    })
+    expect(held.candidate.metrics.decayT60Ms).toBeNull()
+    expect(held.candidate.metrics.sustainDb).toBeGreaterThan(-3)
   })
 
   it('reports n/a rather than a borrowed fundamental when the candidate has no detectable pitch', async () => {
