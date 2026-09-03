@@ -44,6 +44,11 @@ export const WELCOME_TOUR_STEPS: readonly GuideStep[] = [
       '- Show me how the filter shapes the sound.',
       '- Where can I find the echo?'
     ].join('\n')
+  },
+  {
+    target: { id: 'button.history.walkthrough' },
+    title: 'Reopen this anytime',
+    markdown: 'This walkthrough lives behind the **help button**. Click it whenever you want the tour again.'
   }
 ]
 

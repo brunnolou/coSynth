@@ -5,18 +5,18 @@ import { WELCOME_TOUR_STEPS, WELCOME_TOUR_STORAGE_KEY, WelcomeTour } from './wel
 function guide(active = false) {
   return {
     isActive: vi.fn(() => active),
-    show: vi.fn(() => ({ shown: true, stepCount: 4, warnings: [] }))
+    show: vi.fn(() => ({ shown: true, stepCount: 5, warnings: [] }))
   }
 }
 
 describe('welcome tour', () => {
-  it('uses the agreed four-step story and semantic targets', () => {
-    expect(WELCOME_TOUR_STEPS).toHaveLength(4)
+  it('uses the agreed five-step story and semantic targets', () => {
+    expect(WELCOME_TOUR_STEPS).toHaveLength(5)
     expect(WELCOME_TOUR_STEPS.map(step => step.title)).toEqual([
-      'Create sounds with AI', 'Your sound-design partner', 'Play it', 'Ask for anything'
+      'Create sounds with AI', 'Your sound-design partner', 'Play it', 'Ask for anything', 'Reopen this anytime'
     ])
     expect(WELCOME_TOUR_STEPS.map(step => step.target && 'id' in step.target ? step.target.id : null)).toEqual([
-      null, 'panel.agent.ai', 'panel.keyboard', 'panel.synth'
+      null, 'panel.agent.ai', 'panel.keyboard', 'panel.synth', 'button.history.walkthrough'
     ])
     expect(WELCOME_TOUR_STEPS[2].markdown).toContain('A W S E D F T G Y H U J K')
     expect(WELCOME_TOUR_STEPS[2].markdown).toContain('Z / X')
