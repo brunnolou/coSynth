@@ -72,6 +72,8 @@ try {
   assert.match(await page.locator('.driver-popover-description').textContent(), /Z \/ X/)
   await next(); await highlighted('panel.synth')
   assert.match(await page.locator('.driver-popover-description').textContent(), /80s synth bass/)
+  await next(); await highlighted('button.history.walkthrough')
+  assert.match(await page.locator('.driver-popover-description').textContent(), /help button/)
   await next()
   await page.locator('.driver-popover').waitFor({ state: 'detached' })
   assert.equal(await page.evaluate(() => localStorage.getItem('cosynth.walkthrough.seen.v1')), '1')
@@ -227,7 +229,7 @@ try {
 
   // Every built-in step remains readable when the synth switches to its narrow layout.
   await walkthrough.click()
-  for (const title of ['Create sounds with AI', 'Your sound-design partner', 'Play it', 'Ask for anything']) {
+  for (const title of ['Create sounds with AI', 'Your sound-design partner', 'Play it', 'Ask for anything', 'Reopen this anytime']) {
     await page.locator('.driver-popover-title', { hasText: title }).waitFor()
     const popover = await page.locator('.driver-popover').boundingBox()
     assert.ok(popover.x >= 0 && popover.x + popover.width <= 391, `${title} must fit horizontally`)

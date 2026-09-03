@@ -1,5 +1,7 @@
 import { defineConfig } from 'vitest/config'
 
+const devPort = Number(process.env.PORT) || 5173
+
 export default defineConfig({
   // The DSP worklet is imported with `?worker&url` so Vite bundles it as a
   // standalone module file that AudioWorklet.addModule() can load. AudioWorklet
@@ -22,10 +24,12 @@ export default defineConfig({
     exclude: ['**/node_modules/**', '**/dist/**', '.claude/**']
   },
   server: {
-    port: Number(process.env.PORT) || 5173,
+    port: devPort,
     proxy: {
       '/register': { target: 'ws://[::1]:4797', ws: true },
-      '/localhost_5173': { target: 'ws://[::1]:4797', ws: true }
+      // The widget derives its channel from `window.location.host`, so this key
+      // has to follow the port the server actually took.
+      [`/localhost_${devPort}`]: { target: 'ws://[::1]:4797', ws: true }
     }
   }
 })
