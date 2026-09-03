@@ -103,6 +103,66 @@
  * `suggested` move; it is named in the finding, in the vocabulary
  * `set_modulation` and `apply_patch`'s `modulations` block both take.
  *
+ * ## A trajectory has a SHAPE, and a scalar does not
+ *
+ * `brightness[]` is a per-window trajectory and `filter-envelope-depth` used to
+ * read exactly two numbers out of it, `last - first`. That slope is enough to
+ * say the sweep is wrong and not enough to say which STAGE of it is: a drift
+ * present in the first window is a decay running at the wrong RATE, while a
+ * steady offset that holds for half the buffer and then falls away is a decay
+ * that starts at the wrong TIME. Both read as the same slope.
+ *
+ * An eval run priced the difference. The rule named the right mechanism — the
+ * `env2 -> filter1.cutoff` route — five times running, and the agent declined it
+ * four; applied as written it took the score 0.747 -> 0.655, while the same
+ * mechanism re-shaped as hold-then-decay took brightness 0.571 -> 0.702 and the
+ * score to 0.783. Prescribing a slower decay for a trajectory that is flat early
+ * moves the windows that ALREADY AGREE, which is how advice can be directionally
+ * right and still score worse than doing nothing.
+ *
+ * `trendShape` locates the split instead of assuming one: every interior break
+ * is tried and the one whose early stretch is flattest relative to its late
+ * stretch wins. A near-flat opening prescribes `env2.hold` — the time env2 sits
+ * at its peak before the decay begins, so lengthening it moves the sweep later
+ * and leaves the early windows where they are — or `env2.dec_curve` when hold
+ * cannot deliver it, since a negative decay curve carries the same contour
+ * inside the decay stage. Anything else keeps the decay probe it always had.
+ *
+ * `unresolved` is the third answer and it is first-class. Four measured windows
+ * is the fewest that can carry a departure (gated rows are dropped before the
+ * count), so a shorter trajectory says which reading it is assuming, names the
+ * stage it is NOT moving, and gives up a confidence step. Inventing a contour
+ * out of three rows would be this same over-claim wearing a new costume.
+ *
+ * ## One measurement, two parameters: `sustain-level` declines rather than guess
+ *
+ * `envelope.sustainDbDelta` is the level at 80% of the buffer relative to the
+ * peak, and decay TIME and sustain LEVEL produce that level TOGETHER: a note
+ * whose decay is too fast reads low at 80% with its sustain already correct.
+ * The rule read only the level and steered only `env1.sustain`, which the same
+ * eval run caught suggesting `env1.sustain` nine times with `env1.decay` the
+ * real lever every time.
+ *
+ * What the diff CAN settle is the sign. Both deltas are `candidate - reference`,
+ * so a decay error that runs the same way as the level error is a sufficient
+ * explanation for it, one that runs the other way is masking a sustain error at
+ * least as large as the number measured, and a decay inside `DECAY_SILENCE_MS`
+ * is not available as an explanation at all. Those three cases steer `env1.decay`
+ * (via `decay-t60`, which shares the threshold), steer `env1.sustain`, and steer
+ * `env1.sustain` respectively.
+ *
+ * What it CANNOT settle is how much: `MatchDiff.envelope` carries the difference
+ * of the two T60s and neither absolute, so the fraction of the dB error the
+ * decay accounts for is not computable here. The rule therefore emits NO move in
+ * the same-sign case and says so, rather than moving the parameter it cannot
+ * exonerate. The measurement that would close it is named in the finding —
+ * `audio-analysis.ts` already computes a 64-point `envelopeDb` per side and
+ * `compareAudioMetrics` collapses both into a single Pearson correlation, so
+ * carrying those curves (or their per-point difference) on `MatchDiff.envelope`
+ * would show WHERE the two envelopes part, which separates a decay difference
+ * from a sustain one exactly the way `brightness[]` separates a decay from a
+ * hold. That is a contract widening, not new DSP.
+ *
  * ## Probe steps versus computed corrections
  *
  * Some rules can compute their correction exactly (`pitch-error`, `loudness`,
@@ -204,9 +264,15 @@
  *   range, not a tuning offset, so pitch corrections steer `osc1.transpose` and
  *   `osc1.fine`.
  * - `MatchDiff.envelope.timeToPeakMsDelta` has no parameter of its own that
- *   `attackMsDelta` does not already cover (delay/hold would explain the rest,
- *   and a real ADSR fit is out of scope until `envelope-fit.ts`), so no rule
- *   reads it.
+ *   `attackMsDelta` does not already cover (`env1.delay`/`env1.hold` would
+ *   explain the rest, and a real ADSR fit is out of scope until
+ *   `envelope-fit.ts`), so no rule reads it. `env2.hold` is steered — by
+ *   `filter-envelope-depth`, off the brightness trajectory's shape — because
+ *   env2's contour is visible in `brightness[]` window by window, which is
+ *   exactly the per-point view `MatchDiff.envelope` does not carry for env1.
+ * - Which of `env1.decay` and `env1.sustain` owns a level error at 80% of the
+ *   buffer is only decidable by SIGN here; see `sustain-level` for the
+ *   measurement that would make it quantitative.
  * - `MatchDiff.similarity` is carried through for eval trajectories and steers
  *   nothing.
  */
@@ -518,9 +584,15 @@ function mean(values: number[]): number {
   return values.length === 0 ? 0 : values.reduce((a, b) => a + b, 0) / values.length
 }
 
-/** Mean band error over bands centred at or above `minHz`. */
+/**
+ * Mean band error over bands centred at or above `minHz`, ignoring any band above one side's
+ * Nyquist. Those carry a finite `deltaDb` that nothing compared, so averaging them in dilutes
+ * the real error - a 16 kHz reference cuts one of the three bands at or above 4 kHz, which
+ * made `upper-bands-quiet` ask for an `eq.high_gain` move a third too small. `null` when every
+ * band in range was cut, which the callers already treat as "no usable reading".
+ */
 function bandMean(bands: MatchDiff['bands'], minHz: number): number | null {
-  const vals = bands.filter(b => b.centerHz >= minHz).map(b => b.deltaDb)
+  const vals = bands.filter(b => !b.aboveNyquist && b.centerHz >= minHz).map(b => b.deltaDb)
   return vals.length === 0 ? null : mean(vals)
 }
 
@@ -549,6 +621,109 @@ function gatedWindowNote(brightness: MatchDiff['brightness'], used: number): str
   return gated > 0
     ? ` (${gated} of the ${brightness.length} windows sat below the analyzer's noise gate on one side or the other and are left out: their centroids describe the noise the sound decayed into, and the similarity score leaves them out too)`
     : ''
+}
+
+/**
+ * WHERE along the trajectory the drift happens, which is a different question
+ * from how big it is — and the one that decides which envelope STAGE is wrong.
+ *
+ * `last - first` is a slope and nothing else. Two trajectories with the same
+ * slope want opposite moves: one that has already parted company in the first
+ * window is a decay running at the wrong RATE, and one that holds a steady
+ * offset for half the buffer and then falls off a cliff is a decay that starts
+ * at the wrong TIME. An eval run made the difference concrete — the rule below
+ * named the right mechanism (the env2 -> filter1.cutoff route) five times and
+ * the wrong contour every time; following it as written cost 0.09 of similarity,
+ * while the same mechanism shaped as hold-then-decay gained 0.036 and fixed the
+ * brightness term the advice was aimed at. Prescribing a slower decay for a
+ * trajectory that is flat early moves the windows that already AGREE, which is
+ * how advice can be directionally right and score worse than doing nothing.
+ *
+ * The whole trajectory is in hand, so the split is read rather than assumed.
+ */
+type TrendShape =
+  /** The drift runs from the first measured window: the decay RATE. */
+  | { kind: 'throughout' }
+  /** A steady offset through `breakIndex`, then the drift: the decay's START. */
+  | { kind: 'late'; breakIndex: number; breakMs: number }
+  /** Not enough measured windows, or no split that reads as a departure. */
+  | { kind: 'unresolved'; why: string }
+
+/**
+ * Fewer measured windows than this and no shape is readable: a departure needs
+ * an early stretch, a late stretch, and a split between them, so four rows is
+ * the smallest trajectory that can carry one. Gated rows are already gone by
+ * the time this is counted.
+ */
+const MIN_SHAPE_WINDOWS = 4
+
+/**
+ * How flat the early stretch has to be, relative to the late one, before the
+ * drift counts as STARTING late rather than running throughout.
+ *
+ * A threshold rather than a fitted boundary, and deliberately strict: a
+ * trajectory whose early slope is a third of its late slope is still drifting
+ * early, and the decay is still the honest answer for it. Only a near-flat
+ * opening earns the hold-shaped prescription.
+ */
+const FLAT_EARLY_SLOPE_RATIO = 0.3
+
+/**
+ * Least-squares slope of `values` against their index, in units per window.
+ *
+ * Endpoints would be cheaper and are exactly what this is replacing: a slope
+ * read off two rows is one noisy row away from a different verdict, and this
+ * rule already learned that lesson once when a hiss-derived last window put an
+ * `env2.decay` move at the top of the list.
+ */
+function windowSlope(values: readonly number[]): number {
+  const n = values.length
+  if (n < 2) return 0
+  const meanX = (n - 1) / 2
+  const meanY = mean([...values])
+  let num = 0
+  let den = 0
+  for (let i = 0; i < n; i++) {
+    num += (i - meanX) * (values[i] - meanY)
+    den += (i - meanX) ** 2
+  }
+  return den > 0 ? num / den : 0
+}
+
+/**
+ * Classify a brightness trajectory as drifting throughout or departing late.
+ *
+ * Every interior split is tried and the one whose early half is FLATTEST
+ * relative to its late half wins, so the break point is located rather than
+ * guessed at the midpoint. A split whose late half does not move the way the
+ * whole trajectory does cannot be a departure and is skipped.
+ *
+ * `unresolved` is a first-class answer, not a fallback: a three-window
+ * trajectory genuinely cannot tell a sweep that starts at note-on from one that
+ * starts partway through, and inventing a contour out of it would be the same
+ * over-claim in a new place.
+ */
+function trendShape(windows: MatchDiff['brightness'], trend: number): TrendShape {
+  if (windows.length < MIN_SHAPE_WINDOWS) {
+    return {
+      kind: 'unresolved',
+      why: `only ${windows.length} measured window${windows.length === 1 ? '' : 's'}, fewer than the ${MIN_SHAPE_WINDOWS} it takes to tell a drift that starts at note-on from one that starts partway through`
+    }
+  }
+  const values = windows.map(w => w.octaveDelta)
+  let best: { index: number; ratio: number } | null = null
+  for (let k = 1; k <= values.length - 2; k++) {
+    const late = windowSlope(values.slice(k))
+    if (late === 0 || Math.sign(late) !== Math.sign(trend)) continue
+    const ratio = Math.abs(windowSlope(values.slice(0, k + 1))) / Math.abs(late)
+    if (!best || ratio < best.ratio) best = { index: k, ratio }
+  }
+  if (!best) {
+    return { kind: 'unresolved', why: 'no stretch of this trajectory drifts the way the trajectory as a whole does, so which part of the note the drift belongs to is not readable from it' }
+  }
+  return best.ratio <= FLAT_EARLY_SLOPE_RATIO
+    ? { kind: 'late', breakIndex: best.index, breakMs: windows[best.index].startMs }
+    : { kind: 'throughout' }
 }
 
 const SEMITONE_CENTS = 100
@@ -804,6 +979,31 @@ function dampedFactor(error: number, scale: number, maxExtra: number): number {
 /** Error magnitude, in octaves of brightness drift, at which `filter-envelope-depth` saturates. */
 const BRIGHTNESS_TREND_SCALE = 2
 
+/**
+ * The largest step the `env2.dec_curve` probe takes, in raw curve units out of
+ * the parameter's -1..1 span, at saturation.
+ *
+ * `params.ts` measures the curve rather than describing it: decay applies
+ * `1 - curveShape(t, -dec_curve)`, so a NEGATIVE `dec_curve` "holds near the
+ * level it started from and drops steeply only at the end of the stage" — the
+ * default -0.4 is still at 96% of its starting level a quarter of the way
+ * through. That is a hold expressed inside the decay stage, which is why it is
+ * the fallback lever when `env2.hold` itself cannot move.
+ */
+const MAX_CURVE_PROBE = 0.4
+
+/**
+ * Below this |decayT60MsDelta| the decay counts as MATCHING, in ms.
+ *
+ * One constant, two rules, on purpose. It is `decay-t60`'s silence threshold —
+ * the point below which that rule declines to call the decay wrong — and
+ * `sustain-level` uses the same number to decide whether a decay difference is
+ * available to blame its own reading on. Two thresholds would leave a band in
+ * which `decay-t60` says the decay is fine and `sustain-level` says the decay
+ * is why it will not steer, which is one measurement contradicting itself.
+ */
+const DECAY_SILENCE_MS = 20
+
 /** Error magnitude, in stretch coefficient B, at which `inharmonicity` saturates. */
 const INHARMONICITY_SCALE = 2e-3
 
@@ -1044,7 +1244,10 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const h = diff.harmonics
       if (!h) return null
       const tilt = h.tiltDeltaDbPerOctave
-      if (!Number.isFinite(tilt)) return null
+      // `null` when a side had fewer than two partials above the noise: no slope to compare,
+      // rather than a flat one. `Number.isFinite(null)` is already false; the explicit test is
+      // what tells the compiler so.
+      if (tilt === null || !Number.isFinite(tilt)) return null
       const darker = tilt < 0
       const headline = `Spectral tilt is ${n1(Math.abs(tilt))} dB/octave ${darker ? 'steeper' : 'shallower'} than the reference, so the candidate's partial series is ${darker ? 'duller' : 'brighter'} overall.`
       // Coarse: 0.05 of drive per dB/octave of tilt error. Drive is the only
@@ -1254,10 +1457,13 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
   {
     id: 'filter-envelope-depth',
     category: 'envelope',
-    reads: ['brightness[].octaveDelta'],
+    reads: ['brightness[].octaveDelta', 'brightness[].startMs'],
     // The real knob is the env -> filter1.cutoff mod slot depth, which has no
-    // PARAMS id. These are the envelope parameters that shape the same sweep.
-    paramIds: ['env2.decay', 'env2.sustain', 'filter1.cutoff'],
+    // PARAMS id. These are the envelope parameters that shape the same sweep:
+    // `env2.decay` is its RATE, `env2.hold` and `env2.dec_curve` are WHEN it
+    // starts, and which of the two the trajectory implicates is `trendShape`'s
+    // whole job.
+    paramIds: ['env2.decay', 'env2.hold', 'env2.dec_curve', 'env2.sustain', 'filter1.cutoff'],
     scale: BRIGHTNESS_TREND_SCALE,
     weight: 0.15,
     minError: 0.3,
@@ -1285,20 +1491,86 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       // silence threshold, so successive overshoots shrink geometrically.
       const factor = dampedFactor(trend, BRIGHTNESS_TREND_SCALE, 0.5)
       const drift = `Brightness error drifts ${n1(Math.abs(trend))} octaves across the buffer (${n1(first)} in the first window, ${n1(last)} in the last), so the candidate ${tooFast ? 'darkens too fast' : 'holds its brightness too long'}${gatedWindowNote(diff.brightness, windows.length)}. This is envelope shape, not static cutoff`
+      // WHICH envelope stage, read off the trajectory rather than assumed. The
+      // rule used to prescribe the decay for every shape; see `TrendShape`.
+      const shape = trendShape(windows, trend)
+
+      /**
+       * The stage this shape implicates, the move that shapes it, and the
+       * sentences that say why. `later` is "the sweep should run later or
+       * slower", already resolved against the route polarity by the caller —
+       * with a negative depth the cutoff runs AGAINST env2, so the same drift
+       * wants the opposite move and every branch here has to follow that.
+       */
+      const shapeMove = (later: boolean) => {
+        if (shape.kind === 'late') {
+          // `breakIndex` is at least 1, so the early stretch is never one row
+          // and the plural never needs a guard.
+          const wrongLever = `The drift does not start at note-on: the first ${shape.breakIndex + 1} measured windows hold a steady offset and it only departs ${shape.breakMs} ms in, so what is wrong is WHEN the sweep starts, not how steep it is - env2.decay reshapes the stage from note-on and would move the early windows that already agree.`
+          const wantedHold = round(shape.breakMs / 1000, 3)
+          const holdPlan = planMove(patch, 'env2.hold', from => (later ? Math.max(from, wantedHold) : Math.min(from, wantedHold)))
+          if (holdPlan.suggested) {
+            return {
+              plan: holdPlan,
+              direction: (later ? 'increase' : 'decrease') as MatchAction['direction'],
+              paramIds: ['env2.hold', 'env2.dec_curve', 'env2.decay'],
+              lead: `${later ? 'lengthen' : 'shorten'} env2.hold`,
+              emphaticLead: `${later ? 'LENGTHEN' : 'SHORTEN'} env2.hold`,
+              why: ` ${wrongLever} env2.hold is the time env2 sits at its PEAK before the decay begins, so ${later ? 'lengthening' : 'shortening'} it moves the sweep ${later ? 'later' : 'earlier'} and leaves those windows alone.`,
+              probe: ` The suggested env2.hold of ${holdPlan.suggested.to} s is a PROBE read off where the trajectory parts, not a computed correction: if the next measurement comes back too ${later ? 'bright' : 'dark'} early, the shape is a curve rather than a hold and env2.dec_curve is the lever.`,
+              remainder: 'env2.hold spans 2 s; a sweep that has to start later than that belongs to env2.delay in front of it, or to the route depth.'
+            }
+          }
+          // Hold cannot deliver it - the patch does not carry env2.hold, or it
+          // already sits past the departure point. The same contour lives
+          // inside the decay stage as its CURVE, which is the one other lever
+          // that changes the tail without touching the early windows.
+          const curvePlan = planMove(patch, 'env2.dec_curve', from => from + (later ? -1 : 1) * (dampedFactor(trend, BRIGHTNESS_TREND_SCALE, MAX_CURVE_PROBE) - 1))
+          return {
+            plan: curvePlan,
+            direction: (later ? 'decrease' : 'increase') as MatchAction['direction'],
+            paramIds: ['env2.dec_curve', 'env2.hold', 'env2.decay'],
+            lead: `drive env2.dec_curve ${later ? 'negative' : 'positive'}`,
+            emphaticLead: `drive env2.dec_curve ${later ? 'NEGATIVE' : 'POSITIVE'}`,
+            why: ` ${wrongLever} env2.hold cannot deliver that from where it sits, so the lever is env2.dec_curve, which carries the same contour inside the decay stage: negative holds near its starting level and drops steeply at the END of the stage, positive falls fast and trails off.`,
+            probe: ` The suggested ${later ? 'fall' : 'rise'} on env2.dec_curve is a PROBE sized from the error, not a computed correction.`,
+            remainder: 'env2.dec_curve runs out at -1..1; past that the contour has to come from env2.hold or env2.delay.'
+          }
+        }
+        const decayPlan = planMove(patch, 'env2.decay', from => (later ? from * factor : from / factor))
+        const unresolved = shape.kind === 'unresolved'
+          ? ` Which stage is not readable - ${shape.why} - so this move assumes the drift starts at note-on; if it makes the EARLY part of the note wrong, the shape is a hold (env2.hold) rather than a slow decay.`
+          : ` The drift runs from the first measured window, so it is the decay RATE rather than when the decay starts.`
+        return {
+          plan: decayPlan,
+          direction: (later ? 'increase' : 'decrease') as MatchAction['direction'],
+          // The pre-shape default, kept exactly: a decay-shaped trajectory gets
+          // the advice it always got.
+          paramIds: ['env2.decay', 'env2.sustain', 'filter1.cutoff'],
+          lead: `${later ? 'lengthen env2.decay / raise env2.sustain' : 'shorten env2.decay / lower env2.sustain'}`,
+          emphaticLead: `${later ? 'LENGTHEN env2.decay / raise env2.sustain' : 'SHORTEN env2.decay / lower env2.sustain'}`,
+          why: unresolved,
+          probe: ` The suggested ${later ? 'x' : '÷'}${round(factor, 2)} on env2.decay is a PROBE sized from the error, not a computed correction - apply it, re-measure, expect several rounds.`,
+          remainder: 'Take the rest from the route depth, or from env2.sustain.'
+        }
+      }
+
       const state = routeState(mods, 'env2', 'filter1.cutoff')
 
       // No matrix was passed. Unchanged from before it could be: hedge in prose,
       // stay `low`, and do NOT report "there is no route" - nobody looked.
       if (!state.seen) {
+        const stage = shapeMove(tooFast)
         return {
           error: trend,
-          finding: `${drift}: ${tooFast ? 'lengthen env2.decay / raise env2.sustain, or reduce' : 'shorten env2.decay / lower env2.sustain, or increase'} the depth of the env2 -> filter1.cutoff mod slot (set_modulation). That mod slot is the REAL fix and has no parameter id, so it can never appear as a suggested move; env2 reaches the sound through it and nothing else, and if the route does not exist in this patch then env2.decay is inert and set_modulation is the whole job. The direction above assumes that slot has POSITIVE depth, the usual wiring: this call passed no modulation matrix, so its sign is as unreadable from here as its existence, and with an inverted slot the same move lengthens the wrong stage. The suggested ${tooFast ? 'x' : '÷'}${round(factor, 2)} on env2.decay is a PROBE sized from the error, not a computed correction - apply it, re-measure, expect several rounds.`,
-          direction: tooFast ? 'increase' : 'decrease',
+          finding: `${drift}: ${stage.lead}, or ${tooFast ? 'reduce' : 'increase'} the depth of the env2 -> filter1.cutoff mod slot (set_modulation). That mod slot is the REAL fix and has no parameter id, so it can never appear as a suggested move; env2 reaches the sound through it and nothing else, and if the route does not exist in this patch then every env2 stage is inert and set_modulation is the whole job. The direction above assumes that slot has POSITIVE depth, the usual wiring: this call passed no modulation matrix, so its sign is as unreadable from here as its existence, and with an inverted slot the same move shapes the sweep the wrong way.${stage.why}${stage.probe}${clampNote(stage.plan, stage.remainder)}`,
+          direction: stage.direction,
           // The route may not exist, the step is a probe rather than a fit, and
           // the trend can also come from an amplitude decay that reweights the
           // windows. Three reasons for `low`.
           confidence: 'low',
-          suggested: suggest(patch, 'env2.decay', from => (tooFast ? from * factor : from / factor))
+          suggested: stage.plan.suggested,
+          paramIds: stage.paramIds
         }
       }
 
@@ -1332,7 +1604,7 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
             : `this patch's env2 -> filter1.cutoff route sits at depth ${round(state.route.depth, 3)}, under the ${MIN_MOD_DEPTH} it takes to move the cutoff even a tenth of an octave`
         return {
           error: trend,
-          finding: `${drift}, and it is not env2.decay either: ${why}, so env2 reaches nothing and env2.decay / env2.sustain are INERT in this patch. The whole job is the route - set_modulation source=env2 destination=filter1.cutoff depth=${depth}${depth < 0 ? ' (NEGATIVE on purpose: env2 only falls, so a negative depth is what makes the cutoff RISE across the note, which is what this trend asks for)' : ' (positive, the usual downward filter sweep)'}.${depthNote}${sustainNote} A mod slot has no parameter id, so this can never be a suggested move and no move is offered here. The depth is a STARTING POINT sized from the ${n1(Math.abs(trend))} octaves measured and env2.sustain at ${round(sustain, 3)}: a cutoff and a spectral centroid do not move octave for octave, so create the route, re-measure, and shape env2.decay after that.`,
+          finding: `${drift}, and it is not env2.decay either: ${why}, so env2 reaches nothing and env2.decay / env2.sustain are INERT in this patch. The whole job is the route - set_modulation source=env2 destination=filter1.cutoff depth=${depth}${depth < 0 ? ' (NEGATIVE on purpose: env2 only falls, so a negative depth is what makes the cutoff RISE across the note, which is what this trend asks for)' : ' (positive, the usual downward filter sweep)'}.${depthNote}${sustainNote} A mod slot has no parameter id, so this can never be a suggested move and no move is offered here. The depth is a STARTING POINT sized from the ${n1(Math.abs(trend))} octaves measured and env2.sustain at ${round(sustain, 3)}: a cutoff and a spectral centroid do not move octave for octave, so create the route, re-measure, and shape env2 after that - ${shape.kind === 'late' ? `this trajectory only departs ${shape.breakMs} ms in, so the stage to reach for then is env2.hold, not env2.decay` : shape.kind === 'throughout' ? 'this trajectory drifts from its first measured window, so the stage to reach for then is env2.decay' : `which stage is not readable here (${shape.why})`}.`,
           // Which env2 stage to move is not decidable until the route exists,
           // and the action being recommended is not a parameter move at all.
           direction: 'either',
@@ -1360,16 +1632,19 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       // "darkening too fast wants a smaller signed depth" holds for either sign
       // - going from +0.4 to +0.2, or from -0.2 to -0.4, are the same move.
       const depthDirection = tooFast ? 'DOWN' : 'UP'
-      const move = planMove(patch, 'env2.decay', from => (lengthen ? from * factor : from / factor))
+      const stage = shapeMove(lengthen)
       return {
         error: trend,
-        finding: `${drift}. The env2 -> filter1.cutoff route is live at depth ${round(depth, 3)}${positive ? '' : ' - NEGATIVE'}, so the cutoff ${positive ? 'follows env2 and sweeps DOWN as the envelope falls' : 'runs AGAINST env2 and sweeps UP as the envelope falls'}: ${lengthen ? 'LENGTHEN env2.decay / raise env2.sustain' : 'SHORTEN env2.decay / lower env2.sustain'}. ${positive ? '' : 'That is the opposite of the usual advice for this error, and it is the polarity of the route that makes it so. '}The other lever is the route itself: move its signed depth ${depthDirection} from ${round(depth, 3)} with set_modulation (source=env2, destination=filter1.cutoff) - ${depthDirection.toLowerCase()} is right for this error whichever sign the depth carries, since the depth scales a sweep that only ever runs one way. The suggested ${lengthen ? 'x' : '÷'}${round(factor, 2)} on env2.decay is a PROBE sized from the error, not a computed correction: the envelope curve and the filter slope are still unread, so apply it, re-measure, expect several rounds.${clampNote(move, `Take the rest from the route depth, or from env2.sustain.`)}`,
-        direction: lengthen ? 'increase' : 'decrease',
+        finding: `${drift}. The env2 -> filter1.cutoff route is live at depth ${round(depth, 3)}${positive ? '' : ' - NEGATIVE'}, so the cutoff ${positive ? 'follows env2 and sweeps DOWN as the envelope falls' : 'runs AGAINST env2 and sweeps UP as the envelope falls'}: ${stage.emphaticLead}. ${positive ? '' : 'That is the opposite of the usual advice for this error, and it is the polarity of the route that makes it so. '}The other lever is the route itself: move its signed depth ${depthDirection} from ${round(depth, 3)} with set_modulation (source=env2, destination=filter1.cutoff) - ${depthDirection.toLowerCase()} is right for this error whichever sign the depth carries, since the depth scales a sweep that only ever runs one way.${stage.why} The envelope curve and the filter slope are still unread, so nothing here is a fit.${stage.probe}${clampNote(stage.plan, stage.remainder)}`,
+        direction: stage.direction,
         // The route and its polarity are now read rather than assumed, but the
         // step is still a probe and the trend can also come from an amplitude
-        // decay reweighting the windows.
-        confidence: 'medium',
-        suggested: move.suggested
+        // decay reweighting the windows. A trajectory too short to place the
+        // drift within the note drops it a further step: the stage being moved
+        // is then an assumption rather than a reading.
+        confidence: shape.kind === 'unresolved' ? 'low' : 'medium',
+        suggested: stage.plan.suggested,
+        paramIds: stage.paramIds
       }
     }
   },
@@ -1460,7 +1735,10 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const h = diff.harmonics
       if (!h) return null
       const d = h.oddEvenDeltaDb
-      if (!Number.isFinite(d)) return null
+      // `null` when a side had no partial above the noise at all. A parity group sitting
+      // entirely on the floor is still a real reading - that is what a square wave's even
+      // partials are - so only the nothing-found case gets here.
+      if (d === null || !Number.isFinite(d)) return null
       const oddHeavy = d > 0
       return {
         error: d,
@@ -1552,7 +1830,7 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
     paramIds: ['env1.decay', 'env1.release'],
     scale: 1500,
     weight: 0.13,
-    minError: 20,
+    minError: DECAY_SILENCE_MS,
     errorUnit: 'ms',
     evaluate({ diff, patch }) {
       const d = diff.envelope.decayT60MsDelta
@@ -1575,8 +1853,15 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
   {
     id: 'sustain-level',
     category: 'envelope',
-    reads: ['envelope.sustainDbDelta'],
-    paramIds: ['env1.sustain'],
+    // `decayT60MsDelta` is not decoration. `sustainDb` is the envelope level at
+    // 80% of the buffer relative to the peak, and decay TIME and sustain LEVEL
+    // set that level TOGETHER: a note whose decay is too fast reads low at 80%
+    // with its sustain already correct. Reading only `sustainDbDelta` and then
+    // steering `env1.sustain` is measuring one thing and moving another, and an
+    // eval run made the cost of that literal - the same `env1.sustain`
+    // suggestion nine times over, with the decay as the real lever every time.
+    reads: ['envelope.sustainDbDelta', 'envelope.decayT60MsDelta'],
+    paramIds: ['env1.sustain', 'env1.decay', 'env1.dec_curve'],
     scale: 24,
     weight: 0.1,
     minError: 1.5,
@@ -1585,6 +1870,46 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const d = diff.envelope.sustainDbDelta
       if (!Number.isFinite(d)) return null
       const tooLow = d < 0
+      const headline = `Sustain level is ${n1(Math.abs(d))} dB too ${tooLow ? 'low' : 'high'} relative to the peak.`
+      // The one thing this diff genuinely cannot do, said once and reused: it
+      // carries the DIFFERENCE of the two T60s and neither absolute, so the
+      // SIGN of the confound is readable and its SIZE is not.
+      const notComputable = ' Only the SIGN of that is readable here: this diff carries the DIFFERENCE of the two -60 dB decay times and neither absolute, so splitting the dB error between them needs each side\'s 64-point envelopeDb on MatchDiff.envelope.'
+
+      const t60 = diff.envelope.decayT60MsDelta
+      // Null on one side means that buffer held no decay for the T60 line to
+      // fit at all. That is a large envelope difference and it is also the one
+      // state in which nothing is available to attribute the reading to.
+      if (t60 === null || !Number.isFinite(t60)) {
+        return {
+          error: d,
+          finding: `${headline} Which parameter owns it is not decidable here, so no move is offered: the level at 80% of the buffer is set by decay TIME and sustain LEVEL together, and decayT60Ms came back null - one buffer holds no decay for the T60 line to fit - so there is nothing to weigh it against. A candidate that never settles onto a sustain wants env1.sustain; one that settles at the right level but arrives late or early wants env1.decay.${notComputable}`,
+          // Naming a direction would be steering, and this branch declines to.
+          direction: 'either',
+          confidence: 'low',
+          paramIds: ['env1.sustain', 'env1.decay']
+        }
+      }
+
+      // Same sign is the trap. Both deltas are `candidate - reference`, so a
+      // candidate that decays too fast (t60 < 0) reads LOW at 80% (d < 0)
+      // whatever its sustain is set to, and the mirror holds for a slow decay.
+      // The decay is then a sufficient explanation for the whole reading, and
+      // `decay-t60` is already steering `env1.decay` off the very measurement
+      // that says so - the two rules share `DECAY_SILENCE_MS`, so there is no
+      // band where one calls the decay fine and the other blames it.
+      if (Math.abs(t60) >= DECAY_SILENCE_MS && Math.sign(t60) === Math.sign(d)) {
+        return {
+          error: d,
+          finding: `${headline} This rule is NOT steering env1.sustain for it: the level at 80% of the buffer is set by decay TIME and sustain LEVEL together, and the candidate's -60 dB decay is ${n1(Math.abs(t60))} ms too ${t60 < 0 ? 'short' : 'long'}, which drives that reading the same way the error runs - a note that decays too ${t60 < 0 ? 'fast' : 'slowly'} reads ${tooLow ? 'low' : 'high'} here with its sustain already correct. Move env1.decay first (decay-t60 steers it), then read the sustain again.${notComputable}`,
+          direction: 'either',
+          // A finding with no move, on purpose. The confidence is low because
+          // the rule is declining to attribute, not because the error is small.
+          confidence: 'low',
+          paramIds: ['env1.decay', 'env1.sustain', 'env1.dec_curve']
+        }
+      }
+
       // A ratio has no purchase on zero: `0 * 10 ** x` is 0, `planMove` drops the
       // move as no change, and the finding was then describing a correction with
       // nothing attached to it. The delta is relative to each side's own peak,
@@ -1599,13 +1924,22 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
         // envelopes differ in DECAY, not in sustain: there is no headroom left
         // and the rest of the finding is not this parameter's to fix.
         : clampNote(plan, 'The rest is a decay difference rather than a sustain one - look at env1.decay and env1.dec_curve.')
+      // Opposite signs: the decay is pushing the 80% reading AGAINST the error,
+      // so it cannot be what produced it and the sustain error is at least as
+      // large as the number measured. Below the threshold the decay is not
+      // measurably wrong at all, which is the clean case this rule was always
+      // written for.
+      const masked = Math.abs(t60) >= DECAY_SILENCE_MS
       return {
         error: d,
-        finding: `Sustain level is ${n1(Math.abs(d))} dB too ${tooLow ? 'low' : 'high'} relative to the peak.${zeroNote}`,
+        finding: `${headline} ${masked
+          ? `The candidate's -60 dB decay is ${n1(Math.abs(t60))} ms too ${t60 < 0 ? 'short' : 'long'}, which pushes the level at 80% of the buffer the OPPOSITE way from this error, so the decay cannot be what produced it and the sustain error is at least the ${n1(Math.abs(d))} dB measured.`
+          : `The two -60 dB decay times agree within ${DECAY_SILENCE_MS} ms, so there is no decay difference to attribute the level at 80% of the buffer to and env1.sustain is the lever this diff does support.`}${zeroNote}`,
         direction: tooLow ? 'increase' : 'decrease',
-        // sustainDb is sampled at 80% of the buffer, so a long decay still
-        // colours it; the link is direct but not clean.
+        // sustainDb is still sampled at 80% of the buffer rather than fitted, so
+        // even with the decay ruled out the link is direct but not clean.
         confidence: 'medium',
+        paramIds: masked ? ['env1.sustain', 'env1.decay'] : ['env1.sustain'],
         suggested: plan.suggested
       }
     }

@@ -17,12 +17,24 @@
  */
 
 import type { AudioMetrics } from './audio-analysis'
-import { isSpectralWindowBelowNoiseFloor } from './audio-analysis'
+import { isMeasuredPartial, isSpectralWindowBelowNoiseFloor } from './audio-analysis'
+import { BAND_CENTERS_HZ } from './match-diff'
 import type { MatchAction, MatchDiff } from './match-types'
 import { hzToNearestMidi, noteName } from './notes'
 
-/** Width of one partial or band column. Wide enough for `-120.0` and for a 5-cell bar. */
-const COLUMN = 6
+/**
+ * Width of one partial or band column. Wide enough for `-100.0`, the band floor, and for a
+ * 5-cell bar.
+ *
+ * Exported so the tests slice rows by this rather than by a literal 6 - they asserted the
+ * width they assumed rather than the width the formatter uses, which meant an alignment test
+ * that could agree with a wrong answer.
+ *
+ * Known limitation: `signedDb1(-100)` is exactly six characters, so two floored cells sit
+ * flush against each other (`-14.4-100.0+100.0`). Widening to 7 also needs the label prefix
+ * and both snapshots moved; worth doing on its own rather than inside a batch.
+ */
+export const COLUMN = 6
 /** Partials at or below this read as absent from the sparkline rather than as a short bar. */
 const SPARK_FLOOR_DB = -40
 /** Tallest bar. Five cells fit inside `COLUMN` with a separating space, so rows stay aligned. */
@@ -47,6 +59,76 @@ const GATED_WINDOW_NOTE = {
   absolute: '  n/a in a window means it fell below the noise floor, so its centroid measured the noise rather than the sound.',
   diff: '  n/a in a window means one side or both fell below the noise floor there, so nothing was compared - the score leaves those windows out too.'
 } as const
+
+/**
+ * Why a partial cell reads `n/a`. The absolute wording states the fact - the partial is not
+ * there - because that is a real, useful reading of a sound; the diff wording states that
+ * nothing was differenced, because a dB error against a clamp is not an error.
+ */
+const FLOORED_PARTIAL_NOTE = {
+  absolute: '  n/a in a column means no peak above the noise for that partial: it is missing from this sound, not merely quiet.',
+  diff: '  n/a in a column means that partial was above the noise on one side only, or on neither; a one-sided partial still scores as a full mismatch.'
+} as const
+
+/**
+ * Why a band cell reads `n/a`. Not a quiet band and not a gate: the band's lower edge sits
+ * above the Nyquist of this sample rate, so `bandsDb` reads its -100 dB floor there whatever
+ * the sound is.
+ *
+ * Printing that -100 is the same defect the brightness row was fixed for twice, one axis
+ * over. It looks exactly like a level - "the 8k band is 100 dB down" - and an agent that
+ * reads it reaches for brightness parameters to fix an emptiness no patch move can fill,
+ * because the FILE cannot represent those frequencies at all. Worse in the diff, where two
+ * floors subtract to a clean `0.0`: a perfect match, in a band `bandsDetail` never counted.
+ *
+ * On its own line rather than in the cell, for the reason `GATED_WINDOW_NOTE` gives, and
+ * printed only when a band is actually marked - a 44.1 kHz pair marks none, so the common
+ * path is byte-identical to what it printed before the flag existed.
+ */
+const NYQUIST_BAND_NOTE = {
+  absolute: '  n/a in a band means it sits above this sample rate\'s Nyquist: nothing can be there at any level, so there is nothing to measure.',
+  diff: '  n/a in a band means it sits above one side\'s Nyquist, so neither the file nor any patch move can put energy there - the score leaves those bands out too.'
+} as const
+
+/**
+ * Highest frequency this sound can carry, or `Infinity` when the rate is not recorded - a
+ * metrics object built by hand, or serialized before `sampleRateHz` existed, which then
+ * takes every band as measurable exactly as it did before the flag.
+ *
+ * The same rule as `nyquistOrUnbounded` / `isBandMeasurable` in `match-diff.ts`, which is
+ * where it is argued, and as their originals in `audio-analysis.ts`; both are private to
+ * their modules, so this is a third statement of it rather than an import. It is asserted
+ * rather than trusted: a test below renders an `AudioMetrics` through `formatMetrics` and a
+ * self-diff of it through `formatDiff`, and requires the two to mark the SAME bands, so this
+ * copy cannot drift away from the flag whose meaning it is printing.
+ */
+const measurableBands = (sampleRateHz: number | undefined): boolean[] => {
+  const limitHz =
+    typeof sampleRateHz === 'number' && Number.isFinite(sampleRateHz) && sampleRateHz > 0
+      ? sampleRateHz / 2
+      : Number.POSITIVE_INFINITY
+  return BAND_CENTERS_HZ.map((centerHz) => centerHz / Math.SQRT2 < limitHz)
+}
+
+/**
+ * Why this row and `spectralCentroidHz` can name different sides as the brighter one. Both
+ * are centroids of the same audio, and an eval agent reading the two together - the row here
+ * and `comparison.details.spectralCentroidHz` beside it - took the pair for a contradiction
+ * and could not tell which to act on: "brightness said I was too bright (888 vs 620) while
+ * spectralCentroidHz said too dark (574 vs 837) on the same buffer". They are two honest
+ * answers to two questions. This row weights every slice equally; `spectralCentroidHz`
+ * weights by power over the whole buffer, so a quiet bright tail moves this row and barely
+ * moves that number. On one probe buffer with nothing gated at all they read 596 Hz and
+ * 239 Hz, and when the two sides put their brightness in differently-loud slices the sign
+ * between them flips.
+ *
+ * It rides on the block header rather than on a line of its own. Both blocks print it on
+ * every payload - there is no condition to hang it on, since neither formatter can see the
+ * whole-buffer figure it is warning about - and a standing line of prose is a cost the
+ * text-mode byte budget in `tools.test.ts` actually notices. Four words in a header a reader
+ * is already looking at cost a third of that and land in the same eye.
+ */
+const BRIGHTNESS_BASIS = ' - slices weighted equally, unlike spectralCentroidHz'
 
 const pad = (text: string, width = COLUMN): string => text.padStart(width)
 
@@ -200,38 +282,79 @@ export function formatMetrics(metrics: AudioMetrics): string {
   )
 
   lines.push('')
-  // No noise gate here, deliberately. This block renders `harmonicShape.amplitudesDbRelF0`,
-  // fitted once over the WHOLE buffer and therefore dominated by the loud part of it; it is
-  // not a per-slice reading and there is no window to gate it against. Marking it would say
-  // something false about a measurement that is fine.
+  // TWO DIFFERENT QUESTIONS GET ASKED OF THIS BLOCK, AND ONLY ONE OF THEM IS THE NOISE GATE.
   //
-  // The reading that does need the gate is `SpectralWindow.harmonicsDb`, which no formatter
-  // prints today. It is the more dangerous of the two: on a gated slice it does not collapse
-  // to the -120 dB floor but reads a flat fake spectrum - roughly [-80, -82, -82, -80, -83,
-  // -81] - whose fitted tilt is about 0 dB/octave, so it renders as a bright, perfectly even
-  // partial series rather than as an obviously dead one. Whoever adds a per-window partials
-  // row must print `n/a` on a `belowNoiseFloor` slice; a caveat under a plausible-looking
-  // spectrum will not undo it.
+  // 1. Should a WINDOW gate apply? No, deliberately. This renders
+  //    `harmonicShape.amplitudesDbRelF0`, fitted once over the WHOLE buffer and therefore
+  //    dominated by the loud part of it; it is not a per-slice reading and there is no
+  //    window to gate it against. Marking it would say something false about a measurement
+  //    that is fine.
+  //
+  //    The reading that does need that gate is `SpectralWindow.harmonicsDb`, which no
+  //    formatter prints today. It is the more dangerous of the two: on a gated slice it does
+  //    not collapse to the -120 dB floor but reads a flat fake spectrum - roughly [-80, -82,
+  //    -82, -80, -83, -81] - whose fitted tilt is about 0 dB/octave, so it renders as a
+  //    bright, perfectly even partial series rather than as an obviously dead one. Whoever
+  //    adds a per-window partials row must print `n/a` on a `belowNoiseFloor` slice; a
+  //    caveat under a plausible-looking spectrum will not undo it.
+  //
+  // 2. Should a PARTIAL on the -120 floor print as a number? No. `-120.0` looks like a level
+  //    and is not one: `partialsDb` clamps there, and the reading under the clamp was -240
+  //    or -Infinity. The honest statement is "no peak above the noise for this partial",
+  //    which is what `n/a` plus the note below says, and it is the same statement `formatDiff`
+  //    already makes for the same entry. Printing the depth also invites the arithmetic
+  //    `harmonicsDetail` refuses to do - differencing against a clamp - and the `bar` row
+  //    would have drawn `.` for it, a partial as quiet as a real one 40 dB down.
   const shape = metrics.harmonicShape
   if (shape && metrics.harmonics) {
     lines.push('PARTIALS  dB relative to the fundamental')
     const amplitudes = shape.amplitudesDbRelF0
     lines.push(heading(amplitudes))
-    lines.push(row('db', amplitudes.map((value) => db1(value))))
-    lines.push(row('bar', amplitudes.map((value) => levelBar(value))))
+    lines.push(row('db', amplitudes.map((value) => (isMeasuredPartial(value) ? db1(value) : 'n/a'))))
+    lines.push(row('bar', amplitudes.map((value) => (isMeasuredPartial(value) ? levelBar(value) : ''))))
+    // BOTH of these figures carry a 0 that means "nothing to measure", and it is the same 0
+    // a real reading produces, so neither can be printed raw.
+    //
+    // `measureHarmonicShape` writes `tiltDbPerOctave = 0` for a series with fewer than two
+    // partials above the noise. A rendered sine floors partials 2-12, so it has exactly one,
+    // and this row read `tilt 0.0 dB/oct` for it: a flat-spectrum claim about a sound with
+    // one partial in it, indistinguishable from the genuinely flat spectrum that also reads
+    // 0.0. `oddEvenDb` falls back to 0 on the narrower condition of NO partial above the
+    // noise at all - a parity group sitting entirely on the floor is a measurement, and the
+    // whole content of this axis, so a band-limited square keeps its real (large) reading.
+    //
+    // The predicates are the analyzer's own, imported, for the reason `harmonicsDetail`
+    // gives: two definitions of "this partial exists" eventually disagree. They are also
+    // exactly what `measuredTilt` / `measuredOddEven` in `match-diff.ts` ask before nulling
+    // the same two fields, so this block and the diff's go n/a on the same sounds.
+    const measured = amplitudes.filter(isMeasuredPartial)
     lines.push(
-      `  tilt ${signedDb1(shape.tiltDbPerOctave)} dB/oct` +
-        `   odd/even ${signedDb1(shape.oddEvenDb)} dB` +
+      `  tilt ${
+        measured.length >= 2
+          ? `${signedDb1(shape.tiltDbPerOctave)} dB/oct`
+          : 'n/a (fewer than two partials above the noise, so there is no slope to fit)'
+      }` +
+        `   odd/even ${
+          measured.length > 0
+            ? `${signedDb1(shape.oddEvenDb)} dB`
+            : 'n/a (no partial above the noise, so neither parity has a level)'
+        }` +
         `   inharm ${sci(metrics.harmonics.inharmonicity)}`
     )
+    if (amplitudes.some((value) => !isMeasuredPartial(value))) lines.push(FLOORED_PARTIAL_NOTE.absolute)
   } else {
     lines.push('PARTIALS  n/a (no fundamental given or detected, so partials were not analysed)')
   }
 
   lines.push('')
   lines.push('BANDS   dB vs total power')
-  lines.push(row('hz', metrics.bandsDb.map((_, index) => bandLabel(31.25 * 2 ** index))))
-  lines.push(row('db', metrics.bandsDb.map((value) => db1(value))))
+  // The `hz` heading keeps all ten bands whatever the sample rate, the same rule the
+  // brightness timeline follows: the frequency axis stays readable and the row length stays
+  // predictable, and it is the CELL that says what was measurable.
+  const bandMeasurable = measurableBands(metrics.sampleRateHz)
+  lines.push(row('hz', metrics.bandsDb.map((_, index) => bandLabel(BAND_CENTERS_HZ[index]))))
+  lines.push(row('db', metrics.bandsDb.map((value, index) => (bandMeasurable[index] ? db1(value) : 'n/a'))))
+  if (metrics.bandsDb.some((_, index) => !bandMeasurable[index])) lines.push(NYQUIST_BAND_NOTE.absolute)
 
   lines.push('')
   lines.push('ENVELOPE')
@@ -242,7 +365,7 @@ export function formatMetrics(metrics: AudioMetrics): string {
   )
 
   lines.push('')
-  lines.push('BRIGHTNESS  centroid Hz, per window')
+  lines.push(`BRIGHTNESS  centroid Hz, per window${BRIGHTNESS_BASIS}`)
   // A gated slice still carries a centroid - the analyzer keeps the measured number rather
   // than zeroing it - and that number is the one that misleads: a -55 dB tail read 4,978 Hz,
   // brighter than the note that produced it. Printing it with a caveat would still put a
@@ -277,13 +400,57 @@ function formatActions(actions: readonly MatchAction[]): string[] {
 }
 
 /**
+ * What stands in for the ACTIONS block when the caller ships `diff.actions` beside this
+ * text, and why it is a line rather than nothing at all.
+ *
+ * The block is the largest duplicate in a `compare_audio` text-mode response: it restates
+ * the same ranked moves the structured array already carries, and carries them WORSE -
+ * `diff.actions` has the parameter ids, the `suggested.id/from/to/unit` an agent hands
+ * to `update_parameters`, the confidence and the estimated gain, while the prose has a
+ * rendering of a subset of that. Text mode already drops `envelopeDb`, `bandsDb` and
+ * `spectralWindows` because the tables restate them; this is the same duplication with
+ * the sides swapped, and the prose is the copy to drop.
+ *
+ * Dropping it SILENTLY is the one thing that must not happen. A reader who has only ever
+ * seen the block reads its absence as "nothing was ranked" - the same absence-as-
+ * measurement error `n/a` exists to prevent everywhere else in this file - and a missing
+ * block and an empty `actions` array are different facts. So the line leads with the
+ * COUNT, which no "there were no suggestions" reading survives, and then names where the
+ * moves are and what they carry, so an agent holding only this text knows the next move
+ * is to read `diff.actions` rather than to conclude it is done.
+ *
+ * The count is `actions.length`, the number in the array the reader is being sent to,
+ * rather than the `MAX_ACTIONS` the block would have printed.
+ */
+const actionsShippedStructurallyNote = (count: number): string =>
+  `ACTIONS  ${count} ranked ${count === 1 ? 'move' : 'moves'} ship as diff.actions beside this text,` +
+  ' with the parameter ids and target values to apply them; not restated here.'
+
+/**
  * The diff, as an agent reads it. Every block header restates that the numbers are
  * `you - ref`, so a negative always means the candidate is quieter, darker, shorter or
  * narrower - there is nothing per-block to re-derive.
  */
 export function formatDiff(
   diff: MatchDiff,
-  context?: { referenceName?: string; comparisonNumber?: number; bestSoFar?: number }
+  context?: {
+    referenceName?: string
+    comparisonNumber?: number
+    bestSoFar?: number
+    /**
+     * The caller is shipping `diff.actions` structurally in the same response, so the
+     * ACTIONS block is dropped in favour of one line pointing at it. See
+     * `actionsShippedStructurallyNote`.
+     *
+     * Defaults to `false`, and has to: it is an ASSERTION about the response being built
+     * around this text, and only a caller that can see that response can make it. A caller
+     * that renders this text ALONE - a log line, a chat message, a file - and got the block
+     * dropped by default would lose the ranked moves outright and be told to go read an
+     * array that is not there. Off by default, the untrue version of the line can never be
+     * printed.
+     */
+    actionsShipStructurally?: boolean
+  }
 ): string {
   const lines: string[] = []
 
@@ -315,21 +482,49 @@ export function formatDiff(
     lines.push(row('d', diff.harmonics.deltaDb.map((value) => (value === null ? 'n/a' : signedDb1(value)))))
     lines.push(row('bar', diff.harmonics.deltaDb.map((value) => deltaBar(value))))
     const tilt = diff.harmonics.tiltDeltaDbPerOctave
+    const oddEven = diff.harmonics.oddEvenDeltaDb
     const tiltWord = !finite(tilt) ? '' : tilt < 0 ? '  (you darker)' : tilt > 0 ? '  (you brighter)' : '  (same slope)'
     lines.push(
       `  tilt ${signedDb1(tilt)} dB/oct${tiltWord}` +
-        `   odd/even ${signedDb1(diff.harmonics.oddEvenDeltaDb)} dB` +
+        `   odd/even ${signedDb1(oddEven)} dB` +
         `   inharm ${sci(diff.harmonics.inharmonicityDelta)}`
     )
-    lines.push('  n/a in a column means that partial was above the noise on one side only.')
+    if (diff.harmonics.deltaDb.some((value) => value === null)) lines.push(FLOORED_PARTIAL_NOTE.diff)
+    // Two nulls on one row, with two different causes, so one shared note would be wrong
+    // about whichever it did not describe - and a sound can easily earn one without the
+    // other. A rendered sine is the case: one partial above the noise means no slope to fit,
+    // while its single odd partial still gives both parities a level to difference.
+    //
+    // The reasons go under the row rather than into the cells because the row is a triple -
+    // `tilt X dB/oct   odd/even Y dB   inharm Z` - and a parenthetical inside it pushes the
+    // two figures that ARE measured off where the eye expects them. Each prints only when
+    // its own figure is null, so a comparison with both measured is byte-identical to what
+    // it printed before these fields could go null at all.
+    if (!finite(tilt)) {
+      lines.push('  tilt n/a: one side had fewer than two partials above the noise, so it has no slope to difference against.')
+    }
+    if (!finite(oddEven)) {
+      lines.push('  odd/even n/a: one side had no partial above the noise at all, so neither of its parities has a level.')
+    }
   } else {
     lines.push('PARTIALS  n/a (one side has no fundamental, so partials are not comparable)')
   }
 
   lines.push('')
   lines.push('BANDS   dB vs total power, signed error (you - ref)')
+  // `aboveNyquist` rather than a re-derived threshold, and for the same reason the brightness
+  // row reads `belowNoiseFloor`: `diffAudioMetrics` set it from the two sample rates this row
+  // was built from, and those are not recoverable from the row. The number under the flag is
+  // finite and, worse than merely wrong, usually a clean `0.0` - two -100 dB floors
+  // subtracting - which reads as the one band the candidate got exactly right. `bandsDetail`
+  // left those bands out of the score, so printing them puts the table and the score it
+  // explains in disagreement about which bands counted.
+  //
+  // The `hz` heading still carries all ten: the axis is the thing that makes the row
+  // readable, and the cell is what says whether anything was measured.
   lines.push(row('hz', diff.bands.map((band) => bandLabel(band.centerHz))))
-  lines.push(row('d', diff.bands.map((band) => signedDb1(band.deltaDb))))
+  lines.push(row('d', diff.bands.map((band) => (band.aboveNyquist ? 'n/a' : signedDb1(band.deltaDb)))))
+  if (diff.bands.some((band) => band.aboveNyquist)) lines.push(NYQUIST_BAND_NOTE.diff)
 
   lines.push('')
   lines.push('ENVELOPE  signed error (you - ref)')
@@ -346,7 +541,7 @@ export function formatDiff(
 
   lines.push('')
   if (diff.brightness.length > 0) {
-    lines.push('BRIGHTNESS  centroid, octaves (you - ref), per window')
+    lines.push(`BRIGHTNESS  centroid, octaves (you - ref), per window${BRIGHTNESS_BASIS}`)
     // `belowNoiseFloor` rather than a re-derived threshold: `diffBrightness` set it from the
     // two slices this row actually differenced, after resampling, and those are not
     // recoverable from the row. A gated row's `octaveDelta` is finite and often large - it
@@ -373,8 +568,17 @@ export function formatDiff(
       `   loudness ${signedDb1(diff.loudnessDbDelta)} dB`
   )
 
-  // An empty header would read as "nothing is wrong" rather than "nothing was ranked".
-  if (diff.actions.length > 0) lines.push(...formatActions(diff.actions))
+  // An empty header would read as "nothing is wrong" rather than "nothing was ranked" -
+  // and, for the same reason, an empty `actions` array gets NEITHER the block nor the line
+  // that says the moves ship separately. There are no moves to ship, and a pointer to an
+  // empty array is a lie in the opposite direction.
+  if (diff.actions.length > 0) {
+    lines.push(
+      ...(context?.actionsShipStructurally
+        ? ['', actionsShippedStructurallyNote(diff.actions.length)]
+        : formatActions(diff.actions))
+    )
+  }
 
   return lines.join('\n')
 }

@@ -11,7 +11,6 @@ PARTIALS  dB relative to the fundamental, signed error (you - ref)
  d       0.0  -8.6  -6.4  -4.8  -2.1  -2.3  -4.1  -6.6 -10.1 -11.9 -13.4 -15.0
  bar       ·   ---    --    --     -     -     -    --   ---  ----  ---- -----
   tilt -5.3 dB/oct  (you darker)   odd/even +4.1 dB   inharm -3.1e-4
-  n/a in a column means that partial was above the noise on one side only.
 
 BANDS   dB vs total power, signed error (you - ref)
  hz       31    63   125   250   500    1k    2k    4k    8k   16k
@@ -20,7 +19,7 @@ BANDS   dB vs total power, signed error (you - ref)
 ENVELOPE  signed error (you - ref)
   attack +4 ms   time-to-peak -12 ms   T60 -210 ms   sustain -6.2 dB
 
-BRIGHTNESS  centroid, octaves (you - ref), per window
+BRIGHTNESS  centroid, octaves (you - ref), per window - slices weighted equally, unlike spectralCentroidHz
   0-165ms -0.31 | 165-330ms -0.61 | 330-495ms -1.02 | 495-660ms -1.45
 
 OTHER   flatness -0.18   width -0.22   loudness -1.4 dB"
@@ -44,6 +43,6 @@ BANDS   dB vs total power
 ENVELOPE
   attack 10 ms   time-to-peak 40 ms   T60 800 ms   sustain -6.0 dB
 
-BRIGHTNESS  centroid Hz, per window
+BRIGHTNESS  centroid Hz, per window - slices weighted equally, unlike spectralCentroidHz
   0-165ms 2000 | 165-330ms 1600 | 330-495ms 1200 | 495-660ms 900"
 `;

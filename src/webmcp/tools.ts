@@ -1,7 +1,7 @@
 import { RECENT_AUDIO_SECONDS, type PresetData, type RecentAudio, type RecordedAudio, type SynthEngine } from '../audio/engine'
 import { agentActivityFor } from './activity'
 import {
-  PARAMS, PARAM_GROUP_NOTES, defaultNorm, formatValue, normToValue, paramIndex, valueToNorm,
+  PARAMS, PARAM_GROUP_NOTES, defaultNorm, formatValue, normToValue, paramDef, paramIndex, valueToNorm,
   type ParamDef
 } from '../shared/params'
 import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type FxId, type ModSlotState, type ModSourceDef } from '../shared/messages'
@@ -73,6 +73,14 @@ interface ReferenceAnalysis {
   decodedBytes: number
   duration: number
   sampleRate: number
+  /**
+   * The rate in the uploaded file's own RIFF/WAVE `fmt ` header, when it had
+   * one. Present alongside `sampleRate` — the rate the browser decoded it TO —
+   * because `decodeAudioData` resamples to its context's rate without a word.
+   */
+  sourceSampleRate?: number
+  /** Set only when the decode resampled DOWN; see `downsampleNote`. */
+  downsampled?: { from: number; to: number; nyquistHz: number; note: string }
   channels: number
   /** Present only when a trim was applied, so an untrimmed reference reads exactly as before. */
   trimmedMs?: { start: number; end: number }
@@ -106,6 +114,13 @@ interface LastComparisonState {
   diff: MatchDiff
   referenceName?: string
   comparisonNumber: number
+  /**
+   * How many ranked moves that `compare_audio` already handed back in
+   * `diff.actions`. The one number that decides whether a `suggest_patch` call
+   * on an unchanged patch, with no `focus`, could return anything the caller did
+   * not already hold — see `basedOn.addsNothing`.
+   */
+  maxActions: number
   /**
    * The sound-history entry the compared candidate was made from, as
    * `apply_patch` records it for `rollbackId`. Every patch edit commits a new
@@ -295,6 +310,133 @@ const METRIC_NOTES = {
  */
 const SILENT_PEAK_DB = -100
 
+/**
+ * `spectralFlatness` (0 tonal, 1 noise) at or above which a buffer is called
+ * noise-dominated. A synth tone sits near 0.05 even with a bright filter; white
+ * noise reads well past this. Deliberately a loose threshold: it is quoted as
+ * evidence in prose, never used to score anything.
+ */
+const NOISE_LIKE_FLATNESS = 0.3
+
+/**
+ * `stereoWidth` at or above which the mono sum has cancelled far enough for
+ * `detectPitch` to abandon it and retry the channels one at a time. Its own
+ * `COLLAPSE_RATIO` of 0.25 fires when midRms < 0.25 * the loudest channel, which
+ * for equal-level channels is midRms/sideRms < ~0.26 — i.e. this width.
+ */
+const ANTI_PHASE_STEREO_WIDTH = 0.8
+
+/**
+ * Everything `pitchNoteFor` reads. Narrower than `AudioMetrics` on purpose: text
+ * mode's `summarizeAnalysis` drops three arrays, and the note has to attach to
+ * that shape too.
+ */
+type PitchNoteMetrics = Pick<AudioMetrics, 'peakDb' | 'clippingCount' | 'spectralFlatness' | 'stereoWidth' | 'pitch'>
+
+/** What `detectPitch` demands before it will name a fundamental; quoted in `pitchNoteFor`. */
+const PITCH_GUARDS =
+  'Detection refuses rather than guesses: two detectors must agree within 50 cents, inside 16.35 Hz to 5 kHz, at clarity 0.85 or better, over at least 1024 samples (~23 ms at 44.1 kHz).'
+
+/**
+ * Why `metrics.pitch` is `null`, as far as the numbers beside it can say.
+ *
+ * From the tool layer every refusal in `detectPitch` looks identical — too short
+ * a buffer, every frame under the clarity guard, every frame outside the range
+ * guard, the two detectors never agreeing, a collapsed anti-phase sum — and in
+ * eval run 4 that cost an agent two round trips: a +12 dB EQ boost killed
+ * detection, it blamed clipping, fixed the gain, detection still failed, and only
+ * then did it suspect the EQ.
+ *
+ * `detectPitch`'s signature cannot say which guard fired, but `peakDb`,
+ * `clippingCount`, `spectralFlatness` and `stereoWidth` are all right here and
+ * they separate "silent", "clipped", "noise-like" and "near anti-phase" from "a
+ * perfectly ordinary-looking buffer with no fundamental in it". So the note
+ * states the evidence it actually has, then lists the causes it CANNOT
+ * distinguish as causes rather than as a diagnosis. It never names one cause it
+ * has not measured.
+ */
+function pitchNoteFor(metrics: PitchNoteMetrics): string | undefined {
+  if (metrics.pitch !== null && metrics.pitch !== undefined) return undefined
+  if (metrics.peakDb <= SILENT_PEAK_DB) {
+    return `No fundamental was found because there is nothing to find: peakDb ${clean(metrics.peakDb)} is digital silence. Every other metric here is measured on that silence and describes nothing.`
+  }
+  const evidence: string[] = []
+  if (metrics.clippingCount > 0) {
+    evidence.push(`clippingCount ${metrics.clippingCount}: samples are at or past full scale, and a flat-topped waveform is broadband enough to stop the two detectors agreeing. Cut the level — a large EQ or amp boost is the usual cause — and measure again.`)
+  }
+  if (metrics.spectralFlatness >= NOISE_LIKE_FLATNESS) {
+    evidence.push(`spectralFlatness ${clean(metrics.spectralFlatness)} of 1: this buffer reads as noise rather than a tone, and noise has no fundamental to find.`)
+  }
+  if (metrics.stereoWidth >= ANTI_PHASE_STEREO_WIDTH) {
+    evidence.push(`stereoWidth ${clean(metrics.stereoWidth)} of 1: the channels are near anti-phase. Detection already retries them one at a time when the mono sum cancels, so this alone rarely explains a null — but a heavily detuned unison or a deep chorus can genuinely hold no one stable fundamental.`)
+  }
+  if (evidence.length === 0) {
+    evidence.push(`peakDb ${clean(metrics.peakDb)}, no clipping, spectralFlatness ${clean(metrics.spectralFlatness)} and stereoWidth ${clean(metrics.stereoWidth)} all look ordinary, so nothing measured here points at a cause.`)
+  }
+  return `No fundamental was found, so \`pitch\` is null and \`harmonics\`/\`harmonicShape\` are absent, and \`diff.pitch.centsError\` with them. On a CANDIDATE measured against a pitched reference, compare_audio treats that as a measured failure and scores \`harmonics\`, \`tilt\` and \`inharmonicity\` 0, so it costs real similarity; on the REFERENCE side those three are excluded from the mean. ${PITCH_GUARDS} Evidence here — ${evidence.join(' ')} Causes it cannot tell apart: a fundamental buried under a louder partial (a resonant filter or EQ band boosted far above it does this at a perfectly safe level), a pitch moving inside the analysis window (vibrato, a fast pitch envelope, portamento), a note outside 16.35-5000 Hz, or a buffer under 1024 samples. To score the partials against a fundamental you name, pass \`f0Hz\` to analyze_audio (source "scope", "recent" or "reference"); a render's PCM is not retained, so re-render to retry.`
+}
+
+/** `pitchNoteFor` attached to any result that carries metrics, and only when there is one to attach. */
+function withPitchNote<T extends { metrics: PitchNoteMetrics }>(result: T): T & { pitchNote?: string } {
+  const pitchNote = pitchNoteFor(result.metrics)
+  return pitchNote === undefined ? result : { ...result, pitchNote }
+}
+
+/**
+ * A reference whose file was resampled DOWN on the way in, and what that costs.
+ *
+ * `decodeAudioData` resamples to its context's rate silently. Playwright's
+ * Chromium reports a 16 kHz output device, and before `audio-input.ts` pinned an
+ * explicit rate a 44.1 kHz reference was decoded at 16 kHz: everything above its
+ * 8 kHz Nyquist read as empty, the candidate rendered at 48 kHz read real energy
+ * there, and a live eval agent spent a whole comparison proving it could not
+ * close a 75 dB gap that was never in the sound. A residual low-rate context is
+ * still reachable on hardware that refuses 48 kHz, so this is not merely
+ * historical.
+ *
+ * The point is the distinction: "the reference genuinely has no high content"
+ * and "the reference's high content was discarded before I saw it" look
+ * identical in every band figure and lead to opposite edits.
+ */
+function downsampleNote(sourceSampleRate: number | undefined, sampleRate: number) {
+  if (sourceSampleRate === undefined || !(sourceSampleRate > sampleRate)) return undefined
+  const nyquistHz = Math.round(sampleRate / 2)
+  return {
+    downsampled: {
+      from: sourceSampleRate,
+      to: sampleRate,
+      nyquistHz,
+      note: `The uploaded file says ${sourceSampleRate} Hz and the browser decoded it at ${sampleRate} Hz, so everything above ${nyquistHz} Hz was resampled away BEFORE any of these metrics were measured. The top bands, \`spectralRolloffHz\` and the upper partials therefore describe a truncated file, and a candidate rendered at a higher rate will show real energy up there that the reference cannot match however the patch is edited. Treat that gap as an artefact of the decode, not as brightness to remove.`
+    }
+  }
+}
+
+/**
+ * Two sides measured at different rates, said out loud in the comparison itself.
+ *
+ * Every band, rolloff and partial above the LOWER Nyquist is incomparable: one
+ * side can hold energy there and the other cannot, whatever the patch does. That
+ * is the 75 dB error an eval agent could not diagnose, and `downsampled` on the
+ * reference only explains it when the decode was the cause — a candidate
+ * rendered at a rate the reference never had produces the same asymmetry with no
+ * downsample anywhere. So it is reported from the two rates in hand.
+ *
+ * Surfacing only: the scoring side of this lives in `compareAudioMetrics`.
+ */
+function sampleRateMismatch(reference: ReferenceAnalysis, candidateSampleRate: number) {
+  if (reference.sampleRate === candidateSampleRate) return {}
+  const lower = Math.min(reference.sampleRate, candidateSampleRate)
+  const quieter = reference.sampleRate < candidateSampleRate ? 'reference' : 'candidate'
+  return {
+    sampleRates: {
+      reference: reference.sampleRate,
+      candidate: candidateSampleRate,
+      comparableBelowHz: Math.round(lower / 2),
+      note: `These two were measured at different rates, so nothing above ${Math.round(lower / 2)} Hz — the ${quieter}'s Nyquist — is comparable: the ${quieter} cannot carry energy there at all, and no edit to the patch changes that.${reference.downsampled ? ' The reference reached this rate through a decode that resampled it DOWN; see `reference.downsampled`.' : ''} Read the top bands, \`spectralRolloffHz\` and the upper partials with that in mind.`
+    }
+  }
+}
+
 /** Refusal text for `compare_audio` with no render and a silent live scope. */
 const SILENT_CANDIDATE_REFUSAL =
   'Nothing has been rendered yet and the live scope is silent (peak below -100 dB), so there is nothing to compare the reference against; scoring it against silence would return a similarity that means nothing. Call render_audio first — it renders offline and needs no user gesture — then call compare_audio again. The scope fallback is only for comparing against a human who is actually playing.'
@@ -305,10 +447,44 @@ const PLATEAU_COMPARISONS = 5
 const roundSimilarity = (value: number): number => Math.round(value * 1e4) / 1e4
 
 /**
+ * Where this comparison stands against the best so far. `worse` is decided by
+ * `deltaFromBest` and nothing else, so the verdict and the number cannot
+ * disagree; `best` and `tied` differ only in whether THIS comparison is the one
+ * that set the best, which no single delta can express.
+ */
+type MatchStanding = 'best' | 'tied' | 'worse'
+
+/**
  * Fold one comparison into the session's best-so-far and describe where it
  * stands. Returned alongside `comparison` (never inside it — `similarity` and
  * `details` keep their shape for the UI) so a single response answers "better,
  * worse, or done" without the agent keeping its own ledger.
+ *
+ * ## Why a tie is not "worse", and why the tolerance is the reported precision
+ *
+ * In eval run 4 an agent's final comparison scored 0.81727124416943 — byte
+ * identical to comparison 23's best — and a `similarity > state.best` test
+ * called it WORSE. The label was the small part of the damage: the "worse"
+ * branch also emits remediation, so the agent was told to restore history away
+ * from its own best patch and warned that `save_preset` would save the wrong
+ * one. Both false, and both acted on. A wrong number an agent trusts is the
+ * defect `SILENT_CANDIDATE_REFUSAL` exists to refuse; wrong ADVICE derived from
+ * one is the same defect with a shorter fuse.
+ *
+ * So the standing is derived from `deltaFromBest` rather than computed beside
+ * it — the two used to be independent expressions over the same numbers, which
+ * is exactly how `deltaFromBest: 0` came to sit under "Worse than comparison
+ * 23". Now: `deltaFromBest < 0` IS `worse`, `deltaFromBest === 0` IS `best` or
+ * `tied`, and no branch can disagree with the number printed beside it.
+ *
+ * The delta is rounded by `roundSimilarity` — 1e-4, the precision every score in
+ * this block is reported at — before it decides anything. That IS the tolerance,
+ * and it is deliberately not a new magic epsilon: it makes the message consistent
+ * with the response *by construction*. Two renders of one patch differ in the last
+ * bits (float summation order, a realtime capture, a different note length), and a
+ * 1e-15 fall must not cost an agent its best patch when the response prints the
+ * two scores as the same number. `state.best` still tracks the raw maximum, so
+ * the running best is never understated by the rounding.
  */
 function trackMatchProgress(
   session: WebMcpSessionState,
@@ -323,26 +499,49 @@ function trackMatchProgress(
   }
   const state = session.match
   state.comparisons += 1
-  const isBest = similarity > state.best
-  if (isBest) {
+  // A strict improvement on the raw maximum, so `best`/`bestEntryId` name the
+  // highest-scoring patch. A tie leaves them alone: `comparisonsSinceBest` then
+  // keeps counting comparisons that have not IMPROVED on it, which is what the
+  // plateau is about, and re-scoring the same patch cannot reset that counter.
+  if (similarity > state.best) {
     state.best = similarity
     state.bestComparison = state.comparisons
     state.bestEntryId = entryId
   }
+  const deltaFromBest = roundSimilarity(similarity - state.best)
+  const standing: MatchStanding =
+    state.bestComparison === state.comparisons ? 'best' : deltaFromBest < 0 ? 'worse' : 'tied'
+  const isBest = standing !== 'worse'
   const sinceBest = state.comparisons - state.bestComparison
-  const restore = state.bestEntryId
+  const best = roundSimilarity(state.best)
+  const plural = (count: number) => (count === 1 ? '' : 's')
+  // The patch on screen already IS the best-scoring one: an agent that restored
+  // it, or re-compared it against a different render. Telling it to restore what
+  // is loaded, and warning that save_preset saves the wrong patch, is the same
+  // class of false advice as calling a tie "worse" — the sound moved, the patch
+  // did not. Only claimed when both ids are known.
+  const holdingBest = entryId !== undefined && entryId === state.bestEntryId
+  const restore = state.bestEntryId && !holdingBest
     ? ` navigate_history({ action: "restore", entryId: "${state.bestEntryId}" }) goes back to the patch that scored it.`
     : ''
-  const note = isBest
-    ? `Best of ${state.comparisons} comparison${state.comparisons === 1 ? '' : 's'} against this reference. This is the patch to beat, and the one worth save_preset if you stop now.`
-    : `Worse than comparison ${state.bestComparison} (${roundSimilarity(state.best)}), ${sinceBest} comparison${sinceBest === 1 ? '' : 's'} ago.${sinceBest >= PLATEAU_COMPARISONS ? ` Nothing has beaten it in ${sinceBest} tries — this is a plateau, so restore the best and stop rather than keep editing.` : ''}${restore} save_preset would save this patch, not the best one.`
+  const plateau = sinceBest >= PLATEAU_COMPARISONS
+  const note = standing === 'best'
+    ? `Best of ${state.comparisons} comparison${plural(state.comparisons)} against this reference. This is the patch to beat, and the one worth save_preset if you stop now.`
+    : standing === 'tied'
+      ? `Ties the best, comparison ${state.bestComparison} (${best}) — the same score at the 1e-4 precision these figures carry — so the patch in hand is as good as the best one. Nothing to restore, and save_preset saves a patch that scores the same as the best.${plateau ? ` Nothing has IMPROVED on it in ${sinceBest} comparison${plural(sinceBest)} — this is a plateau, so stop here rather than keep editing.` : ''}`
+      : `Worse than comparison ${state.bestComparison} (${best}), ${sinceBest} comparison${plural(sinceBest)} ago.${plateau ? ` Nothing has beaten it in ${sinceBest} tries — this is a plateau, so ${holdingBest ? 'stop' : 'restore the best and stop'} rather than keep editing.` : ''}${restore} ${holdingBest
+        ? `The patch loaded now IS the one that scored best (sound-history entry ${state.bestEntryId}), so save_preset saves the best patch; this comparison scored lower because the RENDER differed — different notes, a different duration, or the live scope — not because the patch changed.`
+        : 'save_preset would save this patch, not the best one.'}`
   return {
     comparisonNumber: state.comparisons,
+    standing,
     isBest,
-    best: roundSimilarity(state.best),
+    best,
     bestComparisonNumber: state.bestComparison,
     ...(state.bestEntryId === undefined ? {} : { bestEntryId: state.bestEntryId }),
-    deltaFromBest: roundSimilarity(similarity - state.best),
+    // Never positive, and negative only when `standing` is 'worse'. See above:
+    // the note is derived from this number, so the two cannot contradict.
+    deltaFromBest,
     comparisonsSinceBest: sinceBest,
     note
   }
@@ -1084,12 +1283,67 @@ function validateParameterUpdates(value: unknown, label: string): ValidatedParam
   })
 }
 
-function appliedParameter(update: ValidatedParameterUpdate) {
+/** The oscillator wavetable choice that resolves to something else when its slot is empty. */
+const CUSTOM_WAVETABLE = 'Custom'
+
+/** What `engine.tableForOsc` falls back to for `Custom`: `WAVETABLE_NAMES[min(sel, CUSTOM_WT - 1)]`. */
+const CUSTOM_WAVETABLE_FALLBACK = 'Digital'
+
+/** The three parameters that can hold `Custom`, in oscillator order. */
+const OSC_WAVETABLE_IDS: readonly string[] = ['osc1.wavetable', 'osc2.wavetable', 'osc3.wavetable']
+
+/**
+ * `osc{n}.wavetable` reading `Custom` with nothing imported into slot `n`.
+ *
+ * `engine.tableForOsc` resolves the choice as
+ * `WAVETABLE_NAMES[Math.min(sel, CUSTOM_WT - 1)]` unless `customTables[osc]`
+ * holds a table, so with an empty slot `Custom` IS `Digital`. And no WebMCP tool
+ * can fill that slot: `importWavetableFile` takes a browser `File` and exists
+ * only for the UI. An agent that writes `Custom` is therefore told the write
+ * succeeded, reads `Custom` back out of `get_synth_state`, and reasons about a
+ * table it is not hearing — a value presented as real when it is not, which is
+ * the defect `SILENT_CANDIDATE_REFUSAL` and `trackMatchProgress` both exist to
+ * refuse.
+ *
+ * Reported rather than refused. The UI accepts `Custom` on this parameter, and a
+ * tool surface that rejected a value the app allows would be a second,
+ * disagreeing model of the same patch — worse than the silence it replaces.
+ *
+ * `captureSoundState()` is the authoritative answer to "is a table imported":
+ * `currentTables[osc].name` would have to guess it from a label an imported WAV
+ * could legitimately carry ("Digital.wav"). It is called only once a `Custom`
+ * selection is already established, so the ordinary path pays nothing. A build
+ * without it cannot know, and an unknowable fact is not claimed.
+ */
+function customWavetableIsEmpty(engine: SynthEngine, paramId: string): boolean {
+  const osc = OSC_WAVETABLE_IDS.indexOf(paramId)
+  if (osc < 0 || typeof engine.captureSoundState !== 'function') return false
+  return engine.captureSoundState().customTables[osc] == null
+}
+
+/** The sentence that travels with a `Custom` selection nothing backs. */
+function emptyCustomWavetableNote(paramId: string): string {
+  return `${paramId} reads "${CUSTOM_WAVETABLE}" but no wavetable has been imported into that slot, so the oscillator is playing "${CUSTOM_WAVETABLE_FALLBACK}": the label changed and the sound did not. No tool here can import one — the importer takes a browser file and belongs to the UI — so ask the human to import a WAV, or name a built-in table instead (get_parameter_schema's \`choiceNotes\` says what each one sounds like).`
+}
+
+/** `osc{n}.wavetable` ids currently reading `Custom` over an empty slot. */
+function emptyCustomWavetables(engine: SynthEngine): string[] {
+  return OSC_WAVETABLE_IDS.filter(id => {
+    const def = paramDef(id)
+    return formatValue(def, engine.values[paramIndex(id)]) === CUSTOM_WAVETABLE && customWavetableIsEmpty(engine, id)
+  })
+}
+
+function appliedParameter(update: ValidatedParameterUpdate, engine?: SynthEngine) {
+  const emptyCustom = engine !== undefined
+    && formatValue(update.def, update.normalized) === CUSTOM_WAVETABLE
+    && customWavetableIsEmpty(engine, update.id)
   return {
     id: update.id,
     raw: update.raw,
     normalized: clean(update.normalized),
-    formatted: formatValue(update.def, update.normalized)
+    formatted: formatValue(update.def, update.normalized),
+    ...(emptyCustom ? { resolvesTo: CUSTOM_WAVETABLE_FALLBACK, note: emptyCustomWavetableNote(update.id) } : {})
   }
 }
 
@@ -1285,7 +1539,13 @@ export function createWebMcpTools(
 
   function scopeCandidate(options: AnalyzeAudioOptions = {}) {
     const sampleRate = engine.ctx?.sampleRate ?? 48000
-    return {
+    // `withPitchNote` here, and on every other result carrying metrics: a null
+    // `pitch` is silent from the tool layer otherwise, and it zeroes three
+    // comparison dimensions. See `pitchNoteFor`. Deliberately NOT folded into
+    // `metricNotes`, which text mode drops (`TEXT_MODE_OMITTED_FIELDS`) — that
+    // is the mode `compare_audio` defaults to, i.e. exactly where the eval agent
+    // needed it.
+    return withPitchNote({
       source: 'scope' as const,
       sampleRate,
       channels: 2,
@@ -1295,7 +1555,7 @@ export function createWebMcpTools(
       // included: the buffer is ~21 ms long, and its envelope figures read as
       // measurements of a note when they are measurements of a fragment.
       scopeNote: SCOPE_NOTE
-    }
+    })
   }
 
   /**
@@ -1320,7 +1580,7 @@ export function createWebMcpTools(
    */
   async function recentCandidate(recent: RecentAudio, signal: AbortSignal, options: AnalyzeAudioOptions = {}) {
     const metrics = await analyzeAudioAsync(recent.channelData, recent.sampleRate, signal, options)
-    return {
+    return withPitchNote({
       source: 'recent' as const,
       sampleRate: recent.sampleRate,
       channels: recent.channelData.length,
@@ -1331,18 +1591,18 @@ export function createWebMcpTools(
       metrics,
       metricNotes: METRIC_NOTES,
       recentNote: RECENT_NOTE
-    }
+    })
   }
 
   function currentCandidate() {
-    if (session.lastRender) return {
+    if (session.lastRender) return withPitchNote({
       source: 'last-render' as const,
       sampleRate: session.lastRender.sampleRate,
       channels: session.lastRender.channels,
       url: session.lastRender.url,
       metrics: session.lastRender.metrics,
       metricNotes: METRIC_NOTES
-    }
+    })
     return scopeCandidate()
   }
 
@@ -1500,10 +1760,23 @@ export function createWebMcpTools(
           const normalized = engine.values[paramIndex(def.id)]
           return Math.abs(normalized - defaultNorm(def)) < 1e-6 ? [] : [`${def.id}=${formatValue(def, normalized)}`]
         })
+        // `Custom` reads back as `Custom` from `engine.values` however empty the
+        // slot is, so a patch verified here would confirm a table the oscillator
+        // is not playing. Named at `patch` level rather than inside
+        // `parameters`, because the page an agent asks for often does not hold
+        // osc*.wavetable at all — and it costs nothing while no slot is affected.
+        const emptyCustom = emptyCustomWavetables(engine)
         return {
           runtime: runtimeSnapshot(engine),
           patch: {
             ...fxOrder(engine),
+            ...(emptyCustom.length === 0 ? {} : {
+              wavetableFallback: {
+                parameters: emptyCustom,
+                resolvesTo: CUSTOM_WAVETABLE_FALLBACK,
+                note: emptyCustom.map(emptyCustomWavetableNote).join(' ')
+              }
+            }),
             // Three short fields, in every format, because this is the question
             // asked BEFORE deciding whether a save is needed - and a tool of its
             // own would have to be discovered first, then called as a second
@@ -1584,18 +1857,39 @@ export function createWebMcpTools(
         // compact default reaches past it, to hand over the whole space at once.
         const limit = boundedInteger(value.limit, 'limit', format === 'compact' ? COMPACT_PAGE_SIZE : DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
         const page = matches.slice(offset, offset + limit)
-        const parameters = page.map(def => ({
-          id: def.id, name: def.name, group: def.group,
-          min: def.choices ? 0 : def.min,
-          max: def.choices ? def.choices.length - 1 : def.max,
-          default: def.def,
-          normalizedDefault: clean(defaultNorm(def)),
-          ...(def.step === undefined ? {} : { step: def.step }),
-          ...(def.choices ? { choices: [...def.choices] } : {}),
-          ...(def.unit === undefined ? {} : { unit: def.unit }),
-          curve: def.curve ?? 'lin',
-          moddable: def.moddable === true
-        }))
+        // What each choice SOUNDS like, for the parameters whose names say
+        // nothing — an eval agent spent four render-and-compare rounds guessing
+        // which of the seven wavetables was the bright one and found it by luck.
+        //
+        // Emitted once per distinct notes object. `osc1/2/3.wavetable` share ONE
+        // (`WAVETABLE_NOTES`, by reference) and it is ~2 kB, so a page wide
+        // enough to hold all three — which is the page an agent asks for when it
+        // wants to see everything — used to be the only way to read them and
+        // would have paid ~6 kB for one table's worth of prose. Identity, not
+        // deep equality: two parameters that happened to describe their choices
+        // the same way would still be two separate facts.
+        const notesCarriedBy = new Map<object, string>()
+        const parameters = page.map(def => {
+          const sharedWith = def.choiceNotes ? notesCarriedBy.get(def.choiceNotes) : undefined
+          if (def.choiceNotes && sharedWith === undefined) notesCarriedBy.set(def.choiceNotes, def.id)
+          return {
+            id: def.id, name: def.name, group: def.group,
+            min: def.choices ? 0 : def.min,
+            max: def.choices ? def.choices.length - 1 : def.max,
+            default: def.def,
+            normalizedDefault: clean(defaultNorm(def)),
+            ...(def.step === undefined ? {} : { step: def.step }),
+            ...(def.choices ? { choices: [...def.choices] } : {}),
+            ...(def.choiceNotes === undefined
+              ? {}
+              : sharedWith === undefined
+                ? { choiceNotes: def.choiceNotes }
+                : { choiceNotesSameAs: sharedWith }),
+            ...(def.unit === undefined ? {} : { unit: def.unit }),
+            curve: def.curve ?? 'lin',
+            moddable: def.moddable === true
+          }
+        })
         // Either paging key asks for the source vocabulary; a limit on its own
         // implies offset 0, so `{ sourceLimit: 60 }` hands over the whole list.
         const includeSources = value.sourceOffset !== undefined || value.sourceLimit !== undefined
@@ -1673,7 +1967,7 @@ export function createWebMcpTools(
         const value = assertObject(input, 'input', ['updates'], ['updates'])
         const validated = validateParameterUpdates(value.updates, 'updates')
         for (const update of validated) engine.setParam(update.index, update.normalized, 'ai')
-        return { applied: validated.map(appliedParameter) }
+        return { applied: validated.map(update => appliedParameter(update, engine)) }
       }
     },
     {
@@ -1910,7 +2204,7 @@ export function createWebMcpTools(
             wouldApply: {
               ...(parameters.length === 0 ? {} : {
                 parameters: parameters.map(update => ({
-                  ...appliedParameter(update),
+                  ...appliedParameter(update, engine),
                   from: formatValue(update.def, engine.values[update.index]),
                   willChange: Math.abs(engine.values[update.index] - update.normalized) > 1e-9
                 }))
@@ -1962,7 +2256,7 @@ export function createWebMcpTools(
         })
 
         const applied = {
-          ...(parameters.length === 0 ? {} : { parameters: parameters.map(appliedParameter) }),
+          ...(parameters.length === 0 ? {} : { parameters: parameters.map(update => appliedParameter(update, engine)) }),
           ...(plan === null ? {} : {
             modulations: {
               cleared: plan.clearSlots.length,
@@ -2017,7 +2311,7 @@ export function createWebMcpTools(
           const requested = singlePitch(audition.notes)
           return {
             ...result,
-            audition: {
+            audition: withPitchNote({
               rendered: true,
               renderMode: rendered.renderMode,
               duration: rendered.recording.duration,
@@ -2029,7 +2323,7 @@ export function createWebMcpTools(
               metricNotes: METRIC_NOTES,
               ...(rendered.renderModeFallback ? { renderModeFallback: rendered.renderModeFallback } : {}),
               ...(audition.overlaps > 0 ? { retriggered: audition.overlaps } : {})
-            }
+            })
           }
         } catch (error) {
           if ((error as Error | undefined)?.name === 'AbortError') throw error
@@ -2119,7 +2413,7 @@ export function createWebMcpTools(
           )
           const { recording, metrics } = rendered
           const requested = singlePitch(sequence.notes)
-          return {
+          return withPitchNote({
             renderMode: rendered.renderMode,
             mimeType: recording.mimeType,
             duration: recording.duration,
@@ -2137,7 +2431,7 @@ export function createWebMcpTools(
             } : {}),
             ...(rendered.renderModeFallback ? { renderModeFallback: rendered.renderModeFallback } : {}),
             ...(sequence.overlaps > 0 ? { retriggered: sequence.overlaps } : {})
-          }
+          })
         })
       }
     },
@@ -2188,8 +2482,10 @@ export function createWebMcpTools(
           ...(f0Hz === undefined ? {} : { f0Hz }),
           ...(windows === undefined ? {} : { windows })
         }
+        // Every source this tool can return goes through here, so the null-pitch
+        // note is attached once rather than per branch.
         const withText = <T extends { metrics: AudioMetrics }>(result: T) =>
-          format === 'text' ? { ...result, text: formatMetrics(result.metrics) } : result
+          withPitchNote(format === 'text' ? { ...result, text: formatMetrics(result.metrics) } : result)
 
         if (value.source === 'reference') {
           if (!session.lastReference || !session.referencePcm) {
@@ -2436,8 +2732,12 @@ export function createWebMcpTools(
             decodedBytes: decoded.decodedBytes,
             duration,
             sampleRate: decoded.sampleRate,
+            // What the FILE says, read from its own RIFF header, beside what the
+            // decode produced. See `downsampleNote` for why the pair matters.
+            ...(decoded.sourceSampleRate === undefined ? {} : { sourceSampleRate: decoded.sourceSampleRate }),
             channels: decoded.channels,
             ...(trimmedSamples > 0 ? { trimmedMs: { start: trimStartMs, end: trimEndMs } } : {}),
+            ...(downsampleNote(decoded.sourceSampleRate, decoded.sampleRate) ?? {}),
             metrics
           }
           assertCurrent()
@@ -2450,7 +2750,10 @@ export function createWebMcpTools(
           // Only the winning (non-superseded) invocation reaches this line.
           session.match = null
           session.lastComparison = null
-          return format === 'text' ? { ...analysis, text: formatMetrics(metrics) } : analysis
+          // A reference with no measurable fundamental is the case that makes
+          // `compare_audio({autoRender:true})` refuse for want of a note to
+          // render, so the explanation belongs here, on the upload.
+          return withPitchNote(format === 'text' ? { ...analysis, text: formatMetrics(metrics) } : analysis)
         })
       }
     },
@@ -2575,6 +2878,7 @@ export function createWebMcpTools(
           diff,
           ...(reference.name ? { referenceName: reference.name } : {}),
           comparisonNumber: progress.comparisonNumber,
+          maxActions,
           // The same id `onComparison` files this comparison under, so
           // `suggest_patch` can tell whether the patch moved underneath it.
           ...(entryId === undefined ? {} : { soundEntryId: entryId })
@@ -2583,15 +2887,25 @@ export function createWebMcpTools(
           ? formatDiff(diff, {
             ...(reference.name ? { referenceName: reference.name } : {}),
             comparisonNumber: progress.comparisonNumber,
-            bestSoFar: progress.best
+            bestSoFar: progress.best,
+            // The `diff` block six lines below ships `actions` structurally, with the
+            // parameter ids and target values the prose version leaves out. Restating them
+            // as prose costs ~1.6 kB to hand back the weaker copy of what is already there.
+            actionsShipStructurally: true
           })
           : undefined
         return {
           // The bulky arrays go only in text mode, where the table restates
           // them; `format: "json"` keeps `reference`/`candidate` exactly as
           // `analyze_audio` shapes them. See `TEXT_MODE_OMITTED_METRICS`.
-          reference: format === 'text' ? summarizeAnalysis(reference) : reference,
-          candidate: format === 'text' ? summarizeAnalysis(candidate) : candidate,
+          // `withPitchNote` on both sides, and on this tool it is load-bearing:
+          // a null on the CANDIDATE is what the last edit did (an EQ boost can
+          // do it at a perfectly safe level) and it scores the pitch, harmonics
+          // and tilt terms 0; a null on the REFERENCE is why autoRender has no
+          // note to render. It costs nothing when both sides are pitched, which
+          // is every comparison that is going well.
+          reference: withPitchNote(format === 'text' ? summarizeAnalysis(reference) : reference),
+          candidate: withPitchNote(format === 'text' ? summarizeAnalysis(candidate) : candidate),
           ...(format === 'text' ? {
             metricsOmitted: { fields: [...TEXT_MODE_OMITTED_FIELDS], note: METRICS_OMITTED_NOTE }
           } : {}),
@@ -2605,13 +2919,51 @@ export function createWebMcpTools(
           // directly with update_parameters.
           diff: format === 'text' ? { similarity: diff.similarity, actions: diff.actions } : diff,
           ...(text === undefined ? {} : { text }),
+          ...sampleRateMismatch(reference, candidate.sampleRate),
           progress
         }
       }
     },
+    /**
+     * ## Why this tool still exists after an eval agent refused to call it
+     *
+     * Run 4's agent never used it, and said why: "`compare_audio` already returns
+     * the same ranked moves, so paying a round trip to re-read them made no sense;
+     * that is a real redundancy." On the call it was picturing — straight after a
+     * comparison, same patch, no `focus` — it was exactly right, and the old
+     * description ("ask what next without paying for a render") described precisely
+     * that useless call.
+     *
+     * What it has that `compare_audio` does not, and what the description now leads
+     * with instead:
+     *
+     * - `adviseFromDiff` re-derives every `from`/`to` against the patch as it is
+     *   RIGHT NOW. Apply three moves and `compare_audio`'s `actions` are a list of
+     *   targets you have already hit, with `from` values that no longer exist; this
+     *   returns the same findings aimed at the current patch. That is the call worth
+     *   making, and nothing said so.
+     * - `focus` narrows to one of timbre/envelope/level/space. `compare_audio` has no
+     *   such input, so a focused list costs a render there.
+     * - `maxActions` here is independent of the comparison's, so more moves can be
+     *   drawn out of a diff that was returned with the default five.
+     *
+     * Kept rather than folded into `compare_audio`, because folding it in means
+     * making `focus` and a bigger `maxActions` cost a render — which is the cost this
+     * tool exists to avoid. Kept rather than deleted, because deleting it costs the
+     * post-edit re-derivation above, and there is nowhere else to get it.
+     *
+     * And the redundant call is now named at the moment it happens:
+     * `basedOn.addsNothing` is true when the patch has not moved, no `focus` narrowed
+     * anything, and `maxActions` asks for no more than the comparison already
+     * returned — i.e. when this response is byte-for-byte the `diff.actions` the
+     * caller is already holding.
+     */
     {
       name: 'suggest_patch',
-      description: 'Ask "what next" without paying for a render: re-reads the last compare_audio and returns its ranked moves again — parameter ids, directions, legal target values — optionally narrowed by `focus`. Nothing is rendered or measured, so call compare_audio to find out whether a move worked. `basedOn.stale` is true when the patch changed since that comparison, making `basedOn.similarity` the score of the sound you replaced.',
+      // Under the 600 B per-tool cap and inside the listing total the metadata
+      // test holds: the long version of this reasoning is in the block comment
+      // above, which costs an agent nothing.
+      description: 'Re-aims the last compare_audio\'s ranked moves at the patch as it is NOW: every from/to recomputed against current values, nothing rendered. Call it AFTER applying moves, or for a `focus` (timbre/envelope/level/space) compare_audio lacks. On an unchanged patch with no `focus` it just repeats compare_audio\'s `diff.actions`; `basedOn.addsNothing` says so. `basedOn.stale` means `basedOn.similarity` scores the patch you replaced.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2630,7 +2982,7 @@ export function createWebMcpTools(
         if (!session.lastComparison) {
           throw new Error('No comparison to advise from yet. Call analyze_reference_audio to set a target, then compare_audio — which renders the candidate for you — and call suggest_patch again; it re-reads that comparison rather than measuring anything itself')
         }
-        const { diff, referenceName, comparisonNumber, soundEntryId } = session.lastComparison
+        const { diff, referenceName, comparisonNumber, soundEntryId, maxActions: comparedMaxActions } = session.lastComparison
         // Warn, do not refuse. `SILENT_CANDIDATE_REFUSAL` refuses because the
         // alternative is a fabricated number: scoring against silence invents a
         // similarity for a comparison that never happened. Stale advice is a
@@ -2649,6 +3001,15 @@ export function createWebMcpTools(
         // treat it as a checked fact.
         const knowable = soundEntryId !== undefined && currentEntryId !== undefined
         const stale = knowable && soundEntryId !== currentEntryId
+        // The call an eval agent correctly refused to make: the patch has not
+        // moved, so no from/to was re-derived; no `focus` dropped anything; and
+        // `maxActions` asks for no more than `compare_audio` already returned. The
+        // list below is then identical to the `diff.actions` in hand, and saying
+        // so is the only way an agent finds out — reading two identical lists
+        // teaches nothing about which call to skip next time. Unknowable without
+        // history services, and, like `stale`, an unknowable fact is omitted
+        // rather than reported as `false`.
+        const addsNothing = knowable && !stale && focus === undefined && maxActions <= comparedMaxActions
         const adviceMods = currentModRoutes(engine)
         return {
           actions: adviseFromDiff(diff, currentPatchValues(engine), {
@@ -2658,11 +3019,13 @@ export function createWebMcpTools(
             ...(referenceName ? { referenceName } : {}),
             comparisonNumber,
             similarity: roundSimilarity(diff.similarity),
-            ...(knowable ? { stale } : {}),
+            ...(knowable ? { stale, addsNothing } : {}),
             ...(stale ? { comparedSoundEntryId: soundEntryId, currentSoundEntryId: currentEntryId } : {}),
             note: stale
               ? `THE SOUND HAS CHANGED since comparison ${comparisonNumber} was measured: the patch moved from sound-history entry ${soundEntryId} to ${currentEntryId}, so \`similarity\` above scores the patch you REPLACED, not the one loaded now. The ranked moves are still the findings of that comparison, and their from/to values are computed against the current patch, so they remain applicable — but nothing here tells you whether your last edit helped. Call compare_audio to measure the sound as it is.`
-              : 'Re-read of the last compare_audio, against the patch as it is right now. Nothing was rendered or measured for this call; call compare_audio to measure the effect of a change.'
+              : addsNothing
+                ? `Nothing new: the patch has not changed since comparison ${comparisonNumber}, so every from/to is what it already was, and these ${maxActions === comparedMaxActions ? 'are' : 'are the first of'} the ranked moves compare_audio returned as \`diff.actions\`. That call answered this one — reach for suggest_patch AFTER you have applied moves (the from/to values are then re-derived against the new patch), or to narrow the list with \`focus\`, or to pull more than the ${comparedMaxActions} moves that comparison returned.`
+                : 'Re-read of the last compare_audio, aimed at the patch as it is right now. Nothing was rendered or measured for this call; call compare_audio to measure the effect of a change.'
           }
         }
       }

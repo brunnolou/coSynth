@@ -8,6 +8,22 @@ export interface AudioMetrics {
   rmsDb: number
   clippingCount: number
   dcOffset: number
+  /**
+   * Power-weighted mean frequency of the whole buffer.
+   *
+   * Bounded by that buffer's own Nyquist, so the same sound analysed at 16 kHz and at 48 kHz
+   * reads about 568 Hz and 632 Hz - a real measurement of the audio as delivered, biased by
+   * roughly a tenth when a bandlimited source meets a full-rate render. That is a bias in a
+   * measurement rather than the fabricated floor `bandsDb` carries above the Nyquist, which
+   * is why `bandsDetail` drops those bands and this stays compared; `spectralRolloffHz`
+   * (879 vs 883 Hz on the same probe) and `spectralFlatness` (nil either way) barely move at
+   * all. Analysing both sides at one rate is what removes the bias, and `audio-input.ts` is
+   * where that is arranged.
+   *
+   * NOT the same quantity as the `brightness` comparison term, which is an unweighted mean
+   * over `spectralWindows`; see `AudioMetricsComparison` for why the two can disagree about
+   * which of two sounds is brighter.
+   */
   spectralCentroidHz: number
   attackMs: number
   /** 0 is identical L/R, 1 is fully anti-phase. Mono is 0. */
@@ -62,6 +78,19 @@ export interface AudioMetrics {
   pitch?: PitchEstimate | null
   /** Present whenever `harmonics` is. The two axes a wavetable synth actually has. */
   harmonicShape?: HarmonicShape
+  /**
+   * The rate this buffer was analysed at. `analyzeAudio` always records it; it is optional
+   * only so that metrics objects built by hand - several tests, and any older serialized
+   * analysis - still typecheck and still compare.
+   *
+   * It exists because half of `bandsDb` can be unmeasurable. An octave band whose lower edge
+   * sits above `sampleRateHz / 2` cannot hold energy, so it reads the -100 floor whatever the
+   * sound is, and `bandsDetail` leaves those bands out rather than scoring them. Without a
+   * rate there is no way to tell that floor from a band that really is empty, so a comparison
+   * missing it on either side falls back to scoring all ten - today's behaviour, and the
+   * reason adding this field changes nothing for a pair of full-rate renders.
+   */
+  sampleRateHz?: number
 }
 
 /** One time slice of the buffer. See `AudioMetrics.spectralWindows`. */
@@ -109,6 +138,18 @@ export interface SpectralWindow {
    * enough to resolve partials; present on every slice or on none, never fabricated. On a
    * `belowNoiseFloor` slice these are peaks picked out of noise: the *level* they report is
    * real - the partials have gone - but their shape across n is not.
+   *
+   * NOT COMPARABLE ENTRY FOR ENTRY WITH `harmonics.amplitudesDb` OR
+   * `harmonicShape.amplitudesDbRelF0`, and an eval agent reading them side by side called
+   * the difference a contradiction. Three arrays, three different denominators: this one is
+   * relative to the loudest partial in any SLICE, `amplitudesDb` to the loudest partial of a
+   * separate peak-centred pass over the whole buffer, `amplitudesDbRelF0` to the
+   * FUNDAMENTAL. A slice's whole row therefore sits a further (this slice's level) below the
+   * other two - on the eval reference, window 0 lands within about 3 dB of the whole-buffer
+   * array while windows 1-3 sit 15, 24 and 37 dB under it, which is the decay, not a
+   * disagreement. The two passes also run at different FFT sizes (up to 32768 for the whole
+   * buffer, `SPECTRAL_FFT_MAX` here), so a low fundamental is resolved far better in the
+   * whole-buffer array. Read these across SLICES, at one n; read the other two across n.
    */
   harmonicsDb?: number[]
 }
@@ -116,7 +157,14 @@ export interface SpectralWindow {
 export interface HarmonicMetrics {
   /**
    * The first 12 partials, in dB relative to the loudest partial found (so the loudest
-   * reads 0). A partial with no peak above the noise reads the -120 dB floor.
+   * reads 0). A partial with no peak above the noise reads the -120 dB floor, which means
+   * "not there"; how far down it reads is the clamp's depth rather than a measurement, so
+   * nothing should difference against it. See `harmonicsDetail`.
+   *
+   * Measured on one window at the envelope peak, as long as the buffer allows. That is a
+   * different pass from `SpectralWindow.harmonicsDb` - different span, different FFT size,
+   * different denominator - so the two arrays are not comparable entry for entry. That
+   * field's own comment sets out which to read for what.
    */
   amplitudesDb: number[]
   /**
@@ -189,6 +237,40 @@ export interface NullableMetricComparisonDetail {
   similarity: number | null
 }
 
+/**
+ * A term whose `similarity` comes from a distance across an ARRAY - ten bands, twelve
+ * partials, four windows - rather than from the two scalars beside it.
+ *
+ * `delta` on such a term is `candidate - reference` between two MEAN LEVELS, and a mean
+ * cancels: a band 8 dB loud and a band 8 dB quiet average to no difference at all while the
+ * score counts 8 dB in each. So `delta` and `similarity` can point in opposite directions,
+ * and an eval agent read exactly that and could not tell which to believe - "a 1.6 dB
+ * band-mean gap scored 0.467 while an 8.3 dB gap scored 0.696". `meanAbsError` is the
+ * quantity `similarity` is actually computed from: the mean of the per-element ABSOLUTE
+ * differences, after each element's own cap, over exactly the elements that were compared.
+ * Read `delta` for "am I louder or quieter overall" and `meanAbsError` for "how far off am
+ * I", never one for the other.
+ */
+export interface AggregateMetricComparisonDetail extends AudioMetricComparisonDetail {
+  /** Mean per-element absolute difference, post-cap, in that term's own unit. */
+  meanAbsError: number
+}
+
+/** As `AggregateMetricComparisonDetail`, for a term that can be unmeasurable. */
+export interface NullableAggregateMetricComparisonDetail extends NullableMetricComparisonDetail {
+  /** `null` exactly when `similarity` is, or when no element pair was comparable. */
+  meanAbsError: number | null
+}
+
+export interface BandsComparisonDetail extends NullableAggregateMetricComparisonDetail {
+  /**
+   * How many of the ten octave bands were comparable. Fewer than ten means the rest sat
+   * entirely above one side's Nyquist, where `bandsDb` reads its floor for want of anything
+   * to measure; those are left out rather than scored. See `bandsDetail`.
+   */
+  bandsCompared: number
+}
+
 export interface AudioMetricsComparison {
   similarity: number
   details:
@@ -198,30 +280,52 @@ export interface AudioMetricsComparison {
     & { envelope: AudioMetricComparisonDetail }
     /**
      * Mean per-band dB difference across `bandsDb`, each band capped at 20 dB and read
-     * linearly against that cap; reference/candidate are their mean levels.
+     * linearly against that cap; reference/candidate are their mean levels and
+     * `meanAbsError` is in dB. One set of bands feeds all of them - the `bandsCompared`
+     * bands measurable on both sides, which is fewer than ten whenever a side's Nyquist cuts
+     * a band off entirely - but the two statistics still answer different questions, and
+     * `meanAbsError` is the one `similarity` follows. See `AggregateMetricComparisonDetail`
+     * and, for the Nyquist rule, `bandsDetail`.
+     *
+     * `null` when no band is measurable on both sides.
      */
-    & { bands: AudioMetricComparisonDetail }
+    & { bands: BandsComparisonDetail }
     /**
      * Mean absolute octave difference across the `spectralWindows` centroid trajectories;
-     * reference/candidate are their mean centroids. Unlike `envelope` this is not a pure
-     * shape score - absolute brightness is part of a timbre match - but it separates two
-     * sounds with the same mean brightness that arrive at it from opposite directions,
-     * which `spectralCentroidHz` alone cannot. Windows below
+     * reference/candidate are their mean centroids and `meanAbsError` is in octaves. Unlike
+     * `envelope` this is not a pure shape score - absolute brightness is part of a timbre
+     * match - but it separates two sounds with the same mean brightness that arrive at it
+     * from opposite directions, which `spectralCentroidHz` alone cannot. Windows below
      * `SPECTRAL_WINDOW_NOISE_GATE_DB` on either side are excluded from the error and from
      * the means alike, which are taken over exactly the surviving pairs.
+     *
+     * THIS IS NOT `spectralCentroidHz`, AND THE TWO CAN DISAGREE ABOUT WHICH SIDE IS
+     * BRIGHTER. `spectralCentroidHz` is one power-weighted centroid of the whole buffer, so
+     * the loud part of a sound decides it; these means are unweighted across equal slices,
+     * so a quiet bright tail counts as much as a loud dark body. On one probe buffer the two
+     * read 239 Hz and 596 Hz with no window gated at all, and when the two sides put their
+     * brightness in differently-loud slices the SIGN of the difference flips between them.
+     * Neither is wrong: read `spectralCentroidHz` for "where is the energy", `brightness`
+     * for "how does the timbre move". `formatDiff` prints both under that label.
      *
      * `null` when no pair survives the gate - a decaying reference against a late-starting
      * candidate, where every pair has one side in the noise. See `brightnessDetail` for why
      * that is "not measurable" rather than the agreement `harmonicTerm` reports.
      */
-    & { brightness: NullableMetricComparisonDetail }
+    & { brightness: NullableAggregateMetricComparisonDetail }
     /**
      * Mean per-partial dB difference across `harmonicShape.amplitudesDbRelF0`, each partial
      * capped at `HARMONIC_ERROR_CLAMP_DB` and read linearly against that cap - the
-     * `bandsDetail` treatment, for the same reason. reference/candidate are their mean
-     * levels relative to the fundamental.
+     * `bandsDetail` treatment, for the same reason. `meanAbsError` is in dB.
+     *
+     * reference/candidate are the mean levels of exactly the partials MEASURED ON BOTH
+     * SIDES, never over all twelve entries: an entry at `HARMONIC_AMPLITUDE_FLOOR_DB` is
+     * "this partial is not there", and averaging the floor's depth into a level reported a
+     * four-partial reference as -82.3 dB when its four real partials averaged -6.9. A
+     * partial present on one side only still moves `similarity` - see `harmonicsDetail` -
+     * so `meanAbsError` covers more partials than the means do, and both say so here.
      */
-    & { harmonics: NullableMetricComparisonDetail }
+    & { harmonics: NullableAggregateMetricComparisonDetail }
     /** From `harmonicShape.tiltDbPerOctave`: one number for brighter versus darker. */
     & { tilt: NullableMetricComparisonDetail }
     /** From `harmonics.inharmonicity`: computed since the first harmonic pass, never scored until now. */
@@ -256,10 +360,35 @@ const BAND_COUNT = 10
 /** Octave band centres: 31.25 Hz doubled nine times, ending at 16 kHz. */
 const BAND_CENTERS_HZ = Array.from({ length: BAND_COUNT }, (_, index) => 31.25 * 2 ** index)
 const BAND_FLOOR_DB = -100
+/**
+ * Highest frequency a buffer at this rate can carry, or `Infinity` when the rate is unknown
+ * and every band therefore has to be taken as measurable - which is what a metrics object
+ * built by hand, or serialized before `sampleRateHz` existed, gives us.
+ */
+const nyquistOrUnbounded = (sampleRateHz: number | undefined): number =>
+  typeof sampleRateHz === 'number' && Number.isFinite(sampleRateHz) && sampleRateHz > 0
+    ? sampleRateHz / 2
+    : Number.POSITIVE_INFINITY
+/**
+ * Could the band at `index` hold energy below `limitHz`? Octave bands, so the band centred
+ * at f spans f/sqrt(2) to f*sqrt(2); once its LOWER edge is above the limit there is nothing
+ * in it to measure at any level. A band straddling the limit keeps its real, if partial,
+ * content and stays in.
+ */
+const isBandMeasurable = (index: number, limitHz: number): boolean =>
+  BAND_CENTERS_HZ[index] / Math.SQRT2 < limitHz
 const HARMONIC_COUNT = 12
 /** Partials quieter than this relative to the loudest are not real peaks; they do not constrain B. */
 const HARMONIC_FIT_FLOOR_DB = -60
 const HARMONIC_AMPLITUDE_FLOOR_DB = -120
+/**
+ * Did this partial have a peak above the noise at all? The one predicate every reader of an
+ * `amplitudesDbRelF0` entry shares - `measureHarmonicShape`'s two fits, `harmonicsDetail`,
+ * `tiltMeasurable`, and `isMeasuredPartial` in `match-diff.ts`, which is this function under
+ * that name because the two modules must not disagree about which partials exist.
+ */
+export const isMeasuredPartial = (value: number | undefined): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value > HARMONIC_AMPLITUDE_FLOOR_DB
 /** Half-width of the peak search around each predicted partial, as a fraction of it. */
 const HARMONIC_SEARCH_FRACTION = 0.03
 /** Largest FFT the whole-buffer spectral pass and each time window will use. */
@@ -468,20 +597,65 @@ function decayDetail(
  * linearly rather than exponentially spends the resolution evenly: 1 dB of improvement is
  * worth the same 0.05 anywhere, instead of concentrating it all at a distance of zero that
  * an agent chasing an arbitrary recording never reaches.
+ *
+ * BANDS ABOVE A NYQUIST ARE LEFT OUT, both from the error and from the means. `bandsDb`
+ * floors at -100 for a band with no energy, and a band whose lower edge sits above
+ * `sampleRateHz / 2` cannot have energy no matter what the sound is - so that -100 is the
+ * floor's depth again, not a measurement, and every rule this module already follows about
+ * a floor applies. A live eval found both halves of the lie at once, from a reference
+ * decoded at 16 kHz against a candidate rendered at 48 kHz (since fixed upstream, in
+ * `audio-input.ts`): the mismatched pair was charged about 75 dB in the top band, an error
+ * no patch could close, and a pair of 16 kHz buffers scored a silent, flattering 1.000 on a
+ * band neither could measure.
+ *
+ * The line this draws is the one `harmonicsDetail` draws too, and it is worth naming because
+ * the two land on opposite answers for what looks like the same case. A partial missing from
+ * both sounds counts as agreement there, because a patch move can put it back or take it
+ * away - absence is a feature the agent is steering. A band above the Nyquist is not
+ * reachable by any patch move at all: the candidate gets that agreement for free, or is
+ * charged for it forever, and either way it is a fact about the FILE rather than about the
+ * sound. Score what the agent can move.
+ *
+ * `bandsCompared` is on the payload because a reader who sees a ten-band table and an eight-
+ * band score has no other way to tell. When the two sides carry different rates only the
+ * bands measurable on BOTH count, exactly as `brightnessDetail` keeps only pairs where both
+ * windows cleared the gate; if none does, the term is `null` and leaves the mean.
  */
-function bandsDetail(reference: readonly number[], candidate: readonly number[]): AudioMetricComparisonDetail {
-  const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
+function bandsDetail(
+  reference: readonly number[],
+  candidate: readonly number[],
+  referenceRateHz: number | undefined,
+  candidateRateHz: number | undefined
+): BandsComparisonDetail {
+  const limitHz = Math.min(nyquistOrUnbounded(referenceRateHz), nyquistOrUnbounded(candidateRateHz))
+  const referenceLevels: number[] = []
+  const candidateLevels: number[] = []
   let cappedError = 0
   for (let index = 0; index < reference.length; index++) {
+    if (!isBandMeasurable(index, limitHz)) continue
+    referenceLevels.push(reference[index])
+    candidateLevels.push(candidate[index])
     cappedError += Math.min(BAND_ERROR_CLAMP_DB, Math.abs(candidate[index] - reference[index]))
   }
-  const referenceMean = mean(reference)
-  const candidateMean = mean(candidate)
+  const bandsCompared = referenceLevels.length
+  if (bandsCompared === 0) {
+    return { reference: null, candidate: null, delta: null, meanAbsError: null, similarity: null, bandsCompared }
+  }
+  const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
+  const referenceMean = mean(referenceLevels)
+  const candidateMean = mean(candidateLevels)
+  // `delta` is a difference of MEANS and cancels; `meanAbsError` is the mean of absolute
+  // differences and does not. Both are reported because they answer different questions and
+  // an agent handed only the first read the score as inconsistent with it. See
+  // `AggregateMetricComparisonDetail`.
+  const meanAbsError = cappedError / bandsCompared
   return {
     reference: referenceMean,
     candidate: candidateMean,
     delta: candidateMean - referenceMean,
-    similarity: clampSimilarity(1 - cappedError / reference.length / BAND_ERROR_CLAMP_DB)
+    meanAbsError,
+    similarity: clampSimilarity(1 - meanAbsError / BAND_ERROR_CLAMP_DB),
+    bandsCompared
   }
 }
 
@@ -529,14 +703,23 @@ function bandsDetail(reference: readonly number[], candidate: readonly number[])
 function brightnessDetail(
   reference: readonly SpectralWindow[],
   candidate: readonly SpectralWindow[]
-): NullableMetricComparisonDetail {
+): NullableAggregateMetricComparisonDetail {
   // The two sides may have been analysed at different `windows` resolutions. Each window
   // is a fixed *fraction* of its own buffer, so index i of a 4-window run and index i of a
   // 16-window run describe different spans; the trajectories are therefore resampled onto
   // the coarser grid by position rather than compared index for index.
+  //
+  // Arithmetic identical to `resampledIndex` in `match-diff.ts`, the `points <= 1` guard
+  // included: that function resamples the very trajectories this one scores, and 0/0 in one
+  // of the two would put a NaN in the score while the table beside it read row 0.
+  // `assertSpectralWindows` keeps the count at 4-32 today, so the guard is latent - but a
+  // pair documented as deliberately the same arithmetic has to BE the same arithmetic, or
+  // the next person to relax that bound inherits a divergence nothing points at.
   const points = Math.min(reference.length, candidate.length)
   const at = (windows: readonly SpectralWindow[], index: number) =>
-    windows[Math.min(windows.length - 1, Math.round(index * (windows.length - 1) / (points - 1)))]
+    windows[points > 1
+      ? Math.min(windows.length - 1, Math.max(0, Math.round(index * (windows.length - 1) / (points - 1))))
+      : 0]
   const errors: number[] = []
   const referenceCentroids: number[] = []
   const candidateCentroids: number[] = []
@@ -555,15 +738,23 @@ function brightnessDetail(
     const right = Math.max(0, candidateWindow.spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
     errors.push(Math.abs(Math.log2(right / left)))
   }
-  if (errors.length === 0) return { reference: null, candidate: null, delta: null, similarity: null }
+  if (errors.length === 0) {
+    return { reference: null, candidate: null, delta: null, meanAbsError: null, similarity: null }
+  }
   const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
   const referenceMean = mean(referenceCentroids)
   const candidateMean = mean(candidateCentroids)
+  // Hz for the two means, octaves for the error, and they are not two views of one number:
+  // a trajectory that is two octaves bright early and two octaves dark late has a mean
+  // difference near zero and an error of two octaves. Reporting only the first made the
+  // score look arbitrary. See `AggregateMetricComparisonDetail`.
+  const meanAbsError = mean(errors)
   return {
     reference: referenceMean,
     candidate: candidateMean,
     delta: candidateMean - referenceMean,
-    similarity: exponentialSimilarity(mean(errors), BRIGHTNESS_SCALE_OCTAVES)
+    meanAbsError,
+    similarity: exponentialSimilarity(meanAbsError, BRIGHTNESS_SCALE_OCTAVES)
   }
 }
 
@@ -637,33 +828,115 @@ function harmonicTerm(
  * so a per-partial difference between them measures that offset rather than the timbre.
  * That is why the field exists and why this term reads it.
  *
- * `reference`/`candidate` are the mean partial levels, mirroring `bandsDetail`.
+ * WHAT `HARMONIC_AMPLITUDE_FLOOR_DB` MEANS, AND WHY THE FOUR READERS OF IT DIFFER. A
+ * floored entry says "this partial is not there". That is a FACT about the sound - a square
+ * wave's even partials really are missing, which is exactly what `measureHarmonicShape`'s
+ * `oddEvenDb` already reports - but its DEPTH is an artefact: `partialsDb` clamps at -120,
+ * and the underlying reading was -240 or -Infinity. So every reader that consumes the
+ * NUMBER must drop it, and a reader that needs only the FACT may keep it. That single rule
+ * explains all four sites: `measureHarmonicShape`'s least-squares fits drop it (a fit of the
+ * floor's depth), `diffHarmonics` and `formatDiff` drop it (a printed dB delta against an
+ * arbitrary depth), and this term keeps the fact while never touching the depth -
+ *
+ * - **both sides measured**: the signed difference, capped.
+ * - **one side measured**: the two sounds do not share this partial at all, which is the
+ *   most any per-partial difference can say, so `HARMONIC_ERROR_CLAMP_DB` outright. Reading
+ *   `candidate - (-120)` instead would have made the charge depend on how deep the clamp
+ *   happens to sit, and would have handed a candidate already 100 dB down a gradient built
+ *   out of the floor.
+ * - **neither side measured**: they agree that the partial is absent, so no error. This is
+ *   the credit half of the charge above, and the two have to match: a candidate charged the
+ *   full clamp for growing a partial the reference lacks must be credited for not growing
+ *   it, or the term would punish presence without ever rewarding absence. The credit is
+ *   also unreachable as a lever - the only way to collect it is to actually reproduce the
+ *   reference's absence, which is the match.
+ *
+ * The asymmetry `harmonicTerm` draws stays where it is, one level up: it is about whether a
+ * side has a measurable partial series AT ALL. A `harmonicShape` whose every entry is on the
+ * floor - reachable when the fundamental's own peak is missing - is such a side, and is
+ * treated here exactly as an absent shape, so a reference that established nothing about
+ * timbre yields `similarity: null` instead of charging a candidate twelve times over.
+ *
+ * A NOTE ON THE ONE RULE THIS DELIBERATELY DOES NOT ADOPT: excluding a partial because the
+ * REFERENCE floored it. It is tempting - a recording's noise floor is no one's target - but
+ * measured against this analyzer it is both unnecessary and destructive. Unnecessary,
+ * because a recording's noise floor does not reach this floor: probing a bandlimited tone
+ * with broadband noise at -60 and -80 dBFS put its absent partials at -80 and -104 dB
+ * relative to the fundamental, comfortably measurable, and `docs/agent-match-eval-reference.wav`
+ * itself has all twelve above it - so exclusion would not have changed the case it was
+ * proposed for. Destructive, because the material that DOES floor here is a clean render: a
+ * synthesised sine floors partials 2-12 exactly, and excluding those would score a sawtooth
+ * candidate 1.000 on timbre against a sine reference.
+ *
+ * `reference`/`candidate` are the mean levels of the partials measured on BOTH sides -
+ * mirroring `bandsDetail`, and mirroring `brightnessDetail`'s rule that one set of pairs
+ * feeds every field a reader might compare. Averaging the floor into them reported a
+ * four-partial reference at -82.3 dB, a level no partial of it has and nothing was compared
+ * against. `meanAbsError` covers the wider set the score does, and `AudioMetricsComparison`
+ * says so where a reader meets the two.
  */
 function harmonicsDetail(
   reference: HarmonicShape | undefined,
   candidate: HarmonicShape | undefined
-): NullableMetricComparisonDetail {
-  const mean = (shape: HarmonicShape | undefined) => shape
-    ? shape.amplitudesDbRelF0.reduce((sum, value) => sum + value, 0) / shape.amplitudesDbRelF0.length
-    : null
-  const detail = harmonicTerm(mean(reference), mean(candidate), () => 0)
-  if (detail.similarity === null || !reference || !candidate) return detail
+): NullableAggregateMetricComparisonDetail {
+  const measurableSeries = (shape: HarmonicShape | undefined): shape is HarmonicShape =>
+    shape !== undefined && shape.amplitudesDbRelF0.some(isMeasuredPartial)
+  // 0 is a placeholder for "this side has a series"; only the `similarity` of the answer is
+  // used, so that `harmonicTerm` stays the one place the missing-side question is answered.
+  const presence = harmonicTerm(
+    measurableSeries(reference) ? 0 : null,
+    measurableSeries(candidate) ? 0 : null,
+    () => 0
+  )
+  if (!measurableSeries(reference) || !measurableSeries(candidate)) {
+    return { reference: null, candidate: null, delta: null, meanAbsError: null, similarity: presence.similarity }
+  }
 
   const partials = Math.min(reference.amplitudesDbRelF0.length, candidate.amplitudesDbRelF0.length)
+  const referenceLevels: number[] = []
+  const candidateLevels: number[] = []
   let cappedError = 0
   for (let index = 0; index < partials; index++) {
-    cappedError += Math.min(
-      HARMONIC_ERROR_CLAMP_DB,
-      Math.abs(candidate.amplitudesDbRelF0[index] - reference.amplitudesDbRelF0[index])
-    )
+    const left = reference.amplitudesDbRelF0[index]
+    const right = candidate.amplitudesDbRelF0[index]
+    if (isMeasuredPartial(left) && isMeasuredPartial(right)) {
+      referenceLevels.push(left)
+      candidateLevels.push(right)
+      cappedError += Math.min(HARMONIC_ERROR_CLAMP_DB, Math.abs(right - left))
+    } else if (isMeasuredPartial(left) || isMeasuredPartial(right)) {
+      cappedError += HARMONIC_ERROR_CLAMP_DB
+    }
   }
+  const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
+  const meanAbsError = partials > 0 ? cappedError / partials : 0
+  const comparedLevels = referenceLevels.length > 0
+  const referenceMean = comparedLevels ? mean(referenceLevels) : null
+  const candidateMean = comparedLevels ? mean(candidateLevels) : null
   return {
-    ...detail,
-    similarity: partials > 0
-      ? clampSimilarity(1 - cappedError / partials / HARMONIC_ERROR_CLAMP_DB)
-      : 1
+    reference: referenceMean,
+    candidate: candidateMean,
+    delta: comparedLevels ? (candidateMean as number) - (referenceMean as number) : null,
+    meanAbsError,
+    similarity: clampSimilarity(1 - meanAbsError / HARMONIC_ERROR_CLAMP_DB)
   }
 }
+
+/**
+ * `tiltDbPerOctave`, or `null` when the fit had nothing to fit.
+ *
+ * `measureHarmonicShape` writes 0 for a shape with fewer than two measurable partials, and
+ * says so: "0 then means 'no tilt measurable', which is the same number a genuinely flat
+ * spectrum produces". Scoring that 0 as a slope is the `harmonicsDetail` defect in its other
+ * costume - an unmeasurable value read as a measured one - and it bites the same way round:
+ * a rendered sine has exactly one measurable partial, so a sine on either side of the
+ * comparison contributed a fabricated "flat spectrum" reading to the score. Handing
+ * `harmonicTerm` a `null` puts it under the rule already argued there: unmeasurable on the
+ * reference is excluded, unmeasurable on the candidate alone is a measured failure at 0.
+ */
+const measuredTilt = (shape: HarmonicShape | undefined): number | null =>
+  shape !== undefined && shape.amplitudesDbRelF0.filter(isMeasuredPartial).length >= 2
+    ? shape.tiltDbPerOctave
+    : null
 
 /**
  * Compare summary audio features on bounded, metric-specific scales.
@@ -730,14 +1003,19 @@ export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMet
     stereoWidth: detail('stereoWidth', exponentialSimilarity(candidate.stereoWidth - reference.stereoWidth, 0.35)),
     decayT60Ms: decayDetail(reference.decayT60Ms, candidate.decayT60Ms, logRatio),
     envelope: envelopeDetail(reference.envelopeDb, candidate.envelopeDb),
-    bands: bandsDetail(reference.bandsDb, candidate.bandsDb),
+    bands: bandsDetail(reference.bandsDb, candidate.bandsDb, reference.sampleRateHz, candidate.sampleRateHz),
     brightness: brightnessDetail(reference.spectralWindows, candidate.spectralWindows),
     harmonics: harmonicsDetail(reference.harmonicShape, candidate.harmonicShape),
     tilt: harmonicTerm(
-      reference.harmonicShape?.tiltDbPerOctave ?? null,
-      candidate.harmonicShape?.tiltDbPerOctave ?? null,
+      measuredTilt(reference.harmonicShape),
+      measuredTilt(candidate.harmonicShape),
       (left, right) => exponentialSimilarity(right - left, TILT_SCALE_DB_PER_OCTAVE)
     ),
+    // No `measuredTilt` equivalent, and deliberately: `analyzeHarmonics` falls back to
+    // `inharmonicity: 0` only when its fit has no term at all, which cannot happen while a
+    // `harmonics` block exists - the loudest partial is 0 dB relative to itself, clears
+    // `HARMONIC_FIT_FLOOR_DB`, and carries a positive frequency, so it always supplies one.
+    // Every 0 reaching this line is a fitted 0: a harmonic series.
     inharmonicity: harmonicTerm(
       reference.harmonics?.inharmonicity ?? null,
       candidate.harmonics?.inharmonicity ?? null,
@@ -1195,7 +1473,7 @@ function measureHarmonicShape(amplitudesDbRelF0: readonly number[]): HarmonicSha
   const measurable: { n: number; db: number }[] = []
   for (let index = 0; index < amplitudesDbRelF0.length; index++) {
     const db = amplitudesDbRelF0[index]
-    if (db > HARMONIC_AMPLITUDE_FLOOR_DB) measurable.push({ n: index + 1, db })
+    if (isMeasuredPartial(db)) measurable.push({ n: index + 1, db })
   }
 
   // Least squares of level against log2(n): the slope is dB per doubling of partial number,
@@ -1572,7 +1850,8 @@ export function analyzeAudio(
     spectralRolloffHz,
     spectralFlatness,
     spectralWindows: measureSpectralWindows(channels, length, sampleRate, pitch?.f0Hz, windowCount),
-    pitch
+    pitch,
+    sampleRateHz: sampleRate
   }
   if (pitch) {
     const peakSampleIndex = Math.round(envelope.peakIndex * hopMs * sampleRate / 1000)

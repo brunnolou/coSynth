@@ -123,7 +123,7 @@ export function announcementSections(): readonly { title: string; body: string }
     {
       title: 'Sound-matching workflow',
       body: `To match a reference sound, call ${MATCHING_WORKFLOW.map(name => `\`${name}\``).join(' → ')}, then repeat that loop. ` +
-        'There is no separate render step: `compare_audio` renders the candidate for you, at the reference\'s own detected pitch and duration, and returns a signed diff with ranked parameter moves. Call `render_audio` yourself only to choose the notes (`autoRender: false` then compares that render), or for sound design no reference is driving. `suggest_patch` re-reads the last comparison\'s ranked moves without paying for another render. ' +
+        'There is no separate render step: `compare_audio` renders the candidate for you, at the reference\'s own detected pitch and duration, and returns a signed diff with ranked parameter moves. Call `render_audio` yourself only to choose the notes (`autoRender: false` then compares that render), or for sound design no reference is driving. `suggest_patch` re-aims that comparison\'s ranked moves at the patch as it is now, so call it after applying moves; calling it before you have changed anything just repeats `diff.actions`. ' +
         'Each `compare_audio` result carries a `progress` block with the best similarity so far against this reference, so stop when it reports a plateau rather than editing past your own best patch.'
     },
     { title: 'Where to start', body: `${START_HERE} ${PLAYBACK_NOTE}` },

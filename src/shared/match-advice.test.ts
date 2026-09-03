@@ -1593,6 +1593,187 @@ describe('the env2 -> filter1.cutoff route', () => {
   })
 })
 
+/**
+ * Eval run 4, first finding. The `env2 -> filter1.cutoff` route was offered five
+ * times and declined four; followed as written it dropped the score 0.747 ->
+ * 0.655, and the SAME mechanism shaped as hold-then-decay took brightness 0.571
+ * -> 0.702 and the score to 0.783. Right mechanism, wrong contour - and
+ * `last - first` is exactly the reading that cannot tell the two contours apart.
+ */
+describe("a trajectory's shape picks the env2 stage", () => {
+  /** Steady offset through the first three windows, then the whole drift. */
+  const fallsLate = () => {
+    const diff = zeroDiff()
+    diff.brightness = withBrightness([-0.02, 0, -0.03, -0.8, -1.6])
+    return diff
+  }
+  /** The same total drift, spread evenly from the first window. */
+  const fallsThroughout = () => {
+    const diff = zeroDiff()
+    diff.brightness = withBrightness([-0.05, -0.45, -0.85, -1.2, -1.6])
+    return diff
+  }
+  const routed = (depth: number) => [{ source: 'env2', destination: 'filter1.cutoff', depth }]
+  const envOf = (diff: MatchDiff, patch: PatchValues = defaultPatch(), options = {}) =>
+    adviseFromDiff(diff, patch, { maxActions: 20, ...options }).find(a => a.suggested?.id.startsWith('env2.'))
+
+  it('prescribes hold for a drift that starts late and decay for one that starts at note-on', () => {
+    const late = envOf(fallsLate())!
+    const throughout = envOf(fallsThroughout())!
+    expect(late.suggested!.id).toBe('env2.hold')
+    expect(throughout.suggested!.id).toBe('env2.decay')
+    // The two shapes carry the same total drift, so the old first-vs-last read
+    // is identical for both: only the shape separates them.
+    expect(late.paramIds).not.toEqual(throughout.paramIds)
+    expect(late.finding).not.toBe(throughout.finding)
+    expect(late.paramIds.some(id => throughout.paramIds.includes(id) && id === 'env2.hold')).toBe(false)
+  })
+
+  it('says why the decay is the wrong lever for a late drift rather than only which one is right', () => {
+    const late = envOf(fallsLate())!
+    // The break point is read off the trajectory, and the move lands on it.
+    expect(late.finding).toContain('500 ms')
+    expect(late.suggested!.to).toBeCloseTo(0.5, 6)
+    expect(late.direction).toBe('increase')
+    expect(late.finding).toMatch(/move the early windows that already agree/)
+    expect(late.finding).toContain('PROBE')
+    expectLegalSuggestion(late)
+
+    const throughout = envOf(fallsThroughout())!
+    expect(throughout.finding).toContain('The drift runs from the first measured window')
+    expect(throughout.finding).not.toContain('env2.hold')
+  })
+
+  it('brings the sweep forward when the candidate is the one holding too long', () => {
+    const diff = zeroDiff()
+    diff.brightness = withBrightness([0.02, 0, 0.03, 0.8, 1.6])
+    const held = envOf(diff, defaultPatch({ 'env2.hold': 1.2 }))!
+    expect(held.suggested!.id).toBe('env2.hold')
+    expect(held.suggested!.to).toBeLessThan(held.suggested!.from)
+    expect(held.direction).toBe('decrease')
+  })
+
+  it('falls back to env2.dec_curve when env2.hold cannot deliver the contour', () => {
+    // Same shape, but the sweep has to come EARLIER and env2.hold is already at
+    // 0. The contour then lives inside the decay stage as its curve.
+    const diff = zeroDiff()
+    diff.brightness = withBrightness([0.02, 0, 0.03, 0.8, 1.6])
+    const action = envOf(diff)!
+    expect(action.suggested!.id).toBe('env2.dec_curve')
+    expect(action.paramIds[0]).toBe('env2.dec_curve')
+    expect(action.suggested!.to).toBeGreaterThan(action.suggested!.from)
+    expect(action.finding).toContain('drops steeply at the END of the stage')
+    expectLegalSuggestion(action)
+  })
+
+  it('refuses to invent a contour it has too few windows to read', () => {
+    const short = zeroDiff()
+    short.brightness = withBrightness([0, -0.7, -1.6])
+    const action = envOf(short, defaultPatch(), { mods: routed(0.45) })!
+    // The probe survives - the drift is real and the mechanism is known - but
+    // it says which reading it is assuming, and it costs a confidence step.
+    expect(action.suggested!.id).toBe('env2.decay')
+    expect(action.finding).toContain('only 3 measured windows')
+    expect(action.finding).toContain('assumes the drift starts at note-on')
+    expect(action.finding).toContain('env2.hold')
+    expect(action.confidence).toBe('low')
+    // The same route, on a trajectory long enough to place the drift, keeps the
+    // confidence the route earned.
+    expect(envOf(fallsThroughout(), defaultPatch(), { mods: routed(0.45) })!.confidence).toBe('medium')
+  })
+
+  it('shapes the advice for a route that does not exist yet, without moving anything', () => {
+    const late = envOf(fallsLate(), defaultPatch(), { mods: [] })
+    expect(late, 'no env2 move belongs on a patch with no route').toBeUndefined()
+    const action = adviseFromDiff(fallsLate(), defaultPatch(), { maxActions: 20, mods: [] })
+      .find(a => a.paramIds.includes('env2.decay'))!
+    expect(action.suggested).toBeUndefined()
+    expect(action.finding).toContain('the stage to reach for then is env2.hold')
+  })
+})
+
+/**
+ * Eval run 4, second finding: `env1.sustain` suggested nine times, wrong nine
+ * times, with `env1.decay` the real lever. `sustainDb` is the envelope level at
+ * 80% of the buffer, which decay TIME and sustain LEVEL set together, so the
+ * rule was measuring one thing and steering another.
+ */
+describe('sustain level against decay time', () => {
+  const sustainOf = (sustainDbDelta: number, decayT60MsDelta: number | null, patch = defaultPatch()) => {
+    const diff = zeroDiff()
+    diff.envelope.sustainDbDelta = sustainDbDelta
+    diff.envelope.decayT60MsDelta = decayT60MsDelta
+    return adviseFromDiff(diff, patch, { maxActions: 20 }).find(a => a.paramIds.includes('env1.sustain'))!
+  }
+
+  it('steers env1.sustain when the two decays agree', () => {
+    const action = sustainOf(-6, 0, defaultPatch({ 'env1.sustain': 0.4 }))
+    expect(action.paramIds).toEqual(['env1.sustain'])
+    expect(action.suggested!.id).toBe('env1.sustain')
+    expect(action.suggested!.to).toBeCloseTo(0.4 * 10 ** (6 / 20), 4)
+    expect(action.confidence).toBe('medium')
+    expect(action.finding).toContain('agree within 20 ms')
+  })
+
+  it('refuses to steer env1.sustain when the decay explains the reading', () => {
+    // The eval case: a candidate that decays too FAST reads low at 80% of the
+    // buffer whatever its sustain is set to, so both deltas are negative and
+    // `env1.sustain` is the wrong parameter.
+    const action = sustainOf(-6, -400, defaultPatch({ 'env1.sustain': 0.4 }))
+    expect(action.suggested, 'a move here fights the wrong parameter').toBeUndefined()
+    expect(action.paramIds[0]).toBe('env1.decay')
+    expect(action.paramIds).toContain('env1.sustain')
+    expect(action.confidence).toBe('low')
+    expect(action.direction).toBe('either')
+    expect(action.finding).toContain('NOT steering env1.sustain')
+    expect(action.finding).toContain('decay TIME and sustain LEVEL together')
+    // And it names the measurement that would settle it rather than guessing.
+    expect(action.finding).toContain('envelopeDb')
+    // The mirror: a candidate that decays too SLOWLY reads high at 80%.
+    const high = sustainOf(6, 400, defaultPatch({ 'env1.sustain': 0.4 }))
+    expect(high.suggested).toBeUndefined()
+    expect(high.confidence).toBe('low')
+  })
+
+  it('keeps the sustain move when the decay pushes the reading the other way', () => {
+    // Decay too LONG while the level at 80% reads LOW: the decay is masking the
+    // sustain error rather than causing it, so the move stands and the finding
+    // says the error is at least the size measured.
+    const action = sustainOf(-6, 400, defaultPatch({ 'env1.sustain': 0.4 }))
+    expect(action.suggested!.id).toBe('env1.sustain')
+    expect(action.confidence).toBe('medium')
+    expect(action.finding).toContain('OPPOSITE way')
+    expect(action.finding).toContain('at least the 6.0 dB measured')
+    expect(action.paramIds).toContain('env1.decay')
+  })
+
+  it('names both levers when there is no decay reading to weigh against', () => {
+    const action = sustainOf(-6, null, defaultPatch({ 'env1.sustain': 0.4 }))
+    expect(action.suggested).toBeUndefined()
+    expect(action.confidence).toBe('low')
+    expect(action.direction).toBe('either')
+    expect(action.paramIds).toEqual(['env1.sustain', 'env1.decay'])
+    expect(action.finding).toContain('decayT60Ms came back null')
+    expect(action.finding).toContain('envelopeDb')
+  })
+
+  it('never repeats a sustain move the decay already explains, however many rounds it runs', () => {
+    // Nine rounds of the eval's own loop: the level error stays because the
+    // decay is what produces it, and the rule must not hand back the same
+    // `env1.sustain` move every time.
+    let patch = defaultPatch({ 'env1.sustain': 0.4, 'env1.decay': 0.5 })
+    for (let round = 0; round < 9; round++) {
+      const diff = zeroDiff()
+      diff.envelope.sustainDbDelta = -6
+      diff.envelope.decayT60MsDelta = -400
+      const actions = adviseFromDiff(diff, patch, { maxActions: 20 })
+      expect(actions.some(a => a.suggested?.id === 'env1.sustain'), `round ${round}`).toBe(false)
+      expect(actions.some(a => a.suggested?.id === 'env1.decay'), `round ${round}`).toBe(true)
+      patch = applySuggestions(patch, actions).patch
+    }
+  })
+})
+
 describe('a finding never describes a bigger move than it applies', () => {
   /** The clamp claim a finding makes, read back out of its own prose. */
   function clampClaim(finding: string): { id: string; computed: number; bound: string; limit: number } | null {
@@ -1991,7 +2172,11 @@ describe('brightness rows below the noise gate', () => {
     const measured = envOf(rows[3])!
     expect(measured, 'the control must fire, or the negative case proves nothing').toBeDefined()
     expect(measured.finding).toContain('darkens too fast')
-    expect(measured.suggested?.id).toBe('env2.decay')
+    // `env2.hold`, not `env2.decay`: these rows hold a steady offset for three
+    // windows and only fall in the fourth, which is the flat-early/falls-late
+    // shape - the rule prescribes the stage that moves the tail and leaves the
+    // early windows alone. See `a trajectory's shape picks the env2 stage`.
+    expect(measured.suggested?.id).toBe('env2.hold')
 
     // Same trajectory, last window measured off the noise the sound decayed
     // into. There is no measurable drift left, so there is no action.

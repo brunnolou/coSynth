@@ -17,7 +17,7 @@
 //   POST /start            dispatch the human Start gesture (logged, not free)
 //   GET  /log              every call so far, plus the summary counters
 //   POST /reset            reload the page for a fresh cold session
-//   GET  /health           readiness
+//   GET  /health           readiness, plus this browser's audio sample rates
 import { createServer } from 'node:http'
 import { chromium } from 'playwright'
 
@@ -68,6 +68,35 @@ await page.waitForFunction(() => (window.__webMcpTools?.size ?? 0) > 0, { timeou
 
 const log = []
 let gestureAt = null
+let deviceSampleRate
+
+/**
+ * The two rates the page itself can tell us: what the output device claims, and
+ * what the live engine context ended up at (null until the Start gesture builds
+ * one, which is most of a matching run).
+ *
+ * Both belong in the instrument's readout rather than in an agent's guesswork.
+ * The device rate is what a decode-only `AudioContext` inherits, and this
+ * browser's is 16 kHz — so a run that never notices it is analysing a 44.1 kHz
+ * reference through an 8 kHz ceiling. The device probe is cached: a context is
+ * cheap but not free, and browsers cap how many may exist at once.
+ */
+async function readBrowserSampleRates() {
+  if (deviceSampleRate === undefined) {
+    deviceSampleRate = await page.evaluate(async () => {
+      try {
+        const probe = new AudioContext()
+        const rate = probe.sampleRate
+        await probe.close()
+        return rate
+      } catch {
+        return null
+      }
+    })
+  }
+  const engineSampleRate = await page.evaluate(() => window.coSynth?.context?.sampleRate ?? null)
+  return { deviceSampleRate, engineSampleRate }
+}
 
 /** A digital-silence floor: the analyzer reports -160 dB for an all-zero buffer. */
 const SILENT_PEAK_DB = -159
@@ -142,7 +171,15 @@ function digest(result) {
       decodedBytes: result.reference.decodedBytes
     }
   }
-  if (result.candidate && typeof result.candidate === 'object') out.candidateSource = result.candidate.source
+  if (result.candidate && typeof result.candidate === 'object') {
+    out.candidateSource = result.candidate.source
+    // Reference and candidate are analysed on whatever axis their own sample
+    // rate gives them, and nothing in the payload puts the two side by side.
+    // When they disagree, every octave band above the lower Nyquist reads
+    // empty on one side and full on the other - a gap no patch can close. A
+    // real run spent an experiment discovering that; the log now just says it.
+    out.candidateSampleRate = result.candidate.sampleRate
+  }
   // analyze_reference_audio returns the analysis at the top level, not nested.
   if (result.source === 'base64-reference') {
     out.referenceDuration = result.duration
@@ -201,7 +238,50 @@ function summariseMatchingLoop(calls) {
   }
 }
 
-const summarise = () => {
+/**
+ * Every sample rate the run analysed audio at, and whether they agree.
+ *
+ * The rate is not cosmetic: `bandsDb` is ten octave bands ending at 16 kHz, and
+ * a band above a signal's Nyquist can only read the -100 dB floor. Analysing the
+ * reference at one rate and the candidate at another therefore manufactures a
+ * per-band gap out of nothing. This browser is exactly where that happens -
+ * Playwright's Chromium reports a 16 kHz output device (measured; no launch flag
+ * changes it), while an offline render falls back to 48 kHz - and a live run
+ * lost a comparison to a +75 dB error in the 16 kHz band that no patch could
+ * touch. `deviceSampleRate` is reported even when nothing disagrees, because a
+ * run where both sides are low is not wrong so much as blind above 8 kHz.
+ */
+function summariseSampleRates(calls, browserRates) {
+  const reference = new Set()
+  const candidate = new Set()
+  for (const entry of calls) {
+    const result = entry.result
+    if (!result) continue
+    if (typeof result.referenceSampleRate === 'number') reference.add(result.referenceSampleRate)
+    if (typeof result.reference?.sampleRate === 'number') reference.add(result.reference.sampleRate)
+    if (typeof result.candidateSampleRate === 'number') candidate.add(result.candidateSampleRate)
+  }
+  const analysed = [...new Set([...reference, ...candidate])].sort((a, b) => a - b)
+  const mismatched = reference.size > 0 && candidate.size > 0 && analysed.length > 1
+  const lowest = analysed.length ? analysed[0] : null
+  const notes = []
+  if (mismatched) {
+    notes.push(`Reference and candidate were analysed at different sample rates (${analysed.join(', ')} Hz). ` +
+      `Every octave band above ${lowest / 2} Hz reads the -100 dB floor on the slower side only, so its band error is an artifact of the rate, not of the patch.`)
+  }
+  if (lowest !== null && lowest < 32000) {
+    notes.push(`The lowest analysis rate was ${lowest} Hz, so nothing above ${lowest / 2} Hz was measurable at all.`)
+  }
+  return {
+    ...browserRates,
+    reference: [...reference].sort((a, b) => a - b),
+    candidate: [...candidate].sort((a, b) => a - b),
+    mismatched,
+    notes
+  }
+}
+
+const summarise = (browserRates = {}) => {
   const calls = log.filter(entry => entry.kind === 'call')
   const failed = calls.filter(entry => !entry.ok)
   const firstOkUpdate = calls.findIndex(entry => entry.tool === 'update_parameters' && entry.ok)
@@ -249,6 +329,7 @@ const summarise = () => {
     // `compare_audio` performs for itself. This must stay at zero; a nonzero
     // count means the offline path silently produced nothing.
     silentRenders: calls.filter(entry => entry.result?.SILENT).length,
+    sampleRates: summariseSampleRates(calls, browserRates),
     matchingLoop: summariseMatchingLoop(calls),
     startGestureDispatchedAtCall: gestureAt,
     pageErrors: [...pageErrors]
@@ -275,7 +356,12 @@ const server = createServer(async (request, response) => {
   const route = `${request.method} ${new URL(request.url, 'http://localhost').pathname}`
   try {
     if (route === 'GET /health') {
-      return json(response, 200, { ok: true, url, toolCount: (await page.evaluate(() => window.__webMcpTools.size)) })
+      return json(response, 200, {
+        ok: true,
+        url,
+        toolCount: (await page.evaluate(() => window.__webMcpTools.size)),
+        ...(await readBrowserSampleRates())
+      })
     }
 
     if (route === 'GET /tools') {
@@ -289,7 +375,9 @@ const server = createServer(async (request, response) => {
       return json(response, 200, { tools })
     }
 
-    if (route === 'GET /log') return json(response, 200, { summary: summarise(), log })
+    if (route === 'GET /log') {
+      return json(response, 200, { summary: summarise(await readBrowserSampleRates()), log })
+    }
 
     if (route === 'POST /start') {
       const before = await page.evaluate(() => ({ running: window.coSynth?.running ?? null }))

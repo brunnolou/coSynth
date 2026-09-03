@@ -83,6 +83,13 @@ class FakeEngine {
   loadPreset = vi.fn((preset: Partial<PresetData>, _origin?: unknown) => {
     if (preset.params?.['master.volume'] !== undefined) this.values[paramIndex('master.volume')] = preset.params['master.volume']
   })
+  /**
+   * Wavetables imported through the browser UI, one slot per oscillator. Null is
+   * the real default: no WebMCP tool can fill one, so `osc*.wavetable: Custom`
+   * resolves to Digital unless a human has imported a WAV.
+   */
+  customTables: (object | null)[] = [null, null, null]
+  captureSoundState = vi.fn(() => ({ customTables: this.customTables.slice() }))
   recordOutput = vi.fn(async (duration: number, _signal?: AbortSignal): Promise<RecordedAudio> => {
     const length = Math.max(32, Math.round(duration * 8000))
     const left = Float32Array.from({ length }, (_, index) => 0.2 * Math.sin(2 * Math.PI * 440 * index / 8000))
@@ -326,6 +333,82 @@ describe('single-round-trip discovery', () => {
     expect(envelope.parameters.items[0]).toMatchObject({ id: 'env1.attack', unit: 's', curve: 'exp' })
     await expect(execute('get_parameter_schema', { limit: 61 })).rejects.toThrow(/1\.\.60/)
     await expect(execute('get_parameter_schema', { format: 'brief' })).rejects.toThrow(/format/i)
+  })
+
+  it('says what the opaque choices SOUND like, and pays for a shared table once', async () => {
+    const { execute } = setup()
+    // The motivating run: an agent spent four render-and-compare rounds guessing
+    // which of the seven wavetables was the bright one, and found it by luck.
+    // "Digital" and "FM Bell" say nothing about tilt or odd/even on their own.
+    const table = await execute('get_parameter_schema', { search: 'osc1.wavetable' })
+    const wavetable = table.parameters.items[0]
+    expect(wavetable.id).toBe('osc1.wavetable')
+    expect(Object.keys(wavetable.choiceNotes)).toEqual(wavetable.choices)
+    expect(wavetable.choiceNotes.Digital).toMatch(/tilt/i)
+
+    // osc1/2/3.wavetable share one notes object by reference, and it is ~2 kB.
+    // A page wide enough to hold all three is exactly the page an agent asks for
+    // when it wants to see everything, so it must not pay for that prose three
+    // times over.
+    const wide = await execute('get_parameter_schema', { limit: 60 })
+    const carriers = wide.parameters.items.filter((item: { choiceNotes?: unknown }) => item.choiceNotes)
+    const referrers = wide.parameters.items.filter((item: { choiceNotesSameAs?: unknown }) => item.choiceNotesSameAs)
+    expect(carriers.map((item: { id: string }) => item.id)).toContain('osc1.wavetable')
+    expect(referrers.map((item: { id: string }) => item.id)).toEqual(['osc2.wavetable', 'osc3.wavetable'])
+    for (const item of referrers) expect(item.choiceNotesSameAs).toBe('osc1.wavetable')
+    // Identity, not deep equality: the other annotated choices carry their own.
+    for (const id of ['dist.type', 'filter.routing']) {
+      const own = (await execute('get_parameter_schema', { search: id })).parameters.items[0]
+      expect(own.id, id).toBe(id)
+      expect(Object.keys(own.choiceNotes), id).toEqual(own.choices)
+    }
+
+    // Compact is a one-line-per-parameter format and stays one line: the notes
+    // are the reason to ask for the full format on a narrow page.
+    const compact = await execute('get_parameter_schema', { format: 'compact' })
+    expect(JSON.stringify(compact)).not.toContain('choiceNotes')
+    // And the default full page — the discovery call with a 1500 B budget — does
+    // not reach osc1.wavetable at all, so it pays nothing either.
+    expect(JSON.stringify(await execute('get_parameter_schema'))).not.toContain('choiceNotes')
+  })
+
+  it('refuses to let `Custom` read back as a wavetable that is not playing', async () => {
+    const { engine, execute } = setup()
+    // `engine.tableForOsc` resolves Custom as WAVETABLE_NAMES[min(sel, CUSTOM_WT - 1)]
+    // when the slot is empty — Digital — and no tool here can fill that slot:
+    // importWavetableFile takes a browser File. So the write "succeeded", the
+    // state read back "Custom", and the agent reasoned about a table it was not
+    // hearing.
+    const applied = await execute('update_parameters', { updates: [{ id: 'osc1.wavetable', value: 'Custom' }] })
+    expect(applied.applied[0]).toMatchObject({ id: 'osc1.wavetable', formatted: 'Custom', resolvesTo: 'Digital' })
+    expect(applied.applied[0].note).toMatch(/no wavetable has been imported/)
+    expect(applied.applied[0].note).toMatch(/no tool here can import one/i)
+
+    // Reading the patch back says the same thing, in either format and on any
+    // page — the page an agent asks for usually does not hold osc*.wavetable.
+    for (const input of [{}, { format: 'compact' }, { group: 'filter' }]) {
+      const state = await execute('get_synth_state', input)
+      expect(state.patch.wavetableFallback, JSON.stringify(input)).toMatchObject({
+        parameters: ['osc1.wavetable'], resolvesTo: 'Digital'
+      })
+    }
+
+    // A built-in table is not a fallback and says nothing.
+    await execute('update_parameters', { updates: [{ id: 'osc1.wavetable', value: 'PWM' }] })
+    expect((await execute('get_synth_state')).patch).not.toHaveProperty('wavetableFallback')
+
+    // And once a human HAS imported one, Custom is exactly what it claims.
+    engine.customTables[0] = { name: 'imported' }
+    const backed = await execute('update_parameters', { updates: [{ id: 'osc1.wavetable', value: 'Custom' }] })
+    expect(backed.applied[0]).not.toHaveProperty('resolvesTo')
+    expect((await execute('get_synth_state')).patch).not.toHaveProperty('wavetableFallback')
+
+    // apply_patch runs the same batch through the same reporting, dry run too.
+    const other = setup()
+    const dry = await other.execute('apply_patch', { parameters: [{ id: 'osc2.wavetable', value: 'Custom' }], dryRun: true })
+    expect(dry.wouldApply.parameters[0].resolvesTo).toBe('Digital')
+    const real = await other.execute('apply_patch', { parameters: [{ id: 'osc2.wavetable', value: 'Custom' }] })
+    expect(real.applied.parameters[0].resolvesTo).toBe('Digital')
   })
 
   it('reports the whole instrument and the next page when a compact call is truncated', async () => {
@@ -1183,6 +1266,10 @@ describe('render and analysis tools', () => {
       duration: 4 / 8000,
       sampleRate: 8000,
       channels: 1,
+      // This four-sample fixture holds nothing periodic, so `pitch` comes back
+      // null and the result explains what that means. See the pitch-note test
+      // below for the wording; here it only has to be part of the shape.
+      pitchNote: expect.stringContaining('No fundamental was found'),
       // objectContaining so new AudioMetrics fields do not break this assertion.
       metrics: expect.objectContaining({
         peakDb: expect.any(Number), rmsDb: expect.any(Number), clippingCount: expect.any(Number),
@@ -1292,20 +1379,12 @@ describe('render and analysis tools', () => {
     await vi.advanceTimersByTimeAsync(1200)
     const json = await comparingJson
     const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length
-    return {
-      text, json,
-      textBytes: bytes(text),
-      jsonBytes: bytes(json),
-      // What text mode cost before the arrays were trimmed out of it: the same
-      // response with both metrics objects whole, which is what it used to be.
-      previousTextBytes: bytes(text) - bytes(text.reference) - bytes(text.candidate) - bytes(text.metricsOmitted)
-        + bytes(json.reference) + bytes(json.candidate)
-    }
+    return { text, json, bytes, textBytes: bytes(text), jsonBytes: bytes(json) }
   }
 
   it('makes text mode a summary in the strict sense, without moving one byte of `comparison`', async () => {
     vi.useFakeTimers()
-    const { text, json, textBytes, jsonBytes, previousTextBytes } = await comparisonSizes(4)
+    const { text, json, bytes, textBytes, jsonBytes } = await comparisonSizes(4)
 
     // The defect: the table was additive on top of two complete metrics objects,
     // so every band, envelope point and spectral window was serialised twice —
@@ -1329,19 +1408,51 @@ describe('render and analysis tools', () => {
     // incomparable with every other. Byte-identical, not merely equivalent.
     expect(JSON.stringify(text.comparison)).toBe(JSON.stringify(json.comparison))
 
-    // The budget, and why it is the number it is. The trimmed fields are ~2.9 kB
-    // of a ~10.9 kB response, so text mode has to land under three quarters of
-    // what it used to cost. It must also come in under json mode — the mode it
-    // claims to summarize — which it could not while carrying json's arrays AND
-    // a 1.8 kB table on top of them. Measured against json twice: whole, and
-    // with the table set aside, because the structured half is the part the two
-    // modes actually have in common and it is a quarter smaller here.
+    // The budget, and why it is measured the way it is.
+    //
+    // This block used to read `textBytes < previousTextBytes * 0.75`, where
+    // `previousTextBytes` was `textBytes + the arrays this mode drops`. Multiply
+    // that out and it says `textBytes < 3 * trimmed`: a ceiling on the WHOLE
+    // response, denominated in the arrays, that tightened by three bytes for
+    // every one the findings gained. It duly failed the round where a rule
+    // learned to say WHY it was refusing a move — an improvement scored as a
+    // regression, by a test written to assert something else entirely. The three
+    // properties are measured directly now, and each fails for its own reason.
     const tableBytes = new TextEncoder().encode(text.text).length
+
+    // 1. The contract: the arrays are not paid for twice. Measured on the fields
+    // actually removed — 64 envelope points, 10 bands and `windows` x 12
+    // partials per side — so it says nothing about how long the findings are.
+    const trimmed = (bytes(json.reference) + bytes(json.candidate))
+      - (bytes(text.reference) + bytes(text.candidate))
+    expect(trimmed).toBeGreaterThan(2500)
+    // Net of the block text mode adds back to say what it dropped.
+    expect(trimmed - bytes(text.metricsOmitted)).toBeGreaterThan(2000)
+    // Per side, so a trim that fired on only one of them cannot hide in a total.
+    expect(bytes(text.reference)).toBeLessThan(bytes(json.reference) * 0.75)
+    expect(bytes(text.candidate)).toBeLessThan(bytes(json.candidate) * 0.75)
+
+    // 2. Smaller than the mode it claims to summarize, table and all — which it
+    // was not while carrying json's arrays AND the table on top of them. And a
+    // quarter smaller with the table set aside, since the structured half is the
+    // part the two modes actually have in common.
     expect(tableBytes).toBeGreaterThan(1000)
-    expect(textBytes).toBeLessThan(previousTextBytes * 0.75)
     expect(textBytes).toBeLessThan(jsonBytes)
     expect(textBytes - tableBytes).toBeLessThan(jsonBytes * 0.75)
-    expect(textBytes).toBeLessThanOrEqual(8200)
+
+    // 3. An absolute cap, from measured reality, raised only by a decision
+    // someone has to write down — the same rule the tool-listing ceiling keeps.
+    // Today the response is 9615 B: 3036 table, 2360 structured actions, 1594
+    // comparison, 1769 both metrics objects, 467 metricsOmitted, 264 progress.
+    // 1777 B of that table is its ACTIONS block, restating the same five moves
+    // `diff.actions` already carries WITH parameter ids and legal target values, so
+    // `formatDiff` is told they ship structurally and prints one pointer line instead of
+    // restating five moves — measured at 1779 B of block against a 138 B line, taking this
+    // response from 9615 to ~7965. The cap keeps ~535 B of headroom, which is the right
+    // order for a budget the findings' prose grows into: the assertion this replaced was a
+    // ratio against the measured value itself, so it tightened every time a rule learned to
+    // explain a refusal.
+    expect(textBytes).toBeLessThanOrEqual(8500)
   })
 
   it('stops text mode growing with the window count, which is where the arrays hurt most', async () => {
@@ -1457,6 +1568,112 @@ describe('render and analysis tools', () => {
     expect(fresh.progress).toMatchObject({ comparisonNumber: 1, isBest: true, bestComparisonNumber: 1, comparisonsSinceBest: 0, deltaFromBest: 0 })
     expect(fresh.progress.best).toBe(Math.round(fresh.comparison.similarity * 1e4) / 1e4)
     expect(fresh.progress.best).not.toBe(matched.progress.best)
+  })
+
+  it('calls a score equal to the best a tie, and keeps the remediation for a real regression', async () => {
+    // Eval run 4, exactly: the final comparison scored 0.81727124416943 — the
+    // same bits as comparison 23's best — and a `similarity > best` test called
+    // it WORSE, told the agent to restore history away from its own best patch,
+    // and warned that save_preset would save the wrong one. Every word false,
+    // and all three acted on.
+    let soundEntryId = 'sound-first'
+    const { engine, execute } = setup(undefined, vi.fn(async () => decodedReference()), {
+      currentSoundEntryId: () => soundEntryId
+    })
+    engine.scopeL = Float32Array.from([0, 0.5, -0.5, 0])
+    engine.scopeR = engine.scopeL
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+
+    const first = await execute('compare_audio')
+    expect(first.progress).toMatchObject({ standing: 'best', isBest: true, bestEntryId: 'sound-first' })
+
+    // A different sound-history entry that happens to score identically, so this
+    // is not the "you are holding the best patch" case below — it is a genuine
+    // second patch that ties.
+    soundEntryId = 'sound-second'
+    const tie = await execute('compare_audio')
+    expect(tie.comparison.similarity).toBe(first.comparison.similarity)
+
+    expect(tie.progress).toMatchObject({ standing: 'tied', isBest: true, deltaFromBest: 0 })
+    // The best keeps its own number: `comparisonsSinceBest` counts comparisons
+    // that have not IMPROVED on it, which is what the plateau is about.
+    expect(tie.progress.bestComparisonNumber).toBe(1)
+    expect(tie.progress.comparisonsSinceBest).toBe(1)
+    expect(tie.progress.note).toMatch(/ties the best/i)
+    // The three pieces of false advice, none of which may fire on a tie.
+    expect(tie.progress.note).not.toMatch(/worse/i)
+    expect(tie.progress.note).not.toMatch(/navigate_history/)
+    expect(tie.progress.note).not.toMatch(/save_preset would save this patch/)
+
+    // A real regression still gets all three.
+    engine.scopeL = Float32Array.from([0, 0.02, -0.02, 0])
+    engine.scopeR = engine.scopeL
+    const dropped = await execute('compare_audio')
+    expect(dropped.progress).toMatchObject({ standing: 'worse', isBest: false })
+    expect(dropped.progress.deltaFromBest).toBeLessThan(0)
+    expect(dropped.progress.note).toMatch(/worse than comparison 1/i)
+    expect(dropped.progress.note).toContain('navigate_history')
+    expect(dropped.progress.note).toContain('sound-first')
+    expect(dropped.progress.note).toMatch(/save_preset would save this patch/)
+  })
+
+  it('never pairs deltaFromBest 0 with a worse-than verdict, whatever the trajectory', async () => {
+    // The invariant the run-4 bug broke: the verdict and the number beside it are
+    // read off the same comparison, so they may never disagree. Swept rather than
+    // spot-checked, because the failure was one arm of one branch.
+    const trajectories = [
+      [0.5, 0.5, 0.5, 0.5],
+      [0.05, 0.5, 0.5, 0.25, 0.5],
+      [0.5, 0.25, 0.12, 0.5],
+      [0.05, 0.15, 0.3, 0.5, 0.25, 0.18, 0.12, 0.09, 0.07],
+      [0.5, 0.05, 0.5, 0.05, 0.5],
+      [0.3, 0.3, 0.05, 0.3, 0.3, 0.3, 0.3]
+    ]
+    for (const amplitudes of trajectories) {
+      const { engine, execute } = setup()
+      await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+      for (const [index, amplitude] of amplitudes.entries()) {
+        engine.scopeL = Float32Array.from([0, amplitude, -amplitude, 0])
+        engine.scopeR = engine.scopeL
+        const { progress } = await execute('compare_audio')
+        const where = `[${amplitudes.join(', ')}] #${index + 1}`
+        const saysWorse = /worse than/i.test(progress.note)
+        expect(saysWorse, where).toBe(progress.deltaFromBest < 0)
+        expect(progress.standing === 'worse', where).toBe(saysWorse)
+        expect(progress.isBest, where).toBe(!saysWorse)
+        // Never above the best: the best IS the maximum seen.
+        expect(progress.deltaFromBest, where).toBeLessThanOrEqual(0)
+        expect(progress.best, where).toBeGreaterThanOrEqual(Math.round(progress.deltaFromBest * 1e4) / 1e4)
+        if (saysWorse) continue
+        // Remediation is emitted off the verdict, so it may not survive without it.
+        expect(progress.note, where).not.toMatch(/navigate_history/)
+        expect(progress.note, where).not.toMatch(/save_preset would save this patch/)
+      }
+    }
+  })
+
+  it('stops telling an agent to restore the very patch it is holding', async () => {
+    // The same defect one branch over: `restore` and the save warning fired on
+    // the VERDICT alone, so re-comparing the best patch against a different
+    // render — other notes, another duration, the live scope — sent the agent to
+    // navigate_history for a patch already loaded, and told it save_preset would
+    // save the wrong one.
+    const { engine, execute } = setup(undefined, vi.fn(async () => decodedReference()), {
+      currentSoundEntryId: () => 'sound-best'
+    })
+    engine.scopeL = Float32Array.from([0, 0.5, -0.5, 0])
+    engine.scopeR = engine.scopeL
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    expect((await execute('compare_audio')).progress).toMatchObject({ isBest: true, bestEntryId: 'sound-best' })
+
+    engine.scopeL = Float32Array.from([0, 0.02, -0.02, 0])
+    engine.scopeR = engine.scopeL
+    const { progress } = await execute('compare_audio')
+    expect(progress.standing).toBe('worse')
+    expect(progress.note).not.toMatch(/navigate_history/)
+    expect(progress.note).not.toMatch(/save_preset would save this patch/)
+    expect(progress.note).toMatch(/patch loaded now IS the one that scored best/)
+    expect(progress.note).toContain('sound-best')
   })
 
   it('compares against the latest real render and retains only the latest reference analysis', async () => {
@@ -2801,6 +3018,149 @@ describe('matching a reference: harmonics on both sides, a gradient, and advice'
     const advice = await execute('suggest_patch')
     expect(advice.basedOn).not.toHaveProperty('stale')
     expect(advice.basedOn.note).toMatch(/Re-read of the last compare_audio/)
+    // `addsNothing` rests on "the patch has not moved", which is the same
+    // unknowable fact as `stale`. Absent, never false.
+    expect(advice.basedOn).not.toHaveProperty('addsNothing')
+  })
+
+  it('names the suggest_patch call that only repeats the comparison it read', async () => {
+    let currentSoundEntryId = 'entry-1'
+    const { execute } = matchSetup(pitchedReference, renderer(), {
+      currentSoundEntryId: () => currentSoundEntryId
+    })
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'target.wav' })
+    const compared = await execute('compare_audio', { format: 'json' })
+
+    // Eval run 4 never called this tool: "compare_audio already returns the same
+    // ranked moves, so paying a round trip to re-read them made no sense; that is
+    // a real redundancy." For the call it had in mind — unchanged patch, no
+    // focus, no more moves asked for — it was exactly right, and the list really
+    // does come back identical. The response now says so, instead of leaving an
+    // agent to work it out by diffing two payloads.
+    const repeat = await execute('suggest_patch')
+    expect(repeat.actions).toEqual(compared.diff.actions)
+    expect(repeat.basedOn.addsNothing).toBe(true)
+    expect(repeat.basedOn.note).toMatch(/Nothing new/)
+    expect(repeat.basedOn.note).toMatch(/AFTER you have applied moves/)
+
+    // The two inputs compare_audio has no answer for.
+    expect((await execute('suggest_patch', { focus: 'envelope' })).basedOn.addsNothing).toBe(false)
+    expect((await execute('suggest_patch', { maxActions: 20 })).basedOn.addsNothing).toBe(false)
+
+    // And the capability that keeps the tool alive: apply an advised move and the
+    // same stored diff yields a different list, because every from/to is derived
+    // against the patch as it is NOW. compare_audio's `diff.actions` are frozen at
+    // the moment they were measured and cannot do this without another render.
+    const move = compared.diff.actions.find((action: { suggested?: unknown }) => action.suggested) as
+      { suggested: { id: string; to: number } } | undefined
+    expect(move, 'this fixture must produce at least one quantitative move').toBeTruthy()
+    await execute('update_parameters', { updates: [{ id: move!.suggested.id, value: move!.suggested.to }] })
+    currentSoundEntryId = 'entry-2'
+    const reaimed = await execute('suggest_patch')
+    expect(reaimed.actions).not.toEqual(compared.diff.actions)
+    expect(reaimed.basedOn).toMatchObject({ stale: true, addsNothing: false })
+  })
+
+  it('says when the reference was resampled DOWN on the way in, and when it was not', async () => {
+    // Playwright's Chromium reports a 16 kHz output device. Before audio-input
+    // pinned an explicit decode rate, a 44.1 kHz reference decoded at 16 kHz:
+    // everything above its 8 kHz Nyquist read empty, the 48 kHz candidate read
+    // real energy there, and an eval agent spent a comparison proving it could
+    // not close a gap that was never in the sound.
+    const downsampled = matchSetup(() => ({ ...pitchedReference(), sourceSampleRate: 44100 }))
+    const reference = await downsampled.execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    expect(reference.sourceSampleRate).toBe(44100)
+    expect(reference.sampleRate).toBeLessThan(44100)
+    expect(reference.downsampled).toMatchObject({ from: 44100, to: reference.sampleRate })
+    expect(reference.downsampled.nyquistHz).toBe(Math.round(reference.sampleRate / 2))
+    expect(reference.downsampled.note).toMatch(/BEFORE any of these metrics were measured/)
+    // The distinction the agent could not make: absent content and discarded
+    // content look identical in every band figure and call for opposite edits.
+    expect(reference.downsampled.note).toMatch(/artefact of the decode/)
+
+    // A file decoded at its own rate says nothing, and neither does one whose
+    // header could not be read.
+    const equal = matchSetup(() => ({ ...pitchedReference(), sourceSampleRate: RATE }))
+    const plain = await equal.execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    expect(plain.sourceSampleRate).toBe(RATE)
+    expect(plain).not.toHaveProperty('downsampled')
+    const headerless = await matchSetup().execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    expect(headerless).not.toHaveProperty('sourceSampleRate')
+    expect(headerless).not.toHaveProperty('downsampled')
+  })
+
+  it('names the band above which two rates make the comparison meaningless', async () => {
+    const { engine, execute } = setup()
+    // The reference decoded at 8 kHz; the live scope reads the context's rate.
+    // Above the lower Nyquist one side cannot hold energy at all, so no edit to
+    // the patch closes that difference — and nothing used to say so.
+    engine.ctx = { sampleRate: 48000 }
+    engine.scopeL = Float32Array.from([0, 0.5, -0.5, 0])
+    engine.scopeR = engine.scopeL
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const mismatched = await execute('compare_audio', { format: 'json' })
+    expect(mismatched.sampleRates).toMatchObject({ reference: 8000, candidate: 48000, comparableBelowHz: 4000 })
+    expect(mismatched.sampleRates.note).toMatch(/reference's Nyquist/)
+    expect(mismatched.sampleRates.note).toMatch(/no edit to the patch changes that/)
+
+    // Equal rates is the ordinary case and costs nothing.
+    const same = setup()
+    same.engine.scopeL = Float32Array.from([0, 0.5, -0.5, 0])
+    same.engine.scopeR = same.engine.scopeL
+    await same.execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    expect(await same.execute('compare_audio', { format: 'json' })).not.toHaveProperty('sampleRates')
+  })
+
+  it('says why a null pitch is null, and stays quiet when one was measured', async () => {
+    const measured = matchSetup()
+    await measured.execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const pitched = await measured.execute('compare_audio', { format: 'json' })
+    expect(pitched.candidate.metrics.pitch).toMatchObject({ source: 'detected' })
+    // Nothing to explain, so nothing is paid for.
+    expect(pitched.candidate).not.toHaveProperty('pitchNote')
+    expect(pitched.reference).not.toHaveProperty('pitchNote')
+
+    // Run 4: "a +12 dB EQ boost silently killed pitch detection, zeroing three
+    // dimensions. I blamed clipping, spent a round trip fixing gain, and it still
+    // failed — only then did I suspect the EQ." From the tool layer every refusal
+    // inside detectPitch looks the same, so the note states the evidence it has
+    // and lists the rest as causes rather than asserting one.
+    const lost = matchSetup(pitchedReference, noiseRenderer())
+    await lost.execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const noise = await lost.execute('compare_audio', { format: 'json' })
+    expect(noise.candidate.metrics.pitch).toBeNull()
+    const note: string = noise.candidate.pitchNote
+    expect(note).toMatch(/No fundamental was found/)
+    // The consequence the agent could not see: three terms scored 0, not excluded.
+    expect(note).toMatch(/scores `harmonics`, `tilt` and `inharmonicity` 0/)
+    for (const term of ['harmonics', 'tilt', 'inharmonicity']) {
+      expect(noise.comparison.details[term].similarity, term).toBe(0)
+    }
+    // The evidence it actually measured, with the number beside it.
+    expect(note).toContain('spectralFlatness')
+    expect(note).toMatch(/reads as noise/)
+    // The causes it cannot verify are named as causes, never asserted — and the
+    // one that cost run 4 two calls is among them.
+    expect(note).toMatch(/Causes it cannot tell apart/)
+    expect(note).toMatch(/EQ band boosted far above it/)
+    // The reference kept its fundamental, so it carries nothing.
+    expect(noise.reference).not.toHaveProperty('pitchNote')
+
+    // Text is compare_audio's default and it drops `metricNotes`. The pitch note
+    // must not go with them: text mode is where the eval agent was standing.
+    const text = await lost.execute('compare_audio')
+    expect(text.candidate).not.toHaveProperty('metricNotes')
+    expect(text.candidate.pitchNote).toBe(note)
+
+    // Digital silence gets the short answer. Reciting the detector guards for a
+    // buffer with nothing in it would be advice about nothing.
+    const { engine, execute } = setup()
+    engine.scopeL = new Float32Array(256)
+    engine.scopeR = new Float32Array(256)
+    const silent = await execute('analyze_audio', { source: 'scope' })
+    expect(silent.metrics.pitch).toBeNull()
+    expect(silent.pitchNote).toMatch(/digital silence/)
+    expect(silent.pitchNote).not.toMatch(/Causes it cannot tell apart/)
   })
 
   it('measures the candidate\'s own pitch, so a transposed patch reports a real cents error', async () => {

@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import type { AudioMetrics, AudioMetricsComparison, SpectralWindow } from './audio-analysis'
 import { SPECTRAL_WINDOW_NOISE_GATE_DB, compareAudioMetrics } from './audio-analysis'
 import { diffAudioMetrics } from './match-diff'
+import type { HarmonicShape } from './match-types'
+import { formatDiff } from './metrics-format'
 
 /**
  * Fixtures are hand-built rather than analysed: the point of these assertions is the sign
@@ -78,6 +80,48 @@ const decayed = (windows: readonly SpectralWindow[], ...indices: readonly number
     indices.includes(index) ? { ...window, levelDb: DECAYED_LEVEL_DB } : window
   )
 
+/** The floor `partialsDb` clamps at, i.e. "no peak above the noise for this partial". */
+const PARTIAL_FLOOR_DB = -120
+
+/**
+ * The four harmonic shapes the tilt and odd/even rules turn on, written the way
+ * `measureHarmonicShape` would actually write them. The fitted figures are the ones its
+ * documented degenerate cases produce, because the whole question here is whether a diff can
+ * tell a fitted 0 from a fallback 0.
+ */
+const shapes = {
+  /**
+   * A rendered sine. One measurable partial, eleven on the floor - so no slope was fitted and
+   * `tiltDbPerOctave` is the fallback 0. `oddEvenDb` is a real 120 dB: the even partials are
+   * genuinely absent, which is the measurement rather than a gap in it.
+   */
+  sine: (): HarmonicShape => ({
+    amplitudesDbRelF0: [0, ...Array.from({ length: 11 }, () => PARTIAL_FLOOR_DB)],
+    tiltDbPerOctave: 0,
+    oddEvenDb: 120
+  }),
+  /** Twelve equal partials. The slope really was fitted, and it really is 0. */
+  flat: (): HarmonicShape => ({
+    amplitudesDbRelF0: Array.from({ length: 12 }, () => 0),
+    tiltDbPerOctave: 0,
+    oddEvenDb: 0
+  }),
+  /** A band-limited square: six odd partials falling, every even one absent. */
+  square: (oddEvenDb = 106.6): HarmonicShape => ({
+    amplitudesDbRelF0: [0, -120, -9.5, -120, -14, -120, -16.9, -120, -19.1, -120, -20.8, -120],
+    tiltDbPerOctave: -6.9,
+    oddEvenDb
+  }),
+  /** Nothing above the noise anywhere, reachable when the fundamental's own peak is missing. */
+  silent: (): HarmonicShape => ({
+    amplitudesDbRelF0: Array.from({ length: 12 }, () => PARTIAL_FLOOR_DB),
+    tiltDbPerOctave: 0,
+    oddEvenDb: 0
+  })
+}
+
+const withShape = (shape: HarmonicShape): AudioMetrics => makeMetrics({ harmonicShape: shape })
+
 const comparison = (similarity = 0.612): AudioMetricsComparison =>
   ({ similarity, details: {} } as unknown as AudioMetricsComparison)
 
@@ -133,6 +177,79 @@ describe('diffAudioMetrics', () => {
     ])
   })
 
+  it('marks the bands one side could not measure, and marks exactly the ones the score dropped', () => {
+    // The failure from a live eval: a reference decoded at 16 kHz against a candidate
+    // rendered at 48 kHz. The 16 kHz band's lower edge is 11.3 kHz, above the 8 kHz Nyquist
+    // of the reference, so `bandsDb` reads its -100 floor there for want of anything to
+    // measure - on both sides once the pair is capped by the lower rate, which is a silent,
+    // flattering agreement rather than a match.
+    const flooredTop = (bandsDb: readonly number[]): number[] => [...bandsDb.slice(0, 9), -100]
+    const reference = makeMetrics({ sampleRateHz: 16000, bandsDb: flooredTop(makeMetrics().bandsDb) })
+    const candidate = makeMetrics({ sampleRateHz: 48000, bandsDb: flooredTop(makeMetrics().bandsDb) })
+
+    const diff = diffAudioMetrics(reference, candidate, comparison())
+
+    expect(diff.bands).toHaveLength(10)
+    expect(diff.bands[9].centerHz).toBe(16000)
+    expect(diff.bands[9].aboveNyquist).toBe(true)
+    // Kept, never dropped: the frequency axis stays readable and `deltaDb` stays finite.
+    expect(Number.isFinite(diff.bands[9].deltaDb)).toBe(true)
+    // And the marker never lands on a band that WAS compared. The 8 kHz band straddles the
+    // limit - its lower edge is 5.7 kHz - so it keeps its real, if partial, content.
+    for (const band of diff.bands.slice(0, 9)) expect(Object.keys(band)).toEqual(['centerHz', 'deltaDb'])
+
+    // The agreement, asserted rather than trusted: `bandsDetail` counts what it scored and
+    // this module derives its marks independently, from the same two sample rates. If the
+    // two rules ever drift, the printed table and the score it explains stop describing the
+    // same bands - which is the whole defect this marker exists for.
+    const scored = compareAudioMetrics(reference, candidate).details.bands
+    expect(diff.bands.filter((band) => !band.aboveNyquist)).toHaveLength(scored.bandsCompared)
+    expect(scored.bandsCompared).toBe(9)
+  })
+
+  it('marks a band above BOTH Nyquists too, since neither side could measure it', () => {
+    const at16k = makeMetrics({ sampleRateHz: 16000 })
+    const diff = diffAudioMetrics(at16k, at16k, comparison())
+    // Identical buffers, so every delta is 0 - and the top band's 0 is the one that means
+    // nothing, because no patch move can put energy where the file cannot carry it.
+    expect(diff.bands[9].aboveNyquist).toBe(true)
+    expect(diff.bands[9].deltaDb).toBe(0)
+    expect(compareAudioMetrics(at16k, at16k).details.bands.bandsCompared).toBe(9)
+  })
+
+  it('leaves every band unmarked when no rate is known, exactly as before the flag', () => {
+    // A hand-built fixture or an analysis serialized before `sampleRateHz` existed: there is
+    // no way to tell an empty band from an unmeasurable one, so all ten are compared. The
+    // keys are checked by name, so an ungated run emits the same two-key band it always did.
+    // The full-rate pair - the common case - is here for the same reason.
+    for (const [reference, candidate] of [
+      [makeMetrics(), makeMetrics()],
+      [makeMetrics({ sampleRateHz: 48000 }), makeMetrics({ sampleRateHz: 48000 })]
+    ] as const) {
+      const diff = diffAudioMetrics(reference, candidate, comparison())
+      for (const band of diff.bands) expect(Object.keys(band)).toEqual(['centerHz', 'deltaDb'])
+      expect(compareAudioMetrics(reference, candidate).details.bands.bandsCompared).toBe(10)
+    }
+  })
+
+  it('gates on the rate it has when only one side records one, as bandsDetail does', () => {
+    // `Math.min(nyquistOrUnbounded(ref), nyquistOrUnbounded(cand))`: a missing rate
+    // contributes Infinity, so it never widens the limit the other side sets. A 16 kHz
+    // candidate cannot hold energy above 8 kHz whatever the reference was decoded at, and
+    // the analyzer leaves that band out on exactly these terms. Asserted in both directions,
+    // because a `min` written as a `??` would pass one and fail the other.
+    for (const [side, reference, candidate] of [
+      ['rate on the candidate', makeMetrics(), makeMetrics({ sampleRateHz: 16000 })],
+      ['rate on the reference', makeMetrics({ sampleRateHz: 16000 }), makeMetrics()]
+    ] as const) {
+      const diff = diffAudioMetrics(reference, candidate, comparison())
+      expect(diff.bands[9].aboveNyquist, side).toBe(true)
+      expect(diff.bands.filter((band) => !band.aboveNyquist), side).toHaveLength(
+        compareAudioMetrics(reference, candidate).details.bands.bandsCompared
+      )
+    }
+  })
+
   it('reads a partial measurable on one side only as null rather than 0', () => {
     const reference = makeMetrics()
     const candidate = makeMetrics({
@@ -149,6 +266,89 @@ describe('diffAudioMetrics', () => {
     expect(diff.harmonics?.deltaDb[10]).toBeNull()
     // A measured partial that happens to match still reads 0, so null is never "no difference".
     expect(diff.harmonics?.deltaDb[9]).toBe(0)
+  })
+
+  it('nulls tiltDeltaDbPerOctave when either side fitted no slope, and never claims agreement', () => {
+    const full = makeMetrics()
+    const sine = withShape(shapes.sine())
+    const cases = [
+      { side: 'candidate is a sine', reference: full, candidate: sine },
+      { side: 'reference is a sine', reference: sine, candidate: full },
+      { side: 'both are sines', reference: sine, candidate: sine }
+    ] as const
+
+    for (const { side, reference, candidate } of cases) {
+      const diff = diffAudioMetrics(reference, candidate, comparison())
+      expect(diff.harmonics?.tiltDeltaDbPerOctave, side).toBeNull()
+      // What the plain subtraction printed: a sine and a sine both report the fallback 0, so
+      // the delta was 0 and the formatter said the two spectra share a slope neither has.
+      expect(formatDiff(diff), side).not.toContain('same slope')
+      expect(formatDiff(diff), side).toContain('tilt n/a dB/oct')
+    }
+    // The old arithmetic, spelled out: this is the number that reached the formatter.
+    expect(shapes.sine().tiltDbPerOctave - shapes.sine().tiltDbPerOctave).toBe(0)
+
+    // `measuredTilt` is private in `audio-analysis.ts`, so this module carries a copy of it.
+    // `details.tilt.delta` is that copy's answer as the SCORE sees it - `harmonicTerm` writes
+    // `candidate - reference`, or `null` when a side was unmeasurable - so asserting the two
+    // agree over every shape is what keeps the copy honest.
+    for (const reference of Object.values(shapes)) {
+      for (const candidate of Object.values(shapes)) {
+        const pair = [withShape(reference()), withShape(candidate())] as const
+        expect(diffAudioMetrics(pair[0], pair[1], comparison()).harmonics?.tiltDeltaDbPerOctave)
+          .toBe(compareAudioMetrics(pair[0], pair[1]).details.tilt.delta)
+      }
+    }
+  })
+
+  it('keeps a real 0 tilt delta when both spectra genuinely are flat', () => {
+    // The other half of the ambiguity, and the reason this cannot be fixed by nulling every
+    // 0: twelve measurable partials at one level is a fitted slope of 0 dB/octave, and two of
+    // them agree about it. `null` here would replace one collapse with another.
+    const diff = diffAudioMetrics(withShape(shapes.flat()), withShape(shapes.flat()), comparison())
+    expect(diff.harmonics?.tiltDeltaDbPerOctave).toBe(0)
+    expect(formatDiff(diff)).toContain('(same slope)')
+
+    // And a fitted slope against a fitted slope still reports its difference.
+    const steeper = diffAudioMetrics(makeMetrics(), withShape(shapes.flat()), comparison())
+    expect(steeper.harmonics?.tiltDeltaDbPerOctave).toBeCloseTo(6.1, 5)
+  })
+
+  it('reports a real oddEvenDeltaDb for a square, whose missing even partials ARE the measurement', () => {
+    // The case `measureHarmonicShape` protects: a parity group entirely on the floor is
+    // measured *at* the floor, because "this sound has no even partials" is exactly what this
+    // axis says. Nulling it would throw away the one number that separates square from saw.
+    const diff = diffAudioMetrics(
+      withShape(shapes.square()),
+      withShape(shapes.square(100.2)),
+      comparison()
+    )
+    expect(diff.harmonics?.oddEvenDeltaDb).toBeCloseTo(-6.4, 5)
+
+    // A sine has one measurable partial - too few for a slope, but plenty for this axis.
+    const sine = diffAudioMetrics(makeMetrics(), withShape(shapes.sine()), comparison())
+    expect(sine.harmonics?.tiltDeltaDbPerOctave).toBeNull()
+    expect(sine.harmonics?.oddEvenDeltaDb).toBeCloseTo(117.2, 5)
+  })
+
+  it('nulls oddEvenDeltaDb only when a side found no partial above the noise at all', () => {
+    // `measureHarmonicShape` falls back to 0 here, which is also what a sawtooth's
+    // near-balance produces - opposite meanings, one number.
+    const silent = withShape(shapes.silent())
+    for (const [side, reference, candidate] of [
+      ['candidate', makeMetrics(), silent],
+      ['reference', silent, makeMetrics()],
+      ['both', silent, silent]
+    ] as const) {
+      const diff = diffAudioMetrics(reference, candidate, comparison())
+      expect(diff.harmonics?.oddEvenDeltaDb, side).toBeNull()
+      expect(diff.harmonics?.tiltDeltaDbPerOctave, side).toBeNull()
+      expect(formatDiff(diff), side).toContain('odd/even n/a dB')
+    }
+
+    // A saw against a saw: both near 0 dB, both measured, so the delta is a real 0.
+    const saw = diffAudioMetrics(makeMetrics(), makeMetrics(), comparison())
+    expect(saw.harmonics?.oddEvenDeltaDb).toBe(0)
   })
 
   it('nulls the whole harmonics block when either side lacks it', () => {
@@ -433,6 +633,24 @@ describe('diffAudioMetrics', () => {
     everyNumber(diff, (found, path) => {
       expect(Number.isFinite(found), `${path} is ${found}`).toBe(true)
     })
+  })
+
+  it('prints no NaN, undefined or null when every nullable field is unmeasurable at once', () => {
+    // Every new `null` this module can produce, in one payload, through the formatter that
+    // has to survive them. `n/a` is the only thing a reader may ever see in their place.
+    const worst = diffAudioMetrics(
+      makeMetrics({ sampleRateHz: 16000, harmonicShape: shapes.silent(), decayT60Ms: null, pitch: null }),
+      makeMetrics({ sampleRateHz: 48000, harmonicShape: shapes.sine(), decayT60Ms: null }),
+      comparison()
+    )
+    expect(worst.harmonics?.tiltDeltaDbPerOctave).toBeNull()
+    expect(worst.harmonics?.oddEvenDeltaDb).toBeNull()
+    expect(worst.bands[9].aboveNyquist).toBe(true)
+
+    const text = formatDiff(worst)
+    for (const forbidden of ['NaN', 'undefined', 'null', 'Infinity']) {
+      expect(text, forbidden).not.toContain(forbidden)
+    }
   })
 
   it('passes similarity through untouched and leaves actions to match-advice', () => {

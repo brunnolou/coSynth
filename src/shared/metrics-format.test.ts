@@ -3,7 +3,7 @@ import type { AudioMetrics, AudioMetricsComparison } from './audio-analysis'
 import { compareAudioMetrics } from './audio-analysis'
 import type { MatchAction } from './match-types'
 import { diffAudioMetrics } from './match-diff'
-import { formatDiff, formatMetrics } from './metrics-format'
+import { formatDiff, formatMetrics, COLUMN } from './metrics-format'
 
 function makeMetrics(overrides: Partial<AudioMetrics> = {}): AudioMetrics {
   return {
@@ -72,6 +72,8 @@ const context = { referenceName: 'bell-c4.wav', comparisonNumber: 3, bestSoFar: 
 /** No placeholder from the language ever reaches an agent's eyes. */
 const forbidden = ['NaN', 'undefined', 'null', 'Infinity']
 
+const bytes = (text: string): number => new TextEncoder().encode(text).length
+
 /**
  * The last window decayed into the noise: -55 dB, carrying the 4,978 Hz centroid the
  * analyzer measured off that noise. `belowNoiseFloor` is deliberately left unset, so the
@@ -84,6 +86,41 @@ const withDecayedTail = (metrics: AudioMetrics): AudioMetrics => ({
   )
 })
 
+/**
+ * A sine as the analyzer renders one: partials 2-12 have no peak above the noise, so
+ * `amplitudesDbRelF0` floors them and only the fundamental is measured. One partial is
+ * enough for both parities to have a level and not enough for a slope.
+ */
+const sineShape = (): AudioMetrics['harmonicShape'] => ({
+  amplitudesDbRelF0: [0, ...Array.from({ length: 11 }, () => -120)],
+  tiltDbPerOctave: 0,
+  oddEvenDb: 0
+})
+
+/** Nothing above the noise at all - a near-silent buffer, where even a parity has no level. */
+const silentShape = (): AudioMetrics['harmonicShape'] => ({
+  amplitudesDbRelF0: Array.from({ length: 12 }, () => -120),
+  tiltDbPerOctave: 0,
+  oddEvenDb: 0
+})
+
+/**
+ * One row of the BANDS block, split back into its fixed-width cells. `row()` writes a
+ * leading space, a 5-wide label and then 6-wide cells, so the payload starts at column 6.
+ */
+const bandRow = (text: string, label: 'hz' | 'db' | 'd'): string[] => {
+  const lines = text.split('\n')
+  const start = lines.findIndex((line) => line.startsWith('BANDS'))
+  expect(start, 'BANDS').toBeGreaterThanOrEqual(0)
+  const line = lines.slice(start + 1).find((value) => value.startsWith(` ${label.padEnd(5)}`))
+  expect(line, label).toBeDefined()
+  return (line!.slice(COLUMN).match(new RegExp(`.{${COLUMN}}`, 'g')) ?? []).map((cell) => cell.trim())
+}
+
+/** Which band columns read `n/a`, in either block. */
+const naBands = (text: string, label: 'db' | 'd'): number[] =>
+  bandRow(text, label).flatMap((cell, index) => (cell === 'n/a' ? [index] : []))
+
 /** The BRIGHTNESS block's lines, header excluded: the window row, and the note if present. */
 const brightnessBlock = (text: string): string[] => {
   const lines = text.split('\n')
@@ -93,6 +130,64 @@ const brightnessBlock = (text: string): string[] => {
   const end = rest.findIndex((line) => line === '')
   return end === -1 ? rest : rest.slice(0, end)
 }
+
+/**
+ * Five ranked moves the size the advisor really produces, so the byte figures below are
+ * the ones a `compare_audio` response actually pays.
+ *
+ * The findings are held here rather than drawn from `adviseFromDiff` on purpose. A live
+ * advisor makes the size of this block a function of how much a rule currently explains,
+ * and the last test to tie a budget to that failed the round where a rule learned to say
+ * WHY it was refusing a move - an improvement scored as a regression. These five are
+ * transcribed from a real `adviseFromDiff` run and stay put: they render a 1,697 B block
+ * against the 1,779 B a live `compare_audio` response carries, so the assertions below
+ * move only when the FORMATTER does.
+ */
+const RANKED_ACTIONS: MatchAction[] = [
+  {
+    finding:
+      'Spectral tilt is 5.3 dB/octave steeper than the reference, so the candidate\'s partial series is duller overall. Add harmonic content at the source.',
+    paramIds: ['osc1.morph', 'osc1.wavetable', 'dist.drive'],
+    direction: 'increase',
+    suggested: { id: 'dist.drive', from: 0.12, to: 0.385, unit: 'raw' },
+    estimatedGain: 0.11,
+    confidence: 'medium'
+  },
+  {
+    finding:
+      'Partials 2-4 are 4.8-8.6 dB quiet against the reference (mean -6.6 dB). The low-order harmonic balance is a wavetable choice: try a different table or move the morph, and use dist.drive only to add what the table cannot.',
+    paramIds: ['osc1.morph', 'osc1.wavetable'],
+    direction: 'either',
+    estimatedGain: 0.09,
+    confidence: 'medium'
+  },
+  {
+    finding:
+      'Brightness error drifts 1.1 octaves across the buffer (-0.3 in the first window, -1.5 in the last), so the candidate darkens too fast. This is envelope shape, not static cutoff: lengthen env2.decay / raise env2.sustain, or reduce the depth of the env2 -> filter1.cutoff mod slot (set_modulation). That mod slot is the REAL fix and has no parameter id, so it can never appear as a suggested move; env2 reaches the sound through it and nothing else, and if the route does not exist in this patch then every env2 stage is inert and set_modulation is the whole job.',
+    paramIds: ['env2.decay', 'env2.sustain'],
+    direction: 'increase',
+    suggested: { id: 'env2.decay', from: 0.42, to: 0.5418, unit: 's' },
+    estimatedGain: 0.07,
+    confidence: 'low'
+  },
+  {
+    finding:
+      'Odd partials sit 4.1 dB above even ones relative to the reference, so the candidate reads more square/pulse-like than it should. Change wavetable or morph position; a full-spectrum table (Basic Shapes saw region, Harmonic Sweep) restores the even partials.',
+    paramIds: ['osc1.morph', 'osc1.wavetable'],
+    direction: 'either',
+    estimatedGain: 0.05,
+    confidence: 'medium'
+  },
+  {
+    finding:
+      'Stereo width is -0.220 narrower than the reference (0 is mono). Widen at the source first - osc1.unison above 1 with osc1.detune and osc1.spread - before reaching for chorus.mix or reverb.width, which also change the timbre.',
+    paramIds: ['osc1.unison', 'osc1.detune', 'osc1.spread'],
+    direction: 'increase',
+    suggested: { id: 'osc1.spread', from: 0, to: 22, unit: 'raw' },
+    estimatedGain: 0.04,
+    confidence: 'medium'
+  }
+]
 
 describe('formatDiff', () => {
   it('renders the match payload', () => {
@@ -220,11 +315,18 @@ describe('formatDiff', () => {
   })
 
   it('adds no noise-floor note when every window was measured', () => {
-    // The common path, both blocks: one row under the header and nothing else, exactly as
-    // the snapshots record it.
+    // The common path, both blocks: the window row, and no gate note, exactly as the
+    // snapshots record it.
+    for (const text of [formatDiff(diffFixture(), context), formatMetrics(makeMetrics())]) {
+      expect(text).not.toContain('noise floor')
+    }
+    // One row under the header and nothing else, in both blocks. What these windows weight -
+    // and that `spectralCentroidHz` weights something else, so the two can name different
+    // sides as the brighter one - rides on the header rather than on a line of its own.
     for (const text of [formatDiff(diffFixture(), context), formatMetrics(makeMetrics())]) {
       expect(brightnessBlock(text)).toHaveLength(1)
-      expect(text).not.toContain('noise floor')
+      const header = text.split('\n').find((line) => line.startsWith('BRIGHTNESS'))
+      expect(header).toContain('unlike spectralCentroidHz')
     }
   })
 
@@ -251,7 +353,7 @@ describe('formatDiff', () => {
       // Fixed-width cells: every row of a block is the same length, and every cell boundary
       // falls on the same column, through 4-digit Hz labels and negative signs alike.
       expect(new Set(rows.map((line) => line.length)).size, header).toBe(1)
-      for (const line of rows) expect((line.length - 6) % 6, `${header}: ${line}`).toBe(0)
+      for (const line of rows) expect((line.length - COLUMN) % COLUMN, `${header}: ${line}`).toBe(0)
     }
     // 3-digit millisecond bounds keep the brightness windows separated by their own delimiter.
     const brightness = lines[lines.findIndex((line) => line.startsWith('BRIGHTNESS')) + 1]
@@ -266,6 +368,12 @@ describe('formatDiff', () => {
 
   it('omits the actions section entirely when nothing is ranked', () => {
     expect(formatDiff(diffFixture(), context)).not.toContain('ACTIONS')
+  })
+
+  it('never prints a language placeholder when the moves ship structurally', () => {
+    const diff = { ...diffFixture(), actions: RANKED_ACTIONS }
+    const text = formatDiff(diff, { ...context, actionsShipStructurally: true })
+    for (const token of forbidden) expect(text).not.toContain(token)
   })
 
   it('renders finding, param move and confidence, capped at five', () => {
@@ -285,6 +393,256 @@ describe('formatDiff', () => {
     expect(text).toContain(' 5. ')
     expect(text).not.toContain(' 6. ')
     for (const token of forbidden) expect(text).not.toContain(token)
+  })
+})
+
+/**
+ * `compare_audio`'s text mode ships `{ similarity, actions }` structurally beside this
+ * text, so the ACTIONS block there restates moves the array already carries - and carries
+ * better, since only the array has the `suggested.id/from/to/unit` an agent hands to
+ * `update_parameters`. `actionsShipStructurally` is the caller saying so.
+ */
+describe('actions that ship structurally beside the text', () => {
+  const ranked = () => ({ ...diffFixture(), actions: RANKED_ACTIONS })
+  const shipped = (actions: MatchAction[] = RANKED_ACTIONS) =>
+    formatDiff({ ...diffFixture(), actions }, { ...context, actionsShipStructurally: true })
+  /** The one line the block collapses to, wherever it sits. */
+  const noteLine = (text: string): string | undefined =>
+    text.split('\n').find((line) => line.startsWith('ACTIONS'))
+
+  it('keeps the block for a caller that renders the text alone', () => {
+    // The default, and it has to be: only a caller that can see the response it is
+    // building knows whether the array is in it. Text rendered on its own - a log line, a
+    // chat message, a file - is all its reader gets, so the moves stay in it.
+    for (const text of [formatDiff(ranked(), context), formatDiff(ranked())]) {
+      expect(text).toContain('ACTIONS  ranked, best first')
+      expect(text).toContain('Spectral tilt is 5.3 dB/octave steeper')
+      expect(text).toContain('-> dist.drive 0.12 -> 0.385 raw  [medium]')
+    }
+  })
+
+  it('drops the block when the caller ships diff.actions', () => {
+    const text = shipped()
+    expect(text).not.toContain('ranked, best first')
+    expect(text).not.toContain('Spectral tilt is 5.3 dB/octave steeper')
+    expect(text).not.toContain('dist.drive 0.12')
+    // Everything that is not the actions block is byte-identical to what it always was.
+    const upTo = (value: string) => value.slice(0, value.lastIndexOf('\nACTIONS'))
+    expect(upTo(text)).toBe(upTo(formatDiff(ranked(), context)))
+  })
+
+  it('says where the moves went, in terms an agent can act on', () => {
+    const line = noteLine(shipped())
+    expect(line).toBeDefined()
+    // The name of the field to read, and what makes it the better copy: the ids and the
+    // target values, which the prose block never carried.
+    expect(line).toContain('diff.actions')
+    expect(line).toContain('parameter ids')
+    expect(line).toContain('target values')
+    // One line, not a second block dressed as a note.
+    expect(shipped().split('\n').filter((value) => value.includes('diff.actions'))).toHaveLength(1)
+    expect(bytes(line!)).toBeLessThan(200)
+  })
+
+  it('never lets the absent block read as "no moves were suggested"', () => {
+    // The distinction this line exists to hold: a MISSING block and an EMPTY ranking are
+    // different facts, and a reader who has only ever seen the block must not take the
+    // first for the second. The count leads, because no "there were none" reading of a
+    // sentence that opens with `5 ranked moves` survives.
+    const line = noteLine(shipped())!
+    expect(line).toMatch(/^ACTIONS {2}5 ranked moves\b/)
+    for (const denial of [/\bno\b/i, /\bnone\b/i, /\bnothing\b/i, /\bempty\b/i]) {
+      expect(line, denial.source).not.toMatch(denial)
+    }
+    // It counts the array the reader is sent to, not the five the block would have shown.
+    const seven = RANKED_ACTIONS.concat(RANKED_ACTIONS.slice(0, 2))
+    expect(noteLine(shipped(seven))).toMatch(/^ACTIONS {2}7 ranked moves\b/)
+    expect(noteLine(shipped([RANKED_ACTIONS[0]]))).toMatch(/^ACTIONS {2}1 ranked move\b/)
+  })
+
+  it('says nothing at all when there were no moves to ship', () => {
+    // Pointing at an empty array is the lie in the other direction, and `diffFixture`
+    // ranks nothing. Neither the block nor the line: the section is simply absent, exactly
+    // as it is for a caller that is not shipping anything.
+    const text = shipped([])
+    expect(text).not.toContain('ACTIONS')
+    expect(text).not.toContain('diff.actions')
+    expect(text).toBe(formatDiff({ ...diffFixture(), actions: [] }, context))
+  })
+
+  it('pays for the ranked moves once, and the saving is the point', () => {
+    const withBlock = formatDiff(ranked(), context)
+    const text = shipped()
+    const saved = bytes(withBlock) - bytes(text)
+
+    // Measured, not estimated: on a live `compare_audio` response this block is 1,779 B
+    // of a 9,615 B payload, the largest duplicate in it and bigger than any array text
+    // mode already drops. The fixture above is the same shape and saves rather more. A
+    // change that reinstates the duplication - a caller quietly losing the flag, the line
+    // growing back into a block - fails here.
+    expect(saved).toBeGreaterThan(1400)
+    expect(bytes(withBlock)).toBeGreaterThan(2500)
+    // What replaces it is one line, so the section costs a fixed ~140 B whatever the
+    // advisor found rather than growing with every rule that learns to explain itself.
+    const none = bytes(formatDiff({ ...diffFixture(), actions: [] }, context))
+    expect(bytes(text) - none).toBeLessThan(200)
+  })
+})
+
+/**
+ * A band whose lower edge sits above the Nyquist reads the -100 dB band floor whatever the
+ * sound is, so `bandsDetail` leaves it out of the score and both tables have to leave it out
+ * of the numbers. The failure it prevents is sharper in the diff than in the absolute block:
+ * two floors subtract to `0.0`, which reads as the one band the candidate got exactly right.
+ */
+describe('bands above the Nyquist', () => {
+  const at = (sampleRateHz: number | undefined) => makeMetrics({ sampleRateHz })
+  const selfDiff = (sampleRateHz: number | undefined) => {
+    const metrics = at(sampleRateHz)
+    return diffAudioMetrics(metrics, metrics, comparison(1))
+  }
+
+  it('prints n/a rather than a level in both blocks', () => {
+    // 8 kHz puts the Nyquist at 4 kHz, which is under the lower edge of the 8k and 16k
+    // octave bands and above the 4k band's, so exactly the top two go.
+    const absolute = formatMetrics(at(8000))
+    const diff = formatDiff(selfDiff(8000), context)
+    expect(naBands(absolute, 'db')).toEqual([8, 9])
+    expect(naBands(diff, 'd')).toEqual([8, 9])
+    // The number each cell replaces, and the reason it must not be printed: -100.0 in the
+    // absolute block reads as a level 100 dB down, and the diff's 0.0 as a perfect match.
+    expect(at(8000).bandsDb.slice(8)).not.toContain(-100)
+    expect(absolute).not.toContain('-100.0')
+    expect(bandRow(diff, 'd').slice(8)).toEqual(['n/a', 'n/a'])
+  })
+
+  it('says why, once, and only when a band is actually marked', () => {
+    expect(formatMetrics(at(8000))).toContain('above this sample rate\'s Nyquist')
+    expect(formatDiff(selfDiff(8000), context)).toContain('above one side\'s Nyquist')
+    // The diff's wording carries the extra fact its reader needs: the score dropped them
+    // too, so the table and the number it explains counted the same bands.
+    expect(formatDiff(selfDiff(8000), context)).toContain('the score leaves those bands out too')
+    // Nothing can be done about it from the patch, which is what stops an agent steering.
+    expect(formatDiff(selfDiff(8000), context)).toContain('neither the file nor any patch move can put energy there')
+  })
+
+  it('adds nothing at a rate that carries every band', () => {
+    // The common path: 44.1 kHz marks no band, and neither does a metrics object with no
+    // rate recorded at all, so both are byte-identical to what they printed before the flag.
+    for (const sampleRateHz of [44100, 48000, undefined]) {
+      expect(naBands(formatMetrics(at(sampleRateHz)), 'db'), String(sampleRateHz)).toEqual([])
+      expect(formatMetrics(at(sampleRateHz)), String(sampleRateHz)).not.toContain('Nyquist')
+      expect(formatDiff(selfDiff(sampleRateHz), context), String(sampleRateHz)).not.toContain('Nyquist')
+    }
+    expect(formatMetrics(at(44100))).toBe(formatMetrics(at(undefined)))
+  })
+
+  it('keeps the frequency axis at all ten bands whatever the rate', () => {
+    // The brightness timeline's rule, one axis over: the heading is what makes the row
+    // readable, and it is the CELL that says whether anything was measured.
+    for (const sampleRateHz of [8000, 11025, 22050, 44100, undefined]) {
+      expect(bandRow(formatMetrics(at(sampleRateHz)), 'hz'), String(sampleRateHz)).toHaveLength(10)
+      expect(bandRow(formatDiff(selfDiff(sampleRateHz), context), 'hz'), String(sampleRateHz)).toHaveLength(10)
+      expect(bandRow(formatMetrics(at(sampleRateHz)), 'hz')[9]).toBe('16k')
+    }
+  })
+
+  /**
+   * The drift guard. This file states the Nyquist rule for a third time - it is private in
+   * `audio-analysis.ts` and private again in `match-diff.ts` - so the thing that must be
+   * true is not that the arithmetic looks the same but that the two tables mark the same
+   * bands as the flag, which is itself tied to `details.bands.bandsCompared` by its own test.
+   */
+  it('marks exactly the bands diffAudioMetrics flags, at every rate', () => {
+    for (const sampleRateHz of [8000, 11025, 16000, 22050, 32000, 44100, 48000, 96000, undefined]) {
+      const diff = selfDiff(sampleRateHz)
+      const flagged = diff.bands.flatMap((band, index) => (band.aboveNyquist ? [index] : []))
+      expect(naBands(formatMetrics(at(sampleRateHz)), 'db'), String(sampleRateHz)).toEqual(flagged)
+      expect(naBands(formatDiff(diff, context), 'd'), String(sampleRateHz)).toEqual(flagged)
+    }
+    // And the sweep really did exercise both answers, so an agreement of two empty sets
+    // cannot be what passed it.
+    expect(selfDiff(8000).bands.some((band) => band.aboveNyquist)).toBe(true)
+    expect(selfDiff(48000).bands.some((band) => band.aboveNyquist)).toBe(false)
+  })
+
+  it('never prints a language placeholder for a band it could not measure', () => {
+    for (const text of [formatMetrics(at(8000)), formatDiff(selfDiff(8000), context)]) {
+      for (const token of forbidden) expect(text).not.toContain(token)
+    }
+  })
+})
+
+/**
+ * `tiltDbPerOctave` and `oddEvenDb` both fall back to 0 when there is nothing to measure,
+ * and 0 is what a flat spectrum and a balanced one really read, so neither can be printed
+ * raw. The two fall back on DIFFERENT conditions, which is why they get different sentences:
+ * a sine earns the tilt's and not the odd/even's.
+ */
+describe('a tilt or an odd/even with nothing behind it', () => {
+  const sine = () => makeMetrics({ harmonicShape: sineShape() })
+  const silent = () => makeMetrics({ harmonicShape: silentShape() })
+
+  it('does not let a sine claim a flat spectrum', () => {
+    // The defect: one partial above the noise, no slope at all, and the row said `0.0`.
+    const text = formatMetrics(sine())
+    expect(text).not.toContain('tilt 0.0 dB/oct')
+    expect(text).toContain('tilt n/a (fewer than two partials above the noise, so there is no slope to fit)')
+    // The odd/even is a real reading on the same sound and stays a number: the fundamental
+    // gives the odd parity a level, and the even parity's absence is the measurement.
+    expect(text).toMatch(/odd\/even [+-]?\d+\.\d dB/)
+  })
+
+  it('nulls the odd/even only when no partial was found at all', () => {
+    const text = formatMetrics(silent())
+    expect(text).toContain('tilt n/a (fewer than two partials above the noise')
+    expect(text).toContain('odd/even n/a (no partial above the noise, so neither parity has a level)')
+  })
+
+  it('leaves a measured sound exactly as it was', () => {
+    // No condition to hang either sentence on, so the common path pays nothing for them.
+    const text = formatMetrics(makeMetrics())
+    expect(text).toContain('tilt -6.1 dB/oct   odd/even +2.8 dB')
+    expect(text).not.toContain('n/a (')
+  })
+
+  it('gives the diff row its reason, per figure, on its own line', () => {
+    // A sine reference against a full series: the tilt cannot be differenced because one
+    // side has no slope, while both sides' parities have levels, so one sentence appears
+    // and the other must not.
+    const diff = diffAudioMetrics(sine(), candidateMetrics(), comparison(0.3))
+    expect(diff.harmonics!.tiltDeltaDbPerOctave).toBeNull()
+    expect(diff.harmonics!.oddEvenDeltaDb).not.toBeNull()
+
+    const text = formatDiff(diff, context)
+    expect(text).toContain('tilt n/a dB/oct')
+    expect(text).toContain('  tilt n/a: one side had fewer than two partials above the noise')
+    expect(text).not.toContain('odd/even n/a')
+    // The verdict word is the thing a bare `n/a` invites a reader to supply for themselves.
+    for (const word of ['you darker', 'you brighter', 'same slope']) expect(text).not.toContain(word)
+  })
+
+  it('gives both reasons when both figures are missing', () => {
+    const diff = diffAudioMetrics(silent(), candidateMetrics(), comparison(0.1))
+    expect(diff.harmonics!.oddEvenDeltaDb).toBeNull()
+    const text = formatDiff(diff, context)
+    expect(text).toContain('  tilt n/a: one side had fewer than two partials above the noise')
+    expect(text).toContain('  odd/even n/a: one side had no partial above the noise at all')
+  })
+
+  it('adds neither line when both figures were measured', () => {
+    const text = formatDiff(diffFixture(), context)
+    expect(text).not.toContain('tilt n/a')
+    expect(text).not.toContain('odd/even n/a')
+    expect(text).toContain('tilt -5.3 dB/oct  (you darker)')
+  })
+
+  it('never prints a language placeholder for either', () => {
+    for (const metrics of [sine(), silent()]) {
+      for (const text of [formatMetrics(metrics), formatDiff(diffAudioMetrics(metrics, candidateMetrics(), comparison(0.2)), context)]) {
+        for (const token of forbidden) expect(text).not.toContain(token)
+      }
+    }
   })
 })
 
