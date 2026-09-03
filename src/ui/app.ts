@@ -23,8 +23,6 @@ import { guideTarget } from './guide-target'
 import type { HistoryServices } from '../history/types'
 import { AgentHighlights } from './agent-highlights'
 import { agentActivityFor } from '../webmcp/activity'
-import { iconButton } from './icon-button'
-import { History as HistoryIcon } from 'lucide'
 
 export function buildApp(engine: SynthEngine, container: HTMLElement, services: HistoryServices, openWalkthrough: () => void): () => void {
   engine.primeTables()
@@ -330,12 +328,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   guideTarget(main, 'panel.synth', 'Synth controls', 'panel')
   main.append(oscCol, centerCol, sideCol)
   const agentActivity = new AgentActivityPanel(engine, services, openWalkthrough)
-  // A second entry to the same dialog, within reach while playing the keyboard.
-  const keyboardHistory = iconButton('History', HistoryIcon)
-  keyboardHistory.classList.add('kb-history')
-  guideTarget(keyboardHistory, 'button.history.open-keyboard', 'Open history from the keyboard bar', 'button')
-  keyboardHistory.addEventListener('click', () => agentActivity.openHistory())
-  const keyboard = new Keyboard(engine, keyboardHistory)
+  const keyboard = new Keyboard(engine)
   container.append(header, agentActivity.root, main, performancePanel, keyboard.root, midiDialog.root)
   const highlights = new AgentHighlights(container, agentActivityFor(engine))
 

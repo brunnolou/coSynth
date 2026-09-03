@@ -69,6 +69,8 @@ export class AgentActivityPanel {
   private readonly onboarding = el('div', 'agent-modal-section agent-onboarding')
   private readonly onboardingText = el('p', 'agent-empty')
   private readonly comparison = el('div', 'agent-modal-section')
+  private readonly reviewHistory = button('Open history')
+  private readonly openReview = button('AI activity')
   private readonly keep = button('Keep changes')
   private readonly reject = button('Reject changes')
   private reviewSignature = ''
@@ -101,7 +103,9 @@ export class AgentActivityPanel {
       [this.undo, 'undo', 'Undo sound edit'], [this.redo, 'redo', 'Redo sound edit'],
       [open, 'open', 'Open history'], [this.play, 'play', 'Replay or stop performance'],
       [this.replayGuide, 'spotlight', 'Restart latest AI walkthrough'],
-      [walkthrough, 'walkthrough', 'Open walkthrough']
+      [walkthrough, 'walkthrough', 'Open walkthrough'],
+      [this.reviewHistory, 'open-activity', 'Open history from AI activity'],
+      [this.openReview, 'open-review', 'Open AI activity from history']
     ] as const) guideTarget(node, `button.history.${id}`, label, 'button')
     this.undo.title = 'Undo (⌘/Ctrl+Z)'
     this.redo.title = 'Redo (⌘/Ctrl+Shift+Z)'
@@ -141,7 +145,13 @@ export class AgentActivityPanel {
     this.reviewDialog.body.append(this.readiness, this.activityError, this.explainer,
       this.onboarding, this.changeCount, this.changeList, this.comparison, this.toolLog
     )
-    this.reviewDialog.footer.append(this.keep, this.reject)
+    // One modal at a time: the review dialog steps aside rather than stacking under History.
+    this.reviewHistory.classList.add('agent-review-history')
+    this.reviewHistory.addEventListener('click', () => {
+      this.reviewDialog.close()
+      this.dialog.open()
+    })
+    this.reviewDialog.footer.append(this.reviewHistory, this.keep, this.reject)
     this.activityError.setAttribute('role', 'alert')
     this.dialogError.setAttribute('role', 'alert')
     this.root.append(actions, this.indicator.root, guideActions, this.dialog.root, this.reviewDialog.root)
@@ -170,7 +180,13 @@ export class AgentActivityPanel {
     this.soundView.append(this.soundList, this.alternatives)
     this.replayView.append(el('p', 'agent-empty', 'Performances use the current sound. Walkthroughs reopen at step one.'), this.replayList)
     this.dialog.body.append(tabs, this.soundView, this.replayView)
-    this.dialog.footer.append(this.dialogError, this.retention)
+    // The return trip of the review dialog's own History button, one modal at a time.
+    this.openReview.classList.add('history-open-review')
+    this.openReview.addEventListener('click', () => {
+      this.dialog.close()
+      this.reviewDialog.open()
+    })
+    this.dialog.footer.append(this.openReview, this.dialogError, this.retention)
     this.selectTab('sound')
     this.disposeListeners.push(
       activity.subscribe(state => { this.state = state; this.render() }),
@@ -179,11 +195,6 @@ export class AgentActivityPanel {
       services.performance.subscribe(() => this.render())
     )
     this.render()
-  }
-
-  /** Lets a control outside this panel (the keyboard bar) raise the same dialog. */
-  openHistory(): void {
-    this.dialog.open()
   }
 
   dispose(): void {
