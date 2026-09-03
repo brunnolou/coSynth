@@ -47,7 +47,10 @@ JavaScript. This file exists so that fact does not leave you with nothing.
 - **Discover** — `get_parameter_schema`, `get_synth_state`, `list_presets`,
   `get_ui_targets`
 - **Change the sound** — `update_parameters` (atomic batches, raw units or
-  choice labels), `set_modulation` (32-slot matrix), `load_preset`,
+  choice labels), `set_modulation` (32-slot matrix), `set_fx_order` (the effect
+  chain, as a full permutation), `apply_patch` (all of those plus a preset save
+  and an audition render as one validated transaction, with `dryRun` and a
+  rollback handle), `load_preset`,
   `save_preset`
 - **Hear and measure it** — `render_audio` renders offline by default: faster
   than real time, no user gesture needed, and it returns metrics describing
