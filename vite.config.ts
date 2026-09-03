@@ -22,7 +22,7 @@ export default defineConfig({
     exclude: ['**/node_modules/**', '**/dist/**', '.claude/**']
   },
   server: {
-    port: 5173,
+    port: Number(process.env.PORT) || 5173,
     proxy: {
       '/register': { target: 'ws://[::1]:4797', ws: true },
       '/localhost_5173': { target: 'ws://[::1]:4797', ws: true }
