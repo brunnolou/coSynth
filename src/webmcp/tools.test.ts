@@ -102,12 +102,12 @@ afterEach(() => {
 })
 
 describe('WebMCP tool metadata', () => {
-  it('exposes exactly twelve strict object schemas in composable workflow order', () => {
+  it('exposes exactly thirteen strict object schemas in composable workflow order', () => {
     const { tools } = setup()
     expect(tools.map(tool => tool.name)).toEqual([
       'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
       'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
-      'compare_audio', 'save_preset', 'load_preset', 'list_presets'
+      'compare_audio', 'suggest_patch', 'save_preset', 'load_preset', 'list_presets'
     ])
     for (const tool of tools) {
       expect(tool.description.length).toBeGreaterThan(10)
@@ -116,11 +116,13 @@ describe('WebMCP tool metadata', () => {
     }
     expect(tools.filter(tool => tool.annotations?.readOnlyHint).map(tool => tool.name)).toEqual([
       'get_synth_state', 'get_parameter_schema', 'analyze_audio',
-      'compare_audio', 'list_presets'
+      'suggest_patch', 'list_presets'
     ])
+    // `compare_audio` renders by default now, so it is no longer read-only:
+    // it replaces `last-render`, and on the realtime fallback it makes sound.
     expect(tools.filter(tool => tool.annotations?.readOnlyHint === false).map(tool => tool.name)).toEqual([
       'update_parameters', 'set_modulation', 'play_notes', 'render_audio',
-      'analyze_reference_audio', 'save_preset', 'load_preset'
+      'analyze_reference_audio', 'compare_audio', 'save_preset', 'load_preset'
     ])
     expect(tools.find(tool => tool.name === 'analyze_reference_audio')?.annotations?.untrustedContentHint).toBe(true)
     expect(tools[7].inputSchema).toMatchObject({
@@ -140,13 +142,19 @@ describe('WebMCP tool metadata', () => {
     const bytes = (value: string) => new TextEncoder().encode(value).length
     // In the discoverability eval Codex truncated the 17-tool listing and lost
     // `play_notes` entirely, then drove the page through <select> elements
-    // instead. These 12 tools were 10751 B of that listing (5019 B of prose,
-    // 4958 B of schema) after four rounds of per-tool clarity fixes.
-    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(9900)
-    // The prose half — what a truncating client renders first — must stay well
-    // under what those four rounds had grown it to.
+    // instead. These tools were 10751 B of that listing (5019 B of prose,
+    // 4958 B of schema) after four rounds of per-tool clarity fixes, and the
+    // budget was then held at 9900 B for twelve tools.
+    //
+    // Thirteen tools now, and the matching three carry arguments an agent
+    // cannot guess (`f0Hz`, `windows`, `autoRender`, `format`, `maxActions`)
+    // plus the note sequence schema on `compare_audio`. The ceiling moves with
+    // the tool count rather than with the prose: ~1015 B per tool against
+    // ~825 B before, and the prose half — what a truncating client renders
+    // first — is capped separately and deliberately barely moved.
+    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(13200)
     const prose = listing.reduce((total, tool) => total + bytes(tool.description), 0)
-    expect(prose).toBeLessThanOrEqual(3400)
+    expect(prose).toBeLessThanOrEqual(4400)
     for (const tool of listing) {
       // No single tool may dominate the read: render_audio's description alone
       // was 1273 B, a tenth of the whole listing.
@@ -358,8 +366,8 @@ describe('experimental client compatibility', () => {
 
     await expect((byName.get('analyze_reference_audio')!.execute as any)({ audioBase64: 'UklGRg==' }))
       .resolves.toMatchObject({ source: 'base64-reference' })
-    expect((byName.get('compare_audio')!.execute as any)({}, {}))
-      .toMatchObject({ candidate: { source: 'last-render' } })
+    await expect((byName.get('compare_audio')!.execute as any)({}, {}))
+      .resolves.toMatchObject({ candidate: { source: 'last-render' } })
   })
 })
 
@@ -826,7 +834,7 @@ describe('render and analysis tools', () => {
   it('selects the analysis source explicitly', async () => {
     vi.useFakeTimers()
     const { byName, execute } = setup()
-    expect((byName.get('analyze_audio')!.inputSchema as any).properties.source.enum).toEqual(['scope', 'last-render'])
+    expect((byName.get('analyze_audio')!.inputSchema as any).properties.source.enum).toEqual(['scope', 'last-render', 'reference'])
     await expect(execute('analyze_audio', { source: 'last-render' })).rejects.toThrow(/render_audio first/i)
 
     const rendering = execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 })
@@ -1347,17 +1355,48 @@ describe('offline rendering', () => {
     expect(received!.aborted).toBe(true)
   })
 
-  it('omits harmonics when the sequence holds more than one pitch', async () => {
+  /**
+   * A multi-pitch render used to report no harmonics at all: the tool passed
+   * `f0Hz` only for a single-pitch sequence, and without one the analyzer
+   * skipped detection.
+   *
+   * The decision now that detection is on by default: a chord is analyzed the
+   * same way an uploaded chord would be — the fundamental is MEASURED, not
+   * assumed from a note the analyzer was told about. That symmetry is the whole
+   * point of the change, so the tool must not switch detection off just because
+   * it happens to know the sequence had two notes. What separates the two cases
+   * is `pitch.source`: `given` when the tool supplied the note's own f0,
+   * `detected` when the analyzer had to find one, with `pitch.confidence`
+   * saying how much to trust the partials that came with it.
+   */
+  it('detects rather than assumes the fundamental when the sequence holds more than one pitch', async () => {
     const { execute } = offlineSetup()
-    const result = await execute('render_audio', {
+    const chord = await execute('render_audio', {
       notes: [
         { midi: 60, velocity: 0.8, start: 0, duration: 0.5 },
         { midi: 64, velocity: 0.8, start: 0, duration: 0.5 }
       ],
       duration: 1
     })
-    expect(result.renderMode).toBe('offline')
-    expect(result.metrics.harmonics).toBeUndefined()
+    expect(chord.renderMode).toBe('offline')
+    expect(chord.metrics.pitch?.source ?? 'none').not.toBe('given')
+    if (chord.metrics.pitch) {
+      expect(chord.metrics.pitch.source).toBe('detected')
+      expect(chord.metrics.pitch.confidence).toBeGreaterThanOrEqual(0)
+      expect(chord.metrics.harmonics?.amplitudesDb ?? []).toHaveLength(12)
+    } else {
+      expect(chord.metrics.harmonics).toBeUndefined()
+    }
+
+    // The single-pitch case is unchanged: the tool knows the note, so the
+    // analyzer is told rather than left to measure.
+    const single = await execute('render_audio', {
+      notes: [{ midi: 60, velocity: 0.8, start: 0, duration: 0.5 }],
+      duration: 1
+    })
+    expect(single.metrics.pitch).toMatchObject({ source: 'given', confidence: 1 })
+    expect(single.metrics.harmonics?.amplitudesDb).toHaveLength(12)
+    expect(single.metricNotes.pitch).toMatch(/given.*detected/)
   })
 
   it('returns a blob URL or an inline mono WAV on request', async () => {
@@ -1447,7 +1486,13 @@ describe('preset tools', () => {
       name, version: 1, params: { 'master.volume': engine.values[paramIndex('master.volume')] }, mods: [],
       lfoShapes: engine.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
     }))
-    await execute('save_preset', { name: 'Agent Patch' })
+    const saved = await execute('save_preset', { name: 'Agent Patch' })
+    // "Which folder did you save it to?" took several tool calls to answer in
+    // the motivating session, because the honest answer is "none".
+    expect(saved).toMatchObject({ name: 'Agent Patch', saved: true, storage: 'localStorage' })
+    expect(saved.where).toMatch(/localStorage/)
+    expect(saved.where).toMatch(/"User"/)
+    expect(saved.where).toMatch(/no folder|not to a file/)
     engine.values[paramIndex('master.volume')] = 0.25
     await execute('save_preset', { name: 'Agent Patch' })
     engine.values[paramIndex('master.volume')] = 0.9
@@ -1469,5 +1514,202 @@ describe('preset tools', () => {
     await expect(execute('save_preset', { name: 'Blocked' })).rejects.toThrow(/storage.*unavailable/i)
     await expect(execute('load_preset', { name: 'Blocked' })).rejects.toThrow(/storage.*unavailable/i)
     expect(engine.loadPreset).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * The failure this whole change exists to fix. An agent matching a reference
+ * sound got a similarity score with no gradient and could not see the
+ * reference's harmonic content at all, because `analyze_reference_audio` never
+ * passed an `f0Hz` and the analyzer therefore skipped harmonics. It gave up on
+ * the tools and wrote Python.
+ */
+describe('matching a reference: harmonics on both sides, a gradient, and advice', () => {
+  const RATE = 8000
+  const REFERENCE_HZ = 220
+  /** A3. The pitch the reference's own detection should land on. */
+  const REFERENCE_MIDI = 57
+
+  /** A decaying tone with real partials, so pitch detection and harmonics both have something to find. */
+  function pitchedReference(seconds = 0.5): DecodedBase64Audio {
+    const length = Math.round(seconds * RATE)
+    const channel = Float32Array.from({ length }, (_, index) => {
+      const t = index / RATE
+      let value = 0
+      for (let partial = 1; partial <= 6; partial++) {
+        value += Math.sin(2 * Math.PI * REFERENCE_HZ * partial * t) / partial
+      }
+      return 0.45 * Math.exp(-2 * t) * value
+    })
+    return {
+      decodedBytes: length * 4,
+      duration: length / RATE,
+      sampleRate: RATE,
+      channels: 1,
+      channelData: [channel],
+      mimeType: 'audio/wav'
+    }
+  }
+
+  /** A synth-side renderer that actually tracks the requested MIDI note. */
+  function renderer() {
+    return vi.fn(async (_engine: unknown, notes: readonly { midi: number }[], duration: number): Promise<RecordedAudio> => {
+      const length = Math.max(64, Math.round(duration * RATE))
+      const f0 = 440 * Math.pow(2, ((notes[0]?.midi ?? 69) - 69) / 12)
+      const channel = Float32Array.from({ length }, (_, index) => {
+        const t = index / RATE
+        // Two partials only: darker than the reference's six, so the diff has a
+        // real gradient for the advice to rank.
+        return 0.3 * Math.exp(-4 * t) * (Math.sin(2 * Math.PI * f0 * t) + 0.2 * Math.sin(4 * Math.PI * f0 * t))
+      })
+      const channelData = [channel, channel.slice()]
+      return {
+        blob: new Blob([encodeWav(channelData, RATE)], { type: 'audio/wav' }),
+        mimeType: 'audio/wav', duration, sampleRate: RATE, channelData
+      }
+    })
+  }
+
+  function matchSetup(decoded: () => DecodedBase64Audio = pitchedReference) {
+    const engine = new FakeEngine()
+    engine.running = false
+    const renderOffline = renderer()
+    const decodeAudio = vi.fn(async () => decoded())
+    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, { renderOffline, decodeAudio })
+    const byName = new Map(tools.map(tool => [tool.name, tool]))
+    const execute = async (name: string, input: Record<string, unknown> = {}) =>
+      await byName.get(name)!.execute(input, { signal: new AbortController().signal }) as any
+    return { engine, byName, execute, renderOffline, decodeAudio }
+  }
+
+  it('gives the reference a pitch AND harmonics, without returning its PCM', async () => {
+    const { execute } = matchSetup()
+    const reference = await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'target.wav' })
+    expect(reference.metrics.pitch).toMatchObject({ source: 'detected', midi: REFERENCE_MIDI })
+    expect(reference.metrics.pitch.f0Hz).toBeCloseTo(REFERENCE_HZ, -1)
+    expect(reference.metrics.harmonics.amplitudesDb).toHaveLength(12)
+    expect(reference.metrics.harmonicShape.amplitudesDbRelF0).toHaveLength(12)
+    expect(reference.metrics.harmonicShape.amplitudesDbRelF0[0]).toBe(0)
+    // The retained PCM is what makes a re-analysis cheap, and it must never be
+    // in the payload: a 30 s stereo buffer as JSON would end the session.
+    expect(reference).not.toHaveProperty('channelData')
+    expect(JSON.stringify(reference).length).toBeLessThan(8000)
+  })
+
+  it('re-analyzes the retained reference PCM at a corrected f0Hz with no re-upload', async () => {
+    const { execute, decodeAudio } = matchSetup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const octaveDown = await execute('analyze_audio', { source: 'reference', f0Hz: REFERENCE_HZ / 2, windows: 8 })
+    expect(decodeAudio).toHaveBeenCalledTimes(1)
+    expect(octaveDown.source).toBe('reference')
+    expect(octaveDown.metrics.pitch).toMatchObject({ f0Hz: REFERENCE_HZ / 2, source: 'given' })
+    expect(octaveDown.metrics.spectralWindows).toHaveLength(8)
+    expect(octaveDown).not.toHaveProperty('channelData')
+  })
+
+  it('refuses an autoRender it has no pitch for, rather than rendering an arbitrary note', async () => {
+    const { execute, renderOffline } = matchSetup(() => decodedReference())
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    await expect(execute('compare_audio', { autoRender: true })).rejects.toThrow(/no fundamental was detected/i)
+    expect(renderOffline).not.toHaveBeenCalled()
+    // A pitchless reference simply does not auto-render; the old scope path stands.
+    await expect(execute('compare_audio')).resolves.toMatchObject({ candidate: { source: 'scope' } })
+    expect(renderOffline).not.toHaveBeenCalled()
+  })
+
+  it('refuses a reference re-analysis before there is a reference', async () => {
+    const { execute } = matchSetup()
+    await expect(execute('analyze_audio', { source: 'reference' })).rejects.toThrow(/analyze_reference_audio first/i)
+  })
+
+  it('renders the candidate at the reference\'s own detected pitch before comparing', async () => {
+    const { execute, renderOffline } = matchSetup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    // The motivating session hand-picked a MIDI note an octave off, and every
+    // partial comparison was garbage while the scalars still looked plausible.
+    const result = await execute('compare_audio')
+    expect(renderOffline).toHaveBeenCalledTimes(1)
+    const [, notes, duration] = renderOffline.mock.calls[0]
+    expect(notes).toEqual([{ midi: REFERENCE_MIDI, velocity: 1, start: 0, duration: expect.any(Number) }])
+    expect(duration).toBeCloseTo(0.5, 2)
+    expect(result.candidate.source).toBe('last-render')
+    expect(result.diff.similarity).toBe(result.comparison.similarity)
+    // Both sides measured against the same fundamental, so the partial errors
+    // are comparable rather than each read against its own f0.
+    expect(result.candidate.metrics.pitch).toMatchObject({ source: 'given' })
+    expect(result.candidate.metrics.pitch.f0Hz).toBeCloseTo(REFERENCE_HZ, -1)
+
+    // Opting out compares whatever was rendered last, without rendering again.
+    await execute('compare_audio', { autoRender: false })
+    expect(renderOffline).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns ranked, parameter-vocabulary actions and a text payload by default', async () => {
+    const { execute } = matchSetup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'target.wav' })
+    const result = await execute('compare_audio')
+    expect(typeof result.text).toBe('string')
+    expect(result.text).toContain('MATCH')
+    expect(result.text).toContain('PARTIALS')
+    expect(result.text).toContain('ref "target.wav"')
+    expect(Array.isArray(result.diff.actions)).toBe(true)
+    expect(result.diff.actions.length).toBeGreaterThan(0)
+    for (const action of result.diff.actions) {
+      expect(typeof action.finding).toBe('string')
+      for (const id of action.paramIds) expect(PARAMS.some(def => def.id === id), id).toBe(true)
+      if (action.suggested) {
+        const def = PARAMS.find(candidate => candidate.id === action.suggested.id)!
+        expect(action.suggested.to).toBeGreaterThanOrEqual(def.choices ? 0 : def.min)
+        expect(action.suggested.to).toBeLessThanOrEqual(def.choices ? def.choices.length - 1 : def.max)
+      }
+    }
+    // The text half carries the diff's numbers, so the numeric arrays are not
+    // paid for twice; `actions` stays structured because it is applied, not read.
+    expect(result.diff).not.toHaveProperty('bands')
+    const capped = await execute('compare_audio', { maxActions: 1 })
+    expect(capped.diff.actions).toHaveLength(1)
+  })
+
+  it('keeps the legacy comparison shape, and the full numeric diff, under format json', async () => {
+    const { execute } = matchSetup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const result = await execute('compare_audio', { format: 'json' })
+    expect(result).not.toHaveProperty('text')
+    // `docs/agent-match-eval.md` reads these off every recorded run.
+    expect(result.comparison.similarity).toBeGreaterThanOrEqual(0)
+    expect(result.comparison.similarity).toBeLessThanOrEqual(1)
+    expect(Object.keys(result.comparison.details)).toEqual(expect.arrayContaining([
+      'peakDb', 'rmsDb', 'clippingCount', 'dcOffset', 'spectralCentroidHz', 'attackMs', 'stereoWidth'
+    ]))
+    expect(result.diff.bands).toHaveLength(10)
+    expect(result.diff.harmonics.deltaDb).toHaveLength(12)
+    expect(result.diff.pitch.centsError).toBeCloseTo(0, 0)
+    expect(result.progress.comparisonNumber).toBe(1)
+  })
+
+  it('suggest_patch re-reads the last comparison, and refuses cleanly when there is none', async () => {
+    const { execute } = matchSetup()
+    const refusal = expect(execute('suggest_patch')).rejects
+    await refusal.toThrow(/analyze_reference_audio/)
+    await refusal.toThrow(/compare_audio/)
+
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'target.wav' })
+    const compared = await execute('compare_audio')
+    const again = await execute('suggest_patch')
+    expect(again.actions).toEqual(compared.diff.actions)
+    expect(again.basedOn).toMatchObject({ referenceName: 'target.wav', comparisonNumber: 1 })
+
+    const focused = await execute('suggest_patch', { focus: 'envelope', maxActions: 20 })
+    expect(focused.actions.length).toBeLessThanOrEqual(again.actions.length + 20)
+    await expect(execute('suggest_patch', { focus: 'nope' })).rejects.toThrow(/focus/i)
+  })
+
+  it('says out loud that the live scope is 1024 samples, so its envelope metrics mean nothing', async () => {
+    const { execute } = matchSetup()
+    const scope = await execute('analyze_audio', { source: 'scope' })
+    expect(scope.scopeNote).toContain('1024 samples')
+    expect(scope.scopeNote).toMatch(/21 ms/)
+    expect(scope.scopeNote).toMatch(/decayT60Ms/)
+    expect(scope.scopeNote).toMatch(/render_audio/)
   })
 })

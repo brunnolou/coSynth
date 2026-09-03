@@ -5,28 +5,17 @@ import {
   type ParamDef
 } from '../shared/params'
 import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, modSourceIndex, type ModSlotState, type ModSourceDef } from '../shared/messages'
-import { analyzeAudio, compareAudioMetrics, type AudioMetrics, type AudioMetricsComparison } from '../shared/audio-analysis'
+import { analyzeAudio, compareAudioMetrics, type AnalyzeAudioOptions, type AudioMetrics, type AudioMetricsComparison } from '../shared/audio-analysis'
+import { diffAudioMetrics } from '../shared/match-diff'
+import { adviseFromDiff, type AdviceCategory, type PatchValues } from '../shared/match-advice'
+import { formatDiff, formatMetrics } from '../shared/metrics-format'
+import type { MatchDiff } from '../shared/match-types'
 import { listPresets, loadPreset, savePreset, validatePresetData, validatePresetName } from '../shared/preset-store'
 import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
 import { analyzeAudioAbortably } from './audio-analysis-task'
 import { BASE64_MAX_SECONDS, monoWavBase64, offlineRenderAvailable, renderOffline, type OfflineRenderer } from './offline-render'
 import { PerformanceManager, performNotes, assertNotesAvailable, validatePerformanceNotes } from '../history/performance'
 import type { ReplayStore } from '../history/replays'
-
-export const WEBMCP_TOOL_NAMES = [
-  'get_synth_state',
-  'get_parameter_schema',
-  'update_parameters',
-  'set_modulation',
-  'play_notes',
-  'render_audio',
-  'analyze_audio',
-  'analyze_reference_audio',
-  'compare_audio',
-  'save_preset',
-  'load_preset',
-  'list_presets'
-] as const
 
 const MAX_NOTES = 128
 const MAX_PLAY_SECONDS = 30
@@ -79,6 +68,8 @@ interface ReferenceAnalysis {
   duration: number
   sampleRate: number
   channels: number
+  /** Present only when a trim was applied, so an untrimmed reference reads exactly as before. */
+  trimmedMs?: { start: number; end: number }
   metrics: AudioMetrics
 }
 
@@ -100,12 +91,33 @@ interface MatchProgressState {
   bestEntryId?: string
 }
 
+/**
+ * The last comparison, kept so `suggest_patch` can re-read it without a render.
+ * Only the diff and the two labels the text header needs; the metrics
+ * themselves already live on `lastReference` and `lastRender`.
+ */
+interface LastComparisonState {
+  diff: MatchDiff
+  referenceName?: string
+  comparisonNumber: number
+}
+
 interface WebMcpSessionState {
   lastRender: { metrics: AudioMetrics; sampleRate: number; channels: number; url: string; soundEntryId?: string } | null
   lastReference: ReferenceAnalysis | null
+  /**
+   * The reference's decoded PCM, held apart from `lastReference` so it can
+   * never reach the model: `compare_audio` returns `lastReference` whole, and a
+   * 30 s stereo buffer serialised into JSON would end a session. One reference
+   * at a time (~11.5 MB for that same buffer), replaced on every upload, so an
+   * agent can re-analyse at a corrected `f0Hz` or a higher `windows` count
+   * without re-sending up to 16 MiB of Base64.
+   */
+  referencePcm: { channelData: Float32Array[]; sampleRate: number } | null
   referenceGeneration: number
   activeReferenceController: AbortController | null
   match: MatchProgressState | null
+  lastComparison: LastComparisonState | null
   performance: PerformanceManager
 }
 
@@ -117,9 +129,11 @@ function sessionFor(engine: SynthEngine): WebMcpSessionState {
     session = {
       lastRender: null,
       lastReference: null,
+      referencePcm: null,
       referenceGeneration: 0,
       activeReferenceController: null,
       match: null,
+      lastComparison: null,
       performance: new PerformanceManager()
     }
     sessions.set(engine, session)
@@ -252,6 +266,8 @@ function compactParameter(def: ParamDef): string {
  */
 const METRIC_NOTES = {
   peakDb: 'An instantaneous peak — use `loudnessDb` or `rmsDb` to compare levels.',
+  pitch: '`source: "given"` when you passed `f0Hz`, `"detected"` when it was measured here; `null` means nothing periodic was found and every harmonic field is then absent rather than invented. Below `confidence` 0.5 the partials are untrustworthy.',
+  harmonicShape: '`amplitudesDbRelF0`: 12 partials in dB relative to the FUNDAMENTAL, so two sounds compare even when their loudest partial is a different n (`harmonics.amplitudesDb` stays relative to the loudest). `tiltDbPerOctave` positive is brighter; `oddEvenDb` is mean(odd) - mean(even), high for square/pulse, near 0 for saw. -120 dB means "not measured".',
   decayT60Ms: "Measured from the rendered tail, not read back from `env1.decay`: the note's own `duration` and `env1.release` shape that tail, so the same patch reports a different T60 over a longer note. It is `null` — its most common value on short notes — whenever the buffer never falls the 20 dB the slope fit needs, or falls too abruptly for the envelope to resolve."
 } as const
 
@@ -349,12 +365,126 @@ function assertRenderFormat(value: unknown): RenderFormat {
   return value as RenderFormat
 }
 
-/** A single-pitch sequence gets harmonic analysis for free (plan Task 7.4). */
+/**
+ * A single-pitch sequence knows its own fundamental, so it is STATED rather
+ * than measured (`pitch.source: "given"`). Anything else is left to detection,
+ * which is on by default: a chord is then analysed exactly as an uploaded chord
+ * would be, and `pitch.source`/`pitch.confidence` say how the number was got.
+ */
 function analysisOptionsFor(notes: readonly { midi: number }[]): { f0Hz?: number } {
   const pitches = new Set(notes.map(note => note.midi))
   if (pitches.size !== 1) return {}
   const [midi] = [...pitches]
   return { f0Hz: 440 * Math.pow(2, (midi - 69) / 12) }
+}
+
+/** Bounds `AnalyzeAudioOptions.windows` accepts; mirrored here for the schema and the errors. */
+const MIN_ANALYSIS_WINDOWS = 4
+const MAX_ANALYSIS_WINDOWS = 32
+
+/**
+ * The live scope buffer, as `src/worklet/processor.ts` publishes it
+ * (`SCOPE_SIZE = 1024`, one frame per 1024 rendered samples).
+ */
+const SCOPE_SAMPLES = 1024
+
+/**
+ * Said out loud on every scope result. 1024 samples is about 21 ms at 48 kHz:
+ * shorter than one attack, let alone a decay, so the time-domain metrics on it
+ * describe a slice of a steady note rather than a note.
+ */
+const SCOPE_NOTE =
+  `The live scope holds only the most recent ${SCOPE_SAMPLES} samples (~21 ms at 48 kHz). ` +
+  'Level, spectrum and pitch on that slice are real; `attackMs`, `timeToPeakMs`, `envelopeDb`, ' +
+  '`decayT60Ms`, `sustainDb` and the per-window brightness trajectory are not — they describe ' +
+  '21 ms of a sound, not its shape. Use render_audio (offline, no user gesture needed) for those.'
+
+/** `f0Hz` as the analyzer takes it: a positive, finite frequency or nothing at all. */
+function assertF0Hz(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  const hz = finite(value, 'f0Hz')
+  if (hz <= 0 || hz > 20000) throw new Error('f0Hz must be a positive frequency in range 0..20000')
+  return hz
+}
+
+function assertWindows(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  return boundedInteger(value, 'windows', MIN_ANALYSIS_WINDOWS, MIN_ANALYSIS_WINDOWS, MAX_ANALYSIS_WINDOWS)
+}
+
+/** Milliseconds trimmed off one end of a reference before it is analysed. */
+function assertTrimMs(value: unknown, label: string): number {
+  if (value === undefined) return 0
+  const ms = finite(value, label)
+  if (ms < 0) throw new Error(`${label} must be >= 0`)
+  return ms
+}
+
+const PAYLOAD_FORMATS = ['json', 'text'] as const
+type PayloadFormat = (typeof PAYLOAD_FORMATS)[number]
+
+/** `json` or `text`; the default differs per tool, so it is passed in. */
+function assertPayloadFormat(value: unknown, fallback: PayloadFormat): PayloadFormat {
+  if (value === undefined) return fallback
+  if (typeof value !== 'string' || !PAYLOAD_FORMATS.includes(value as PayloadFormat)) {
+    throw new Error(`format must be one of ${PAYLOAD_FORMATS.join(', ')}`)
+  }
+  return value as PayloadFormat
+}
+
+const ADVICE_CATEGORIES = ['timbre', 'envelope', 'level', 'space'] as const
+
+function assertAdviceFocus(value: unknown): AdviceCategory | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || !ADVICE_CATEGORIES.includes(value as AdviceCategory)) {
+    throw new Error(`focus must be one of ${ADVICE_CATEGORIES.join(', ')}`)
+  }
+  return value as AdviceCategory
+}
+
+/** Default number of ranked moves returned beside a diff. */
+const DEFAULT_MAX_ACTIONS = 5
+const MAX_ADVICE_ACTIONS = 20
+
+/**
+ * Trim `startMs`/`endMs` off a decoded buffer. Applied here rather than in the
+ * analyzer because `AnalyzeAudioOptions` has no trim: what is trimmed is what
+ * the caller means by "the reference", so the retained PCM is the trimmed one.
+ */
+function trimChannels(
+  channels: readonly Float32Array[],
+  sampleRate: number,
+  startMs: number,
+  endMs: number
+): Float32Array[] {
+  if (startMs === 0 && endMs === 0) return channels.map(channel => channel)
+  const length = channels[0]?.length ?? 0
+  const from = Math.min(length, Math.round(startMs * sampleRate / 1000))
+  const to = Math.max(from, length - Math.min(length, Math.round(endMs * sampleRate / 1000)))
+  if (to - from < 1) {
+    throw new Error('trimStartMs and trimEndMs leave no audio to analyze')
+  }
+  return channels.map(channel => channel.slice(from, to))
+}
+
+/**
+ * The live patch in the raw units `adviseFromDiff` reads. `engine.toPreset()`
+ * stores NORMALIZED values under the same ids, which would make every
+ * `suggested` move nonsense, so the conversion happens here.
+ */
+function currentPatchValues(engine: SynthEngine): PatchValues {
+  const values = engine.values as ArrayLike<number> | undefined
+  // A patch that cannot be read costs the advice its quantitative `suggested`
+  // moves — `adviseFromDiff` still ranks the findings — and must never cost the
+  // caller the comparison it just paid a render for.
+  if (!values) return {}
+  const patch: Record<string, number> = {}
+  for (const def of PARAMS) {
+    const normalized = values[paramIndex(def.id)]
+    if (typeof normalized !== 'number' || !Number.isFinite(normalized)) continue
+    patch[def.id] = clean(normToValue(def, normalized))
+  }
+  return patch
 }
 
 /**
@@ -522,7 +652,9 @@ export function createWebMcpTools(
     if (session.lastRender) URL.revokeObjectURL(session.lastRender.url)
     session.lastRender = null
     session.lastReference = null
+    session.referencePcm = null
     session.match = null
+    session.lastComparison = null
   }
   lifecycleSignal?.addEventListener('abort', cleanup, { once: true })
 
@@ -585,14 +717,18 @@ export function createWebMcpTools(
     if (performance.active) throw new Error(`${action} is unavailable while a performance is in progress`)
   }
 
-  function scopeCandidate() {
+  function scopeCandidate(options: AnalyzeAudioOptions = {}) {
     const sampleRate = engine.ctx?.sampleRate ?? 48000
     return {
       source: 'scope' as const,
       sampleRate,
       channels: 2,
-      metrics: analyzeAudio([engine.scopeL, engine.scopeR], sampleRate),
-      metricNotes: METRIC_NOTES
+      metrics: analyzeAudio([engine.scopeL, engine.scopeR], sampleRate, options),
+      metricNotes: METRIC_NOTES,
+      // Ships with every scope result, `compare_audio`'s fallback candidate
+      // included: the buffer is ~21 ms long, and its envelope figures read as
+      // measurements of a note when they are measurements of a fragment.
+      scopeNote: SCOPE_NOTE
     }
   }
 
@@ -606,6 +742,87 @@ export function createWebMcpTools(
       metricNotes: METRIC_NOTES
     }
     return scopeCandidate()
+  }
+
+  /**
+   * One render, analysed and stored as `session.lastRender`. Extracted from
+   * `render_audio` so `compare_audio`'s `autoRender` renders exactly the same
+   * way — same offline preference, same replay bookkeeping, same analysis
+   * options — instead of growing a second, subtly different render path.
+   */
+  async function renderSequence(
+    notes: { midi: number; velocity: number; start: number; duration: number }[],
+    duration: number,
+    requestedMode: RenderMode | undefined,
+    operationSignal: AbortSignal,
+    replayLabel: string,
+    analysisOptions: AnalyzeAudioOptions
+  ): Promise<{
+    recording: RecordedAudio
+    metrics: AudioMetrics
+    renderMode: RenderMode
+    renderModeFallback?: string
+    url: string
+  }> {
+    // Whether offline works here is a property of the browser, not of the
+    // request: a default (mode-less) call on a browser without an offline
+    // renderer must not be told to retry with `mode: "offline"`.
+    const offlineUnavailable = offlineRenderer === null
+    const wantsOffline = requestedMode === undefined ? !offlineUnavailable : requestedMode === 'offline'
+    const renderModeFallback = wantsOffline && offlineUnavailable
+      ? 'Offline rendering is unavailable here (no OfflineAudioContext or AudioWorklet); captured the live output in real time instead'
+      : undefined
+    const soundEntryId = dependencies.currentSoundEntryId?.()
+    const commit = (recording: RecordedAudio, metrics: AudioMetrics, renderMode: RenderMode) => {
+      if (session.lastRender) URL.revokeObjectURL(session.lastRender.url)
+      const url = URL.createObjectURL(recording.blob)
+      session.lastRender = { metrics, sampleRate: recording.sampleRate, channels: recording.channelData.length, url, soundEntryId }
+      return { recording, metrics, renderMode, ...(renderModeFallback ? { renderModeFallback } : {}), url }
+    }
+
+    if (wantsOffline && offlineRenderer) {
+      // No live graph, no held-note conflict, no Start gesture: the whole
+      // point of the offline path.
+      throwIfAborted(operationSignal)
+      // The signal goes *into* the renderer: an offline render burns CPU
+      // for as long as it takes, and without it a cancellation could only
+      // be reported once the whole render had finished.
+      const recording = await offlineRenderer(engine, notes, duration, { signal: operationSignal })
+      throwIfAborted(operationSignal)
+      const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal, analysisOptions)
+      return commit(recording, metrics, 'offline')
+    }
+
+    if (!engine.running) {
+      throw new Error(offlineUnavailable
+        ? 'Start audio with a user gesture before rendering audio: offline rendering is unavailable in this browser'
+        : 'Start audio with a user gesture before rendering audio, or use mode: "offline"')
+    }
+    assertNotesAvailable(engine, notes)
+    throwIfAborted(operationSignal)
+    const replayId = dependencies.replays?.startPerformance(notes, duration, replayLabel, soundEntryId)
+    const controller = new AbortController()
+    const forwardAbort = () => controller.abort()
+    operationSignal.addEventListener('abort', forwardAbort, { once: true })
+    let recordingTask: ReturnType<SynthEngine['recordOutput']> | undefined
+    let notesTask: Promise<void> | undefined
+    try {
+      recordingTask = engine.recordOutput(duration, controller.signal)
+      notesTask = performance.trackPlayback(() => performNotes(engine, notes, controller.signal), 'ai')
+      const [recording] = await Promise.all([recordingTask, notesTask])
+      throwIfAborted(operationSignal)
+      const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal, analysisOptions)
+      if (replayId) dependencies.replays!.finishPerformance(replayId, 'completed')
+      return commit(recording, metrics, 'realtime')
+    } catch (error) {
+      controller.abort()
+      await Promise.allSettled([recordingTask, notesTask])
+      if (replayId) dependencies.replays!.finishPerformance(replayId, operationSignal.aborted ? 'cancelled' : 'failed')
+      throw error
+    } finally {
+      controller.abort()
+      operationSignal.removeEventListener('abort', forwardAbort)
+    }
   }
 
   return [
@@ -1029,113 +1246,105 @@ export function createWebMcpTools(
             : finite(value.duration, 'duration')
           if (duration <= 0 || duration > MAX_RENDER_SECONDS) throw new Error(`Render duration must be > 0 and limited to ${MAX_RENDER_SECONDS} seconds`)
           if (duration < sequence.duration) throw new Error('Render duration must cover the complete note sequence')
-          // Whether offline works here is a property of the browser, not of the
-          // request: a default (mode-less) call on a browser without an offline
-          // renderer must not be told to retry with `mode: "offline"`.
-          const offlineUnavailable = offlineRenderer === null
-          const wantsOffline = requestedMode === undefined ? !offlineUnavailable : requestedMode === 'offline'
-          const renderModeFallback = wantsOffline && offlineUnavailable
-            ? 'Offline rendering is unavailable here (no OfflineAudioContext or AudioWorklet); captured the live output in real time instead'
-            : undefined
-          const soundEntryId = dependencies.currentSoundEntryId?.()
-          const analysisOptions = analysisOptionsFor(sequence.notes)
-          const finish = (recording: RecordedAudio, metrics: AudioMetrics, renderMode: RenderMode) => {
-            if (session.lastRender) URL.revokeObjectURL(session.lastRender.url)
-            const url = URL.createObjectURL(recording.blob)
-            session.lastRender = { metrics, sampleRate: recording.sampleRate, channels: recording.channelData.length, url, soundEntryId }
-            return {
-              renderMode,
-              mimeType: recording.mimeType,
-              duration: recording.duration,
-              sampleRate: recording.sampleRate,
-              channels: recording.channelData.length,
-              metrics,
-              metricNotes: METRIC_NOTES,
-              ...(format === 'url' ? { url } : {}),
-              ...(format === 'base64' ? {
-                audio: { ...monoWavBase64(recording.channelData, recording.sampleRate), downmixNote: DOWNMIX_NOTE }
-              } : {}),
-              ...(renderModeFallback ? { renderModeFallback } : {}),
-              ...(sequence.overlaps > 0 ? { retriggered: sequence.overlaps } : {})
-            }
-          }
-
-          if (wantsOffline && offlineRenderer) {
-            // No live graph, no held-note conflict, no Start gesture: the whole
-            // point of the offline path.
-            throwIfAborted(operationSignal)
-            // The signal goes *into* the renderer: an offline render burns CPU
-            // for as long as it takes, and without it a cancellation could only
-            // be reported once the whole render had finished.
-            const recording = await offlineRenderer(engine, sequence.notes, duration, { signal: operationSignal })
-            throwIfAborted(operationSignal)
-            const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal, analysisOptions)
-            return finish(recording, metrics, 'offline')
-          }
-
-          if (!engine.running) {
-            throw new Error(offlineUnavailable
-              ? 'Start audio with a user gesture before rendering audio: offline rendering is unavailable in this browser'
-              : 'Start audio with a user gesture before rendering audio, or use mode: "offline"')
-          }
-          assertNotesAvailable(engine, sequence.notes)
-          throwIfAborted(operationSignal)
-          const replayId = dependencies.replays?.startPerformance(sequence.notes, duration, 'AI rendered sequence', soundEntryId)
-          const controller = new AbortController()
-          const forwardAbort = () => controller.abort()
-          operationSignal.addEventListener('abort', forwardAbort, { once: true })
-          let recordingTask: ReturnType<SynthEngine['recordOutput']> | undefined
-          let notesTask: Promise<void> | undefined
-          try {
-            recordingTask = engine.recordOutput(duration, controller.signal)
-            notesTask = performance.trackPlayback(() => performNotes(engine, sequence.notes, controller.signal), 'ai')
-            const [recording] = await Promise.all([recordingTask, notesTask])
-            throwIfAborted(operationSignal)
-            const metrics = await analyzeAudioAsync(recording.channelData, recording.sampleRate, operationSignal, analysisOptions)
-            if (replayId) dependencies.replays!.finishPerformance(replayId, 'completed')
-            return finish(recording, metrics, 'realtime')
-          } catch (error) {
-            controller.abort()
-            await Promise.allSettled([recordingTask, notesTask])
-            if (replayId) dependencies.replays!.finishPerformance(replayId, operationSignal.aborted ? 'cancelled' : 'failed')
-            throw error
-          } finally {
-            controller.abort()
-            operationSignal.removeEventListener('abort', forwardAbort)
+          const rendered = await renderSequence(
+            sequence.notes, duration, requestedMode, operationSignal,
+            'AI rendered sequence', analysisOptionsFor(sequence.notes)
+          )
+          const { recording, metrics } = rendered
+          return {
+            renderMode: rendered.renderMode,
+            mimeType: recording.mimeType,
+            duration: recording.duration,
+            sampleRate: recording.sampleRate,
+            channels: recording.channelData.length,
+            metrics,
+            metricNotes: METRIC_NOTES,
+            ...(format === 'url' ? { url: rendered.url } : {}),
+            ...(format === 'base64' ? {
+              audio: { ...monoWavBase64(recording.channelData, recording.sampleRate), downmixNote: DOWNMIX_NOTE }
+            } : {}),
+            ...(rendered.renderModeFallback ? { renderModeFallback: rendered.renderModeFallback } : {}),
+            ...(sequence.overlaps > 0 ? { retriggered: sequence.overlaps } : {})
           }
         })
       }
     },
     {
       name: 'analyze_audio',
-      description: 'Re-analyze the last `render_audio` result, or analyze the live output right now (`source: "scope"`) — useful while a human is playing. `render_audio` already returns the same metrics and the same `metricNotes`, so call this only when you need a fresh look without re-rendering.',
+      description: 'Re-analyze the last render (default), the live output (`source: "scope"`), or the uploaded reference. `source: "reference"` re-analyzes the retained reference PCM, so a corrected `f0Hz` or a higher `windows` count costs no re-upload. `render_audio` already returns these metrics, so call this only for a fresh look without re-rendering.',
       inputSchema: {
         type: 'object',
-        properties: { source: { type: 'string', enum: ['scope', 'last-render'] } },
+        properties: {
+          source: { type: 'string', enum: ['scope', 'last-render', 'reference'] },
+          f0Hz: {
+            type: 'number', exclusiveMinimum: 0, maximum: 20000,
+            description: 'Fundamental for the partials, overriding detection. Only for "scope" and "reference": a render\'s PCM is not retained.'
+          },
+          windows: { type: 'integer', minimum: MIN_ANALYSIS_WINDOWS, maximum: MAX_ANALYSIS_WINDOWS, description: `Spectral windows, default ${MIN_ANALYSIS_WINDOWS}.` },
+          format: { type: 'string', enum: [...PAYLOAD_FORMATS], description: 'Default "json"; "text" adds the same metrics as a compact table.' }
+        },
         additionalProperties: false
       },
       annotations: { readOnlyHint: true },
-      execute(input) {
-        const value = assertObject(input, 'input', ['source'])
-        if (value.source !== undefined && value.source !== 'scope' && value.source !== 'last-render') {
-          throw new Error("source must be 'scope' or 'last-render'")
+      async execute(input, options) {
+        const signal = invocationSignal(options)
+        const value = assertObject(input, 'input', ['source', 'f0Hz', 'windows', 'format'])
+        if (value.source !== undefined && value.source !== 'scope' && value.source !== 'last-render' && value.source !== 'reference') {
+          throw new Error("source must be 'scope', 'last-render' or 'reference'")
         }
-        if (value.source === 'scope') return scopeCandidate()
+        const f0Hz = assertF0Hz(value.f0Hz)
+        const windows = assertWindows(value.windows)
+        const format = assertPayloadFormat(value.format, 'json')
+        const analysisOptions: AnalyzeAudioOptions = {
+          ...(f0Hz === undefined ? {} : { f0Hz }),
+          ...(windows === undefined ? {} : { windows })
+        }
+        const withText = <T extends { metrics: AudioMetrics }>(result: T) =>
+          format === 'text' ? { ...result, text: formatMetrics(result.metrics) } : result
+
+        if (value.source === 'reference') {
+          if (!session.lastReference || !session.referencePcm) {
+            throw new Error('No reference is available yet. Call analyze_reference_audio first; its decoded PCM is retained so this call can re-analyze it at a different f0Hz or window count')
+          }
+          const pcm = session.referencePcm
+          const metrics = await analyzeAudioAsync(pcm.channelData, pcm.sampleRate, signal, analysisOptions)
+          return withText({
+            source: 'reference' as const,
+            ...(session.lastReference.name ? { name: session.lastReference.name } : {}),
+            duration: session.lastReference.duration,
+            sampleRate: pcm.sampleRate,
+            channels: pcm.channelData.length,
+            metrics,
+            metricNotes: METRIC_NOTES
+          })
+        }
+        if (value.source === 'scope') return withText(scopeCandidate(analysisOptions))
         if (value.source === 'last-render' && !session.lastRender) {
           throw new Error('No render is available yet. Call render_audio first, or pass source: "scope" to analyze the live output')
         }
-        return currentCandidate()
+        // Re-analysis needs PCM, and only the reference and the live scope keep
+        // theirs. Saying so beats silently returning the stored metrics, which
+        // were measured at a different f0Hz than the one just asked for.
+        if (Object.keys(analysisOptions).length > 0 && session.lastRender) {
+          throw new Error('f0Hz and windows cannot be applied to source "last-render": the render\'s PCM is not retained, only its metrics. Call render_audio again (a single-pitch sequence is analyzed at its own f0 automatically), or analyze the reference with source: "reference"')
+        }
+        return withText(session.lastRender ? currentCandidate() : scopeCandidate(analysisOptions))
       }
     },
     {
       name: 'analyze_reference_audio',
-      description: 'Step 1 of matching a target sound: send the target as Base64 audio; it is decoded in memory and analyzed with the same metrics as synth output. Then render your patch and call compare_audio (step 2).',
+      description: 'Step 1 of matching a target sound: send the target as Base64 audio, decoded in memory and analyzed with the same metrics as synth output. `pitch` is detected automatically and `harmonics`/`harmonicShape` come with it, so the target\'s partials are visible on the same terms as your own. Its PCM is retained (one at a time) for analyze_audio({source:"reference"}). Then call compare_audio (step 2), which renders the candidate for you.',
       inputSchema: {
         type: 'object',
         properties: {
           audioBase64: { type: 'string', minLength: 1, maxLength: MAX_AUDIO_BASE64_CHARACTERS },
           name: { type: 'string', minLength: 1, maxLength: MAX_REFERENCE_NAME_LENGTH },
-          mimeType: { type: 'string', minLength: 1, maxLength: MAX_MIME_TYPE_LENGTH, pattern: '^[aA][uU][dD][iI][oO]/' }
+          mimeType: { type: 'string', minLength: 1, maxLength: MAX_MIME_TYPE_LENGTH, pattern: '^[aA][uU][dD][iI][oO]/' },
+          f0Hz: { type: 'number', exclusiveMinimum: 0, maximum: 20000, description: 'Known target fundamental; overrides detection when it reports the wrong octave.' },
+          trimStartMs: { type: 'number', minimum: 0, description: 'Milliseconds dropped from the start (leading silence).' },
+          trimEndMs: { type: 'number', minimum: 0, description: 'Milliseconds dropped from the end. What survives is the reference.' },
+          windows: { type: 'integer', minimum: MIN_ANALYSIS_WINDOWS, maximum: MAX_ANALYSIS_WINDOWS, description: `Spectral windows, default ${MIN_ANALYSIS_WINDOWS}.` },
+          format: { type: 'string', enum: [...PAYLOAD_FORMATS], description: 'Default "json"; "text" adds the same metrics as a compact table.' }
         },
         required: ['audioBase64'],
         additionalProperties: false
@@ -1145,7 +1354,11 @@ export function createWebMcpTools(
         const signal = invocationSignal(options)
         const invocationGeneration = ++session.referenceGeneration
         return runReferenceAnalysis(signal, invocationGeneration, async (operationSignal, assertCurrent) => {
-          const value = assertObject(input, 'input', ['audioBase64', 'name', 'mimeType'], ['audioBase64'])
+          const value = assertObject(
+            input, 'input',
+            ['audioBase64', 'name', 'mimeType', 'f0Hz', 'trimStartMs', 'trimEndMs', 'windows', 'format'],
+            ['audioBase64']
+          )
           if (typeof value.audioBase64 !== 'string') throw new Error('audioBase64 must be a string')
           if (value.audioBase64.length === 0 || value.audioBase64.trim().length === 0) {
             throw new Error('audioBase64 must not be empty')
@@ -1155,10 +1368,25 @@ export function createWebMcpTools(
           }
           const name = validateReferenceName(value.name)
           const requestedMimeType = validateAudioMimeType(value.mimeType)
+          const f0Hz = assertF0Hz(value.f0Hz)
+          const trimStartMs = assertTrimMs(value.trimStartMs, 'trimStartMs')
+          const trimEndMs = assertTrimMs(value.trimEndMs, 'trimEndMs')
+          const windows = assertWindows(value.windows)
+          const format = assertPayloadFormat(value.format, 'json')
+          const analysisOptions: AnalyzeAudioOptions = {
+            ...(f0Hz === undefined ? {} : { f0Hz }),
+            ...(windows === undefined ? {} : { windows })
+          }
           assertCurrent()
           const decoded = await decodeAudio(value.audioBase64, { context: engine.ctx, signal: operationSignal })
           assertCurrent()
-          const metrics = await analyzeAudioAsync(decoded.channelData, decoded.sampleRate, operationSignal)
+          // What survives the trim is what "the reference" means from here on:
+          // it is what is analyzed, what is retained, and what a later
+          // re-analysis at a corrected f0Hz sees.
+          const channelData = trimChannels(decoded.channelData, decoded.sampleRate, trimStartMs, trimEndMs)
+          const trimmedSamples = decoded.channelData[0].length - channelData[0].length
+          const duration = trimmedSamples > 0 ? channelData[0].length / decoded.sampleRate : decoded.duration
+          const metrics = await analyzeAudioAsync(channelData, decoded.sampleRate, operationSignal, analysisOptions)
           assertCurrent()
           const decodedMimeType = decoded.mimeType === undefined ? undefined : normalizeAudioMimeType(decoded.mimeType)
           if (requestedMimeType && decodedMimeType && requestedMimeType !== decodedMimeType) {
@@ -1170,30 +1398,91 @@ export function createWebMcpTools(
             ...(name ? { name } : {}),
             ...(mimeType ? { mimeType } : {}),
             decodedBytes: decoded.decodedBytes,
-            duration: decoded.duration,
+            duration,
             sampleRate: decoded.sampleRate,
             channels: decoded.channels,
+            ...(trimmedSamples > 0 ? { trimmedMs: { start: trimStartMs, end: trimEndMs } } : {}),
             metrics
           }
           assertCurrent()
           session.lastReference = analysis
+          // Deliberately NOT on `analysis`: `compare_audio` returns that object
+          // whole, and a decoded buffer inside it would be serialised to the
+          // model. One reference at a time, replaced here on every upload.
+          session.referencePcm = { channelData, sampleRate: decoded.sampleRate }
           // A new target is a new matching problem: the best-so-far starts over.
           // Only the winning (non-superseded) invocation reaches this line.
           session.match = null
-          return analysis
+          session.lastComparison = null
+          return format === 'text' ? { ...analysis, text: formatMetrics(metrics) } : analysis
         })
       }
     },
     {
       name: 'compare_audio',
-      description: 'Step 2 of matching a target sound: report per-metric and overall similarity between the latest `analyze_reference_audio` reference and the latest render. With nothing rendered it falls back to the live scope — the same candidate `analyze_audio` returns — and refuses outright when that scope is silent rather than scoring against silence.',
-      inputSchema: emptySchema,
-      annotations: { readOnlyHint: true },
-      execute(input, options) {
+      description: 'Step 2 of matching a target sound: the signed, per-dimension error between the reference and your sound (`diff`). It also returns ranked moves in this synth\'s parameter ids (`diff.actions`) and the unchanged `comparison` score. It renders the candidate first by default, at the reference\'s OWN detected pitch and duration, so you never compare an octave-off render whose scalars still look plausible. Falls back to the last render or the live scope with `autoRender: false`, and refuses a silent scope rather than scoring against silence.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          autoRender: { type: 'boolean', description: 'Default true when the reference has a pitch: render at that pitch and duration first. False compares the last render, or the live scope.' },
+          notes: { type: 'array', minItems: 1, maxItems: MAX_NOTES, items: noteSchema, description: 'Notes for that render, when the reference\'s own pitch is not what you want.' },
+          duration: { type: 'number', exclusiveMinimum: 0, maximum: MAX_RENDER_SECONDS, description: 'Render seconds; defaults to the reference\'s duration.' },
+          format: { type: 'string', enum: [...PAYLOAD_FORMATS], description: 'Default "text": the diff as a compact table. "json" returns the full numeric diff.' },
+          maxActions: { type: 'integer', minimum: 0, maximum: MAX_ADVICE_ACTIONS, description: `Ranked moves, default ${DEFAULT_MAX_ACTIONS}.` }
+        },
+        additionalProperties: false
+      },
+      // Not read-only: the default path renders, which stores a new
+      // `last-render` and, on the realtime fallback, makes sound.
+      annotations: { readOnlyHint: false },
+      async execute(input, options) {
         const signal = invocationSignal(options)
         if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
-        assertObject(input, 'input', [])
+        const value = assertObject(input, 'input', ['autoRender', 'notes', 'duration', 'format', 'maxActions'])
+        if (value.autoRender !== undefined && typeof value.autoRender !== 'boolean') throw new Error('autoRender must be boolean')
+        const format = assertPayloadFormat(value.format, 'text')
+        const maxActions = boundedInteger(value.maxActions, 'maxActions', DEFAULT_MAX_ACTIONS, 0, MAX_ADVICE_ACTIONS)
         if (!session.lastReference) throw new Error('Call analyze_reference_audio first before compare_audio')
+        const reference = session.lastReference
+        const referencePitch = reference.metrics.pitch ?? null
+        // A candidate rendered at the wrong pitch scores plausibly on every
+        // scalar and nonsensically on every partial, so the default is to
+        // render at the reference's own measured pitch rather than to trust
+        // whatever note was last played.
+        const autoRender = value.autoRender === undefined
+          ? referencePitch !== null || value.notes !== undefined
+          : value.autoRender
+        if (autoRender && value.notes === undefined && referencePitch === null) {
+          throw new Error('autoRender needs a pitch: no fundamental was detected in the reference, so there is no note to render. Pass `notes` explicitly, or re-run analyze_reference_audio with a known `f0Hz`, or pass autoRender: false')
+        }
+        if (autoRender) {
+          const duration = value.duration === undefined
+            ? Math.min(MAX_RENDER_SECONDS, Math.max(0.05, clean(reference.duration)))
+            : finite(value.duration, 'duration')
+          if (duration <= 0 || duration > MAX_RENDER_SECONDS) throw new Error(`Render duration must be > 0 and limited to ${MAX_RENDER_SECONDS} seconds`)
+          const sequence = value.notes === undefined
+            ? {
+              notes: [{ midi: referencePitch!.midi, velocity: 1, start: 0, duration }],
+              duration,
+              overlaps: 0
+            }
+            : validatePerformanceNotes(value.notes, MAX_RENDER_SECONDS)
+          if (duration < sequence.duration) throw new Error('Render duration must cover the complete note sequence')
+          try {
+            await runPerformance(signal, operationSignal => renderSequence(
+              sequence.notes, duration, undefined, operationSignal, 'AI comparison render',
+              // The reference's own fundamental, so both sides' partials are
+              // measured against the same f0 rather than each against its own.
+              referencePitch ? { f0Hz: referencePitch.f0Hz } : analysisOptionsFor(sequence.notes)
+            ))
+          } catch (error) {
+            if ((error as Error | undefined)?.name === 'AbortError') throw error
+            // The render is this tool's default, not something the caller asked
+            // for by name, so its failure has to say how to compare anyway.
+            throw new Error(`${(error as Error | undefined)?.message ?? String(error)} (compare_audio renders the candidate by default; pass autoRender: false to compare the last render or the live scope instead)`)
+          }
+          if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
+        }
         const candidate = currentCandidate()
         // The scope fallback exists for a human who IS playing. Before the
         // audio gesture the scope is guaranteed digital silence, and scoring a
@@ -1205,20 +1494,78 @@ export function createWebMcpTools(
           throw new Error(SILENT_CANDIDATE_REFUSAL)
         }
         if (signal.aborted || lifecycleSignal?.aborted) throw abortError()
-        const comparison = compareAudioMetrics(session.lastReference.metrics, candidate.metrics)
+        // Unchanged, and deliberately so: `docs/agent-match-eval.md` reads
+        // `detailSimilarities` and `similarityTrajectory` off this object, and a
+        // new shape would make every recorded run incomparable.
+        const comparison = compareAudioMetrics(reference.metrics, candidate.metrics)
         const entryId = candidate.source === 'last-render' ? session.lastRender?.soundEntryId : dependencies.currentSoundEntryId?.()
         dependencies.onComparison?.(comparison, entryId)
+        const progress = trackMatchProgress(session, reference, comparison.similarity, entryId)
+        const diff = diffAudioMetrics(reference.metrics, candidate.metrics, comparison)
+        diff.actions = adviseFromDiff(diff, currentPatchValues(engine), { maxActions })
+        session.lastComparison = {
+          diff,
+          ...(reference.name ? { referenceName: reference.name } : {}),
+          comparisonNumber: progress.comparisonNumber
+        }
+        const text = format === 'text'
+          ? formatDiff(diff, {
+            ...(reference.name ? { referenceName: reference.name } : {}),
+            comparisonNumber: progress.comparisonNumber,
+            bestSoFar: progress.best
+          })
+          : undefined
         return {
-          reference: session.lastReference,
+          reference,
           candidate,
           comparison,
-          progress: trackMatchProgress(session, session.lastReference, comparison.similarity, entryId)
+          // In text mode the table already carries every band, partial and
+          // window figure, so shipping the numeric arrays as well would pay for
+          // the same numbers twice. `actions` stays structured either way: it
+          // carries parameter ids and legal target values an agent applies
+          // directly with update_parameters.
+          diff: format === 'text' ? { similarity: diff.similarity, actions: diff.actions } : diff,
+          ...(text === undefined ? {} : { text }),
+          progress
+        }
+      }
+    },
+    {
+      name: 'suggest_patch',
+      description: 'Ask "what next" without paying for a render: re-reads the last compare_audio and returns its ranked moves again — parameter ids, directions, legal target values — optionally narrowed by `focus`. Nothing is rendered or measured, so call compare_audio to find out whether a move worked.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          maxActions: { type: 'integer', minimum: 0, maximum: MAX_ADVICE_ACTIONS, description: `Default ${DEFAULT_MAX_ACTIONS}.` },
+          focus: { type: 'string', enum: [...ADVICE_CATEGORIES] }
+        },
+        additionalProperties: false
+      },
+      annotations: { readOnlyHint: true },
+      execute(input) {
+        const value = assertObject(input, 'input', ['maxActions', 'focus'])
+        const maxActions = boundedInteger(value.maxActions, 'maxActions', DEFAULT_MAX_ACTIONS, 0, MAX_ADVICE_ACTIONS)
+        const focus = assertAdviceFocus(value.focus)
+        // Advice with no measurement behind it would be advice about nothing,
+        // and an agent would spend edits on it. Refuse and name the call.
+        if (!session.lastComparison) {
+          throw new Error('No comparison to advise from yet. Call analyze_reference_audio to set a target, then compare_audio — which renders the candidate for you — and call suggest_patch again; it re-reads that comparison rather than measuring anything itself')
+        }
+        const { diff, referenceName, comparisonNumber } = session.lastComparison
+        return {
+          actions: adviseFromDiff(diff, currentPatchValues(engine), { maxActions, ...(focus ? { focus } : {}) }),
+          basedOn: {
+            ...(referenceName ? { referenceName } : {}),
+            comparisonNumber,
+            similarity: roundSimilarity(diff.similarity),
+            note: 'Re-read of the last compare_audio, against the patch as it is right now. Nothing was rendered or measured for this call; call compare_audio to measure the effect of a change.'
+          }
         }
       }
     },
     {
       name: 'save_preset',
-      description: 'Save the complete current patch to localStorage under a validated name, replacing that name if present.',
+      description: "Save the complete current patch under a validated name, replacing that name if present. It goes to this browser's localStorage and shows up in the preset select under `User` — no file, no folder. The result says so; `list_presets` confirms it.",
       inputSchema: {
         type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 80 } },
         required: ['name'], additionalProperties: false
@@ -1228,7 +1575,14 @@ export function createWebMcpTools(
         const value = assertObject(input, 'input', ['name'], ['name'])
         const name = validatePresetName(value.name)
         savePreset(engine.toPreset(name))
-        return { name, saved: true }
+        return {
+          name,
+          saved: true,
+          storage: 'localStorage',
+          // The motivating session: "which folder did you save it to?" cost
+          // several calls to answer, because the answer was "none".
+          where: `Saved in this browser's localStorage, not to a file: no folder holds it. It is in the preset select under the "User" group as "${name}", and list_presets returns it.`
+        }
       }
     },
     {

@@ -13,7 +13,14 @@ describe('analyzeAudioAbortably', () => {
     })
   })
 
-  it('forwards analysis options to the inline fallback so single-note renders get harmonics', async () => {
+  /**
+   * The options reach the analyzer, and the analyzer's own defaults reach the
+   * caller. `f0Hz` is now a way to STATE the fundamental rather than the only
+   * way to get a harmonic block at all: detection is on by default, so the
+   * difference the options make is `pitch.source` (and `detectPitch: false`,
+   * which is how a caller says "this material has no single fundamental").
+   */
+  it('forwards analysis options to the inline fallback', async () => {
     vi.stubGlobal('Worker', undefined)
     const sampleRate = 48000
     const tone = Float32Array.from({ length: sampleRate }, (_, i) => {
@@ -23,7 +30,16 @@ describe('analyzeAudioAbortably', () => {
     })
     const withF0 = await analyzeAudioAbortably([tone], sampleRate, undefined, { f0Hz: 440 })
     expect(withF0.harmonics?.amplitudesDb).toHaveLength(12)
-    expect((await analyzeAudioAbortably([tone], sampleRate)).harmonics).toBeUndefined()
+    expect(withF0.pitch).toMatchObject({ f0Hz: 440, source: 'given' })
+
+    const detected = await analyzeAudioAbortably([tone], sampleRate)
+    expect(detected.pitch?.source).toBe('detected')
+    expect(detected.pitch?.f0Hz).toBeCloseTo(440, 0)
+    expect(detected.harmonics?.amplitudesDb).toHaveLength(12)
+
+    const unpitched = await analyzeAudioAbortably([tone], sampleRate, undefined, { detectPitch: false })
+    expect(unpitched.pitch).toBeNull()
+    expect(unpitched.harmonics).toBeUndefined()
   })
 
   it('includes analysis options in the worker payload', () => {
