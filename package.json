@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@audio/pitch-yin": "^1.0.5",
+    "@vercel/analytics": "^2.0.1",
     "driver.js": "^1.8.0",
     "lucide": "^1.37.0",
     "micromark": "^4.0.2",
