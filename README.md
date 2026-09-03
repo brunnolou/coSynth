@@ -102,6 +102,45 @@ All eighteen semantic tools register at page load, so `GET /tools` returns the s
 - `replay_history` — play a saved AI note sequence with the current sound, or restart a saved walkthrough. No new history entry is created.
 - `stop_performance` — cancel AI playback, rendering, or a history audition and wait for cleanup.
 
+### Using coSynth from an AI agent
+
+coSynth is deployed as a static site, so an agent that opens it has no
+repository, no `AGENTS.md` and no README to read. The page is therefore its own
+documentation: `src/webmcp/announce.ts` writes a clipped (never `display: none`)
+`#cosynth-agent-brief` section into the body, plus a
+`<script type="application/json">` descriptor and `ai-tools` / `ai-tool-names` /
+`ai-workflow` meta tags in `index.html`. All of it survives both a plain DOM
+snapshot and a text extraction of the page, which are the two things a browsing
+agent reliably has. Point an agent at the URL and tell it to read the page text.
+
+To match a reference sound, run this loop: `analyze_reference_audio` →
+`render_audio` → `compare_audio` → `update_parameters`, then repeat. Each
+`compare_audio` result carries a `progress` block naming the best similarity so
+far against that reference, so stop when it reports a plateau instead of editing
+past your own best patch. Open with one
+`get_parameter_schema({ format: 'compact' })` call, which returns every
+parameter, one line each.
+
+Four traps cost a real evaluated session roughly a dozen tool calls:
+
+- **The tools are page-scoped, so they are absent from any ambient tool list.**
+  They are registered on the document via `document.modelContext.registerTool`.
+  Filtering your own global tool inventory for `synth|preset|oscillator|audio`
+  returns an empty array whether or not coSynth is open — an empty grep of
+  `ALL_TOOLS` means nothing here.
+- **They are bound to the document, so the tab has to be claimed in a browsing
+  context that exposes the `webmcp` capability.** An external browser tab on the
+  same URL may not have it, and a raw CDP probe there returns
+  `{"hasMC":false,"keys":[],"ai":false}` — a confident false negative. Re-probe
+  from a WebMCP-capable context before concluding the page exposes nothing.
+- **`analyze_audio({ source: 'scope' })` reads a 1024-sample buffer (~21 ms).**
+  It is silent unless a note is sounding at that instant. Anything involving
+  attack, decay, release or a tail needs `render_audio`, which renders offline
+  and needs no user gesture.
+- **Presets are saved to browser localStorage, not to a folder on disk.**
+  A saved patch appears under the `User` optgroup of the preset select; there is
+  no path to hand to anyone. `list_presets` is how you prove a save happened.
+
 ### Teaching with guides
 
 After audio starts for the first time, coSynth opens a four-step introduction to its AI controls, playable keyboard, and synth workspace. Closing or finishing it records a versioned browser-local preference. The Help button in the activity toolbar restarts it from step one. This built-in tour never enters Replays or changes the sound.

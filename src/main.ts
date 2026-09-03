@@ -11,6 +11,12 @@ import { guideTarget } from './ui/guide-target'
 import { createHistoryServices } from './history/services'
 import { bindHistoryInteractions, isTextEditing } from './ui/history-bindings'
 import { WelcomeTour } from './ui/welcome-tour'
+import { announceAgentSurface } from './webmcp/announce'
+
+// coSynth ships as a static site, so an agent arriving here has no repo and no AGENTS.md to
+// read. The page has to describe its own tool surface; this writes that description into the
+// DOM where a snapshot or a text extraction will find it.
+announceAgentSurface()
 
 const engine = new SynthEngine()
 const agentActivity = agentActivityFor(engine)
