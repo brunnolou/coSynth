@@ -246,6 +246,162 @@ describe('UiGuideController with Driver.js', () => {
     expect(document.querySelector('.driver-popover')).toBeNull()
   })
 
+  /**
+   * A guide that cannot open its own subject fails exactly where it matters.
+   * A real session called show_ui_guide for `param.env1.release` and got back
+   * "Target unavailable ... Open the relevant panel or tab", and recovered only
+   * by finding and clicking `ENV 1 · AMP` itself before calling the guide again.
+   *
+   * "Unavailable" covered two different situations that need different fixes.
+   * A control inside a closed `<details>` is mounted and can be walked to from
+   * the element. The ENV and LFO knobs are not mounted at all — app.ts rebuilds
+   * that row on every tab click — so there is nothing to walk from, and the
+   * owning tab has to come from the ID the two targets share.
+   */
+  describe('revealing what hides a target', () => {
+    /** A `<details>` panel, the way the preset actions menu is built. */
+    const panel = (id: string, label: string) => {
+      const details = document.createElement('details')
+      const summary = guideTarget(document.createElement('summary'), `button.${id}.actions`, `${label} actions`, 'button')
+      details.append(summary)
+      app.append(details)
+      return details
+    }
+    /**
+     * A sub-tab group that mounts its controls on click and throws away the
+     * previous tab's, exactly as `renderEnvKnobs` does.
+     */
+    const envTabs = () => {
+      const tabs = document.createElement('div')
+      const mount = document.createElement('div')
+      app.append(tabs, mount)
+      const show = (env: number) => mount.replaceChildren(
+        guideTarget(document.createElement('div'), `param.env${env}.release`, `env${env} Release`, 'knob'))
+      const buttons = [1, 2].map(env => {
+        const button = guideTarget(document.createElement('button'), `tab.env${env}`, `Env ${env}`, 'tab')
+        button.addEventListener('click', () => {
+          for (const other of buttons) other.classList.toggle('on', other === button)
+          show(env)
+        })
+        tabs.append(button)
+        return button
+      })
+      buttons[1].classList.add('on')
+      show(2)
+      return { buttons, mount }
+    }
+
+    it('reports a control in a closed panel as revealable, and an unknown ID as neither', () => {
+      const actions = panel('preset', 'Preset')
+      target('button.preset.save', actions, 'Save preset')
+      // Hidden by the app's own state rather than by a container: nothing the
+      // guide opens brings this one back, and saying otherwise would be a lie.
+      target('fx.delay', app, 'Delay / echo effect', 'panel').hidden = true
+
+      expect(guide.listTargets({ format: 'compact' }).items).toEqual([
+        'button.preset.actions button Preset actions',
+        'button.preset.save button Save preset (hidden, revealable)',
+        'fx.delay panel Delay / echo effect (hidden)'
+      ])
+      expect(guide.listTargets({ search: 'Save preset' }).items).toEqual([
+        { id: 'button.preset.save', label: 'Save preset', type: 'button', visible: false, revealable: true }
+      ])
+      // A wrong ID and a closed tab both return nothing; only `unmatched` says
+      // which of the two happened.
+      envTabs()
+      expect(guide.listTargets({ search: 'param.env1.release' })).toMatchObject({
+        total: 0, unmatched: { search: 'param.env1.release', revealable: true, opens: ['tab.env1'] }
+      })
+      expect(guide.listTargets({ search: 'param.reverb.sizzle' })).toMatchObject({
+        total: 0, unmatched: { search: 'param.reverb.sizzle', revealable: false, opens: [] }
+      })
+    })
+
+    it('still warns, and reveals nothing, for an ID no tab could produce', async () => {
+      envTabs()
+      const result = guide.show({ steps: [{ target: { id: 'button.nope' }, markdown: 'Instructions survive' }] })
+      expect(result).not.toHaveProperty('reveals')
+      expect(result.warnings).toEqual([{ step: 1, message: expect.stringContaining('Nothing on the page carries that ID') }])
+      await tick()
+      expect(document.querySelector('.guide-warning')?.textContent).toContain('Target unavailable: button.nope')
+      expect(document.querySelector('.driver-popover-description')?.textContent).toContain('Instructions survive')
+    })
+
+    it('opens the panel a step points into, so the human ends up looking at the control', async () => {
+      const actions = panel('preset', 'Preset')
+      const save = target('button.preset.save', actions, 'Save preset')
+
+      const result = guide.show({ steps: [{ target: { id: 'button.preset.save' }, markdown: 'Name it, then save.' }] })
+      expect(result).toMatchObject({ shown: true, warnings: [], reveals: [{ step: 1, opens: ['button.preset.actions'] }] })
+      await tick()
+      // The real DOM the guide drives, not the plan it returned.
+      expect(actions.open).toBe(true)
+      expect(save.classList.contains('driver-active-element')).toBe(true)
+      expect(document.querySelector('.guide-warning')).toBeNull()
+      // And the panel stays open once the guide is dismissed: closing it again
+      // would leave the popover pointing at nothing and undo the whole point.
+      document.querySelector<HTMLButtonElement>('.driver-popover-close-btn')!.click()
+      expect(actions.open).toBe(true)
+    })
+
+    it('activates the tab that owns a control the page has not mounted yet', async () => {
+      const { buttons } = envTabs()
+      const result = guide.show({ steps: [{ target: { id: 'param.env1.release' }, markdown: 'Release' }] })
+      expect(result).toMatchObject({ warnings: [], reveals: [{ step: 1, opens: ['tab.env1'] }] })
+      await tick()
+      expect(buttons[0].classList.contains('on')).toBe(true)
+      expect(app.querySelector('[data-guide-id="param.env1.release"]')?.classList.contains('driver-active-element')).toBe(true)
+    })
+
+    it('leaves the screen alone when the caller opts out', async () => {
+      const actions = panel('preset', 'Preset')
+      target('button.preset.save', actions, 'Save preset')
+      const result = guide.show({ reveal: false, steps: [{ target: { id: 'button.preset.save' } }] })
+      expect(result).not.toHaveProperty('reveals')
+      expect(result.warnings[0].message).toContain('Its panel or tab is closed')
+      await tick()
+      expect(actions.open).toBe(false)
+      expect(() => guide.show({ reveal: 'yes', steps: [] })).toThrow(/reveal/)
+    })
+
+    it('is idempotent and never closes a panel the human already had open', () => {
+      const actions = panel('preset', 'Preset')
+      const save = target('button.preset.save', actions, 'Save preset')
+      const other = panel('fx', 'FX')
+      other.open = true
+      target('button.fx.reset', other, 'Reset FX')
+
+      expect(guide.reveal({ id: 'button.preset.save' })).toEqual({ revealed: true, opened: ['button.preset.actions'] })
+      // Second call: already visible, so nothing to open and nothing to undo.
+      expect(guide.reveal({ id: 'button.preset.save' })).toEqual({ revealed: true, opened: [] })
+      expect(actions.open).toBe(true)
+      expect(other.open).toBe(true)
+      expect(guide.listTargets({ search: 'Save preset' }).items).toEqual([
+        { id: 'button.preset.save', label: 'Save preset', type: 'button', visible: true }
+      ])
+      expect(save.classList.contains('driver-active-element')).toBe(false)
+    })
+
+    it('touches nothing but the container it opens, so no parameter can move', () => {
+      const { buttons, mount } = envTabs()
+      const knob = target('param.filter1.cutoff', app, 'filter1 Cutoff', 'knob')
+      const seen: string[] = []
+      const types = ['click', 'pointerdown', 'input', 'change']
+      const spy = (event: Event) => seen.push(`${event.type}:${(event.target as HTMLElement).dataset?.guideId ?? 'unknown'}`)
+      for (const type of types) document.addEventListener(type, spy, true)
+
+      expect(guide.reveal({ id: 'param.env1.release' })).toMatchObject({ revealed: true, opened: ['tab.env1'] })
+      for (const type of types) document.removeEventListener(type, spy, true)
+      // Exactly one synthetic event, on the tab button. Every parameter in this
+      // app moves through a pointer or input event on its own control, so a
+      // reveal that dispatches none cannot have changed the patch.
+      expect(seen).toEqual(['click:tab.env1'])
+      expect(buttons[0].classList.contains('on')).toBe(true)
+      expect(mount.querySelector('[data-guide-id="param.env1.release"]')).not.toBeNull()
+      expect(knob.classList.contains('driver-active-element')).toBe(false)
+    })
+  })
+
   it('does not bypass blocking startup screens or leave a guide trapped in a closed dialog', async () => {
     target('app.control')
     const screen = document.createElement('div')

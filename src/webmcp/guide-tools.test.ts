@@ -68,6 +68,26 @@ describe('teaching tool descriptors', () => {
     expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(2600)
   })
 
+  /**
+   * The guide used to promise it "never activates tabs", and then warned the
+   * caller to open the tab itself. Both halves are gone: it opens what a step
+   * points into, the descriptor says so, and `reveal` is the way out for a
+   * caller that wants the screen left alone.
+   */
+  it('offers revealing as an opt-out rather than a discovery problem', () => {
+    const { schemaOf, descriptionOf } = setup()
+    const schema = schemaOf('show_ui_guide')
+    expect(schema.properties.reveal).toMatchObject({ type: 'boolean' })
+    // Default on, so the failing call site is fixed without a second tool to find.
+    expect(schema.required).toEqual(['steps'])
+    expect(descriptionOf('show_ui_guide')).toMatch(/`reveal`/)
+    expect(descriptionOf('show_ui_guide')).not.toMatch(/activates tabs/)
+    // The sound guarantee is the one that has to survive intact.
+    expect(descriptionOf('show_ui_guide')).toMatch(/[Nn]ever changes sound/)
+    // Availability is now two facts, not one, in the format an agent reads first.
+    expect(schemaOf('get_ui_targets').properties.format.description).toMatch(/revealable/)
+  })
+
   it('passes the format through to the controller unchanged', async () => {
     const { guide, byName } = setup()
     const input = { format: 'compact' }
