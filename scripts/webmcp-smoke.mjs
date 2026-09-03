@@ -49,8 +49,21 @@ function installShim(page) {
   })
 }
 
-const TOOLS_AT_LOAD = 18
-const TOOLS_AFTER_AUDIO = 18
+// The one source of truth for both the names and the count in this file. The
+// count had drifted three times because it was typed as a literal in five
+// places and the name list in a sixth; now adding a tool here is the whole
+// edit. Every tool registers at page load and the set never changes across the
+// gesture, so the same number is awaited on both sides of the Start click on
+// purpose - play_notes is registered but refuses until audio starts, because an
+// agent that could not see it concluded playback was not a tool at all.
+const EXPECTED_TOOL_NAMES = [
+  'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
+  'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
+  'compare_audio', 'suggest_patch', 'save_preset', 'load_preset', 'list_presets',
+  'get_ui_targets', 'show_ui_guide',
+  'get_history', 'navigate_history', 'replay_history', 'stop_performance'
+]
+const TOOL_COUNT = EXPECTED_TOOL_NAMES.length
 
 try {
   // Progressive-enhancement path: the unmodified browser has no shim.
@@ -69,7 +82,7 @@ try {
   const cold = await trackedPage(coldBrowser)
   await installShim(cold.page)
   await cold.page.goto(url, { waitUntil: 'networkidle' })
-  await cold.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOLS_AT_LOAD)
+  await cold.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOL_COUNT)
   const coldResult = await cold.page.evaluate(async () => {
     const tools = window.__webMcpTools
     const before = {
@@ -168,12 +181,12 @@ try {
   const shimmed = await trackedPage()
   await installShim(shimmed.page)
   await shimmed.page.goto(url, { waitUntil: 'networkidle' })
-  await shimmed.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOLS_AT_LOAD)
+  await shimmed.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOL_COUNT)
   const toolsBeforeAudio = await shimmed.page.evaluate(() => [...window.__webMcpTools.keys()])
   if (!toolsBeforeAudio.includes('play_notes')) throw new Error('play_notes was hidden before audio startup')
   await shimmed.page.click('#start-btn')
   await shimmed.page.waitForFunction(() => !document.getElementById('start-overlay'), { timeout: 10000 })
-  await shimmed.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOLS_AFTER_AUDIO)
+  await shimmed.page.waitForFunction(count => window.__webMcpTools?.size === count, TOOL_COUNT)
 
   const result = await shimmed.page.evaluate(async () => {
     const tools = window.__webMcpTools
@@ -301,13 +314,7 @@ try {
     }
   })
 
-  const expectedNames = [
-    'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
-    'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
-    'compare_audio', 'save_preset', 'load_preset', 'list_presets', 'get_ui_targets', 'show_ui_guide',
-    'get_history', 'navigate_history', 'replay_history', 'stop_performance'
-  ]
-  if (JSON.stringify([...result.names].sort()) !== JSON.stringify([...expectedNames].sort())) throw new Error(`Unexpected tools: ${result.names}`)
+  if (JSON.stringify([...result.names].sort()) !== JSON.stringify([...EXPECTED_TOOL_NAMES].sort())) throw new Error(`Unexpected tools: ${result.names}`)
   if (!result.running || !result.schemaCount || result.appliedRaw !== 0.8) throw new Error('State/schema/update check failed')
   if (result.modulationCount !== 1 || result.played.noteCount !== 1 || result.heldNotes !== 0) throw new Error('Modulation/note check failed')
   if (result.render.mode !== 'realtime' || result.render.blobSize <= 0 || result.render.channels < 1) throw new Error('Render metadata check failed')
@@ -320,7 +327,7 @@ try {
   if (result.expectedError?.ok !== false || !/unknown parameter/i.test(result.expectedError?.error?.message ?? '')) {
     throw new Error(`Structured error check failed: ${JSON.stringify(result.expectedError)}`)
   }
-  if (!result.activity.toolStatus?.startsWith(`${TOOLS_AFTER_AUDIO} tools ready.`) || !result.activity.undoEnabled ||
+  if (!result.activity.toolStatus?.startsWith(`${TOOL_COUNT} tools ready.`) || !result.activity.undoEnabled ||
       !result.activity.retainedComparison || !result.activity.changedParameters.some(text => text === 'master.volume' || text.startsWith('master.volume:')) ||
       result.activity.soundCount < 5 || result.activity.replayCount !== 2) {
     throw new Error(`Agent activity check failed: ${JSON.stringify(result.activity)}`)

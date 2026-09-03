@@ -56,10 +56,18 @@ export const ANNOUNCED_TOOL_NAMES = [
   'show_ui_guide'
 ] as const
 
-/** The sound-matching loop, named in the order an agent should run it. */
+/**
+ * The sound-matching loop, named in the order an agent should run it.
+ *
+ * Three steps, not four: `compare_audio` renders the candidate itself, at the
+ * reference's own detected pitch. The `render_audio` call that used to sit
+ * between steps 1 and 2 now costs a render per iteration and buys nothing but
+ * the chance to pick the note by hand — which is exactly where an observed
+ * session went an octave wrong. `render_audio` is still the tool for anything
+ * no reference is driving, and `Where to start` says so.
+ */
 export const MATCHING_WORKFLOW = [
   'analyze_reference_audio',
-  'render_audio',
   'compare_audio',
   'update_parameters'
 ] as const
@@ -106,7 +114,7 @@ export function announcementSections(): readonly { title: string; body: string }
     {
       title: 'Sound-matching workflow',
       body: `To match a reference sound, call ${MATCHING_WORKFLOW.map(name => `\`${name}\``).join(' → ')}, then repeat that loop. ` +
-        'By default `compare_audio` renders the candidate at the reference\'s own detected pitch and returns a signed diff with ranked parameter moves; `suggest_patch` re-reads those moves without paying for another render. ' +
+        'There is no separate render step: `compare_audio` renders the candidate for you, at the reference\'s own detected pitch and duration, and returns a signed diff with ranked parameter moves. Call `render_audio` yourself only to choose the notes (`autoRender: false` then compares that render), or for sound design no reference is driving. `suggest_patch` re-reads the last comparison\'s ranked moves without paying for another render. ' +
         'Each `compare_audio` result carries a `progress` block with the best similarity so far against this reference, so stop when it reports a plateau rather than editing past your own best patch.'
     },
     { title: 'Where to start', body: `${START_HERE} ${PLAYBACK_NOTE}` },

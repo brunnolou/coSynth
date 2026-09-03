@@ -56,6 +56,18 @@ JavaScript. This file exists so that fact does not leave you with nothing.
 - **Play it live** — `play_notes` needs a human to click "CLICK TO START AUDIO"
   first, because browser autoplay policy requires a gesture. Offline rendering
   does not.
+- **Match a reference sound** — the loop is `analyze_reference_audio` →
+  `compare_audio` → `update_parameters`, repeated. Send the target as Base64 to
+  `analyze_reference_audio`, which analyzes it with the same metrics as synth
+  output and detects its pitch. Then `compare_audio`, which **renders the
+  candidate for you** at that detected pitch and duration and returns the
+  signed, per-dimension error plus ranked moves in this synth's parameter ids —
+  so there is no separate `render_audio` step, and no way to compare an
+  octave-off render whose scalars still look plausible. Apply a move with
+  `update_parameters` and compare again. `suggest_patch` re-reads the last
+  comparison's ranked moves with no render at all, and every `compare_audio`
+  result carries a `progress` block naming the best similarity so far, so you
+  can stop on a plateau instead of editing past your own best patch.
 - **Teach** — `show_ui_guide` drives an interactive walkthrough of the real UI
 - **Undo** — `get_history`, `navigate_history`, `replay_history`
 

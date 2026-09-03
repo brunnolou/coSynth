@@ -3,11 +3,13 @@ import assert from 'node:assert/strict'
 import { chromium } from 'playwright'
 
 // Every tool registers at page load and the set never changes across the
-// gesture. play_notes is registered but refuses until audio starts: an agent
-// that could not see it concluded playback was not a tool at all and went off
-// to drive the DOM instead.
-const TOOLS_AT_LOAD = 18
-const TOOLS_AFTER_AUDIO = 18
+// gesture, so one constant covers both sides of the Start click. play_notes is
+// registered but refuses until audio starts: an agent that could not see it
+// concluded playback was not a tool at all and went off to drive the DOM
+// instead.
+// Thirteen synth tools, four history tools, two guide tools. `webmcp-smoke.mjs`
+// holds the names; this file only ever needs the total.
+const TOOL_COUNT = 19
 
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined })
 try {
@@ -77,7 +79,7 @@ try {
     return page.evaluate(() => { window.__dragStop(); return window.__dragMutations })
   }
 
-  await page.waitForFunction(count => window.__historyTools.size === count, TOOLS_AT_LOAD)
+  await page.waitForFunction(count => window.__historyTools.size === count, TOOL_COUNT)
   const preAudio = await sounds()
   const octave = await page.locator('.oct-label').textContent()
   await page.keyboard.press('Control+z')
@@ -93,7 +95,7 @@ try {
   assert.equal(await page.locator('.driver-popover-description').textContent(), 'History works before audio starts.')
   await clearGuide()
   await page.locator('#start-btn').click()
-  await page.waitForFunction(count => window.__historyTools.size === count, TOOLS_AFTER_AUDIO)
+  await page.waitForFunction(count => window.__historyTools.size === count, TOOL_COUNT)
   await page.evaluate(() => {
     window.__historyNotes = []
     window.coSynth.onNote((midi, on) => window.__historyNotes.push({ midi, on }))

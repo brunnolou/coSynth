@@ -8,8 +8,8 @@
     <meta name="description" content="A synthesizer you control by talking to AI." />
     <!-- Agent discoverability: coSynth ships as a static site, so the page is its own AGENTS.md. -->
     <meta name="ai-tools" content="WebMCP; page-scoped via document.modelContext.registerTool; not in any ambient tool list" />
-    <meta name="ai-tool-names" content="get_synth_state, get_parameter_schema, update_parameters, set_modulation, play_notes, render_audio, analyze_audio, analyze_reference_audio, compare_audio, save_preset, load_preset, list_presets, get_history, navigate_history, replay_history, stop_performance, get_ui_targets, show_ui_guide" />
-    <meta name="ai-workflow" content="Match a sound with analyze_reference_audio -> render_audio -> compare_audio -> update_parameters, then repeat." />
+    <meta name="ai-tool-names" content="get_synth_state, get_parameter_schema, update_parameters, set_modulation, play_notes, render_audio, analyze_audio, analyze_reference_audio, compare_audio, suggest_patch, save_preset, load_preset, list_presets, get_history, navigate_history, replay_history, stop_performance, get_ui_targets, show_ui_guide" />
+    <meta name="ai-workflow" content="Match a sound with analyze_reference_audio -> compare_audio -> update_parameters, then repeat; compare_audio renders the candidate itself, so no separate render_audio step is needed. suggest_patch re-reads the last comparison's ranked moves for free. render_audio is for notes you choose yourself, or for sound design no reference is driving." />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Bitcount+Grid+Single:wght@100..900&amp;display=swap" rel="stylesheet" />
@@ -34,8 +34,11 @@
         coSynth exposes its live synthesizer engine to AI agents as page-scoped WebMCP tools, registered on this
         document through <code>document.modelContext.registerTool</code>. They will not appear in a global or ambient
         tool list, and a browsing context without the <code>webmcp</code> capability reports none of them on this same
-        URL. To match a reference sound, call <code>analyze_reference_audio</code>, then <code>render_audio</code>,
-        then <code>compare_audio</code>, then <code>update_parameters</code>, and repeat that loop.
+        URL. To match a reference sound, call <code>analyze_reference_audio</code>, then <code>compare_audio</code>,
+        then <code>update_parameters</code>, and repeat that loop. There is no separate render step:
+        <code>compare_audio</code> renders the candidate for you, at the reference's own detected pitch and duration,
+        and <code>suggest_patch</code> re-reads its ranked parameter moves without paying for another render. Call
+        <code>render_audio</code> yourself to choose the notes, or for sound design no reference is driving.
       </p>
     </section>
     <script type="module" src="/src/main.ts"></script>

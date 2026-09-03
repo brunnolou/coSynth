@@ -116,13 +116,21 @@ describe('agent announcement', () => {
   })
 
   it('spells out the sound-matching loop in order', () => {
+    // Three steps, deliberately. `compare_audio` renders its own candidate at
+    // the reference's detected pitch, so the `render_audio` call that used to
+    // sit between steps 1 and 2 cost a render an iteration and let an agent
+    // pick the note by hand — which is how one went an octave wrong.
     expect([...MATCHING_WORKFLOW]).toEqual([
-      'analyze_reference_audio', 'render_audio', 'compare_audio', 'update_parameters'
+      'analyze_reference_audio', 'compare_audio', 'update_parameters'
     ])
     const body = announcementText()
     const positions = MATCHING_WORKFLOW.map(name => body.indexOf(`\`${name}\``))
     expect(positions.every(position => position >= 0)).toBe(true)
     expect([...positions].sort((a, b) => a - b)).toEqual(positions)
+    // Dropped from the loop, not from the brief: it is still the only way to
+    // render anything no reference is driving.
+    expect(body).toContain('`render_audio`')
+    expect(body).toContain('`suggest_patch`')
   })
 
   it('warns about the false negatives that cost a real session a dozen calls', () => {

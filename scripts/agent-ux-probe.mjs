@@ -69,6 +69,9 @@ await page.waitForFunction(() => (window.__webMcpTools?.size ?? 0) > 0, { timeou
 const log = []
 let gestureAt = null
 
+/** A digital-silence floor: the analyzer reports -160 dB for an all-zero buffer. */
+const SILENT_PEAK_DB = -159
+
 /**
  * A few fields from each result, so the log alone shows what came back. Logging
  * whole results would bury the file in 64-point envelopes and PCM, but logging
@@ -89,7 +92,19 @@ function digest(result) {
     if (Array.isArray(metrics.spectralWindows)) {
       out.windowCentroidsHz = metrics.spectralWindows.map(w => w?.spectralCentroidHz)
     }
-    if (out.peakDb !== undefined && out.peakDb <= -159) out.SILENT = true
+    if (out.peakDb !== undefined && out.peakDb <= SILENT_PEAK_DB) out.SILENT = true
+  }
+  // `compare_audio` renders its own candidate now, and returns that render's
+  // metrics under `candidate` with nothing at the top level. The silence
+  // detector above therefore saw nothing for the one call that renders most
+  // often in a matching run: an all-zero buffer inside compare_audio logged as
+  // "ok, 900ms" and no more. An all-zero render was the single most valuable
+  // finding of the previous round, so the detector follows the metrics.
+  const candidateMetrics = result.candidate?.metrics
+  if (out.peakDb === undefined && candidateMetrics && typeof candidateMetrics === 'object' &&
+      typeof candidateMetrics.peakDb === 'number') {
+    out.peakDb = candidateMetrics.peakDb
+    if (candidateMetrics.peakDb <= SILENT_PEAK_DB) out.SILENT = true
   }
   for (const key of ['renderMode', 'renderModeFallback', 'retriggered', 'completed', 'noteCount', 'saved', 'loaded']) {
     if (key in result) out[key] = result[key]
@@ -218,8 +233,9 @@ const summarise = () => {
         guideStepCounts: guides.map(entry => Array.isArray(entry.input?.steps) ? entry.input.steps.length : null)
       }
     })(),
-    // Renders that came back as an all-zero buffer. This must stay at zero;
-    // a nonzero count means the offline path silently produced nothing.
+    // Renders that came back as an all-zero buffer, counting the one
+    // `compare_audio` performs for itself. This must stay at zero; a nonzero
+    // count means the offline path silently produced nothing.
     silentRenders: calls.filter(entry => entry.result?.SILENT).length,
     matchingLoop: summariseMatchingLoop(calls),
     startGestureDispatchedAtCall: gestureAt,
