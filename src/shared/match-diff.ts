@@ -28,11 +28,11 @@ import type {
   AudioMetricsComparison,
   SpectralWindow
 } from './audio-analysis'
-import { isMeasuredPartial, isSpectralWindowBelowNoiseFloor } from './audio-analysis'
+import {
+  BAND_CENTERS_HZ, isBandMeasurable, isMeasuredPartial, isSpectralWindowBelowNoiseFloor,
+  measuredTilt, nyquistOrUnbounded
+} from './audio-analysis'
 import type { HarmonicShape, MatchDiff } from './match-types'
-
-/** Octave band centres: 31.25 Hz doubled nine times, ending at 16 kHz. Mirrors the analyzer. */
-export const BAND_CENTERS_HZ: readonly number[] = Array.from({ length: 10 }, (_, index) => 31.25 * 2 ** index)
 
 /** The analyzer's partial count. */
 const HARMONIC_COUNT = 12
@@ -43,44 +43,6 @@ const HARMONIC_COUNT = 12
  * symmetric, so two equal centroids still read 0 octaves.
  */
 const BRIGHTNESS_FLOOR_HZ = 20
-
-/**
- * Highest frequency a buffer at this rate can carry, or `Infinity` when the rate is not
- * recorded - which a metrics object built by hand, or serialized before `sampleRateHz`
- * existed, is. `Infinity` never widens the limit the two sides are capped to, so a rate
- * missing on one side leaves the other side's rate doing the gating, and a pair with no rate
- * at all takes every band as measurable, exactly as it did before the flag existed.
- *
- * The same function as `nyquistOrUnbounded` in `audio-analysis.ts`, which is where the rule
- * is argued; it is private there, so this is a copy rather than an import. The agreement is
- * asserted rather than trusted: a test compares the bands this module leaves unmarked
- * against `details.bands.bandsCompared`, so the two cannot drift apart in silence.
- */
-const nyquistOrUnbounded = (sampleRateHz: number | undefined): number =>
-  typeof sampleRateHz === 'number' && Number.isFinite(sampleRateHz) && sampleRateHz > 0
-    ? sampleRateHz / 2
-    : Number.POSITIVE_INFINITY
-
-/**
- * Could the band at `index` hold energy below `limitHz`? Octave bands, so the band centred
- * at f spans f/sqrt(2) to f*sqrt(2); once its LOWER edge is above the limit there is nothing
- * in it to measure at any level. Mirrors `isBandMeasurable` in `audio-analysis.ts`.
- */
-const isBandMeasurable = (index: number, limitHz: number): boolean =>
-  BAND_CENTERS_HZ[index] / Math.SQRT2 < limitHz
-
-/**
- * `tiltDbPerOctave`, or `null` when the fit had nothing to fit.
- *
- * `measureHarmonicShape` writes 0 for a shape with fewer than two measurable partials and
- * says so: that 0 is "no tilt measurable", which is the same number a genuinely flat
- * spectrum produces. Subtracting one from the other therefore printed `(same slope)` about a
- * slope one side never had - a rendered sine floors partials 2-12, so it has exactly one
- * measurable partial and no slope at all. `measuredTilt` in `audio-analysis.ts` is this
- * function, and feeds the tilt term of the score; it is private there, so this is a copy.
- */
-const measuredTilt = (shape: HarmonicShape): number | null =>
-  shape.amplitudesDbRelF0.filter(isMeasuredPartial).length >= 2 ? shape.tiltDbPerOctave : null
 
 /**
  * `oddEvenDb`, or `null` when no partial at all was found.

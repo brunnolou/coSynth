@@ -288,10 +288,10 @@ describe('diffAudioMetrics', () => {
     // The old arithmetic, spelled out: this is the number that reached the formatter.
     expect(shapes.sine().tiltDbPerOctave - shapes.sine().tiltDbPerOctave).toBe(0)
 
-    // `measuredTilt` is private in `audio-analysis.ts`, so this module carries a copy of it.
+    // `measuredTilt` is imported from `audio-analysis.ts`, so both sides run one implementation.
     // `details.tilt.delta` is that copy's answer as the SCORE sees it - `harmonicTerm` writes
     // `candidate - reference`, or `null` when a side was unmeasurable - so asserting the two
-    // agree over every shape is what keeps the copy honest.
+    // agree over every shape is what keeps the diff and the score reading it the same way.
     for (const reference of Object.values(shapes)) {
       for (const candidate of Object.values(shapes)) {
         const pair = [withShape(reference()), withShape(candidate())] as const

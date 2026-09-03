@@ -105,17 +105,25 @@ const silentShape = (): AudioMetrics['harmonicShape'] => ({
 })
 
 /**
- * One row of the BANDS block, split back into its fixed-width cells. `row()` writes a
- * leading space, a 5-wide label and then 6-wide cells, so the payload starts at column 6.
+ * One raw row of the BANDS block. `row()` writes a space-prefixed label padded to `COLUMN`
+ * and then `COLUMN`-wide cells, so the payload starts at column `COLUMN` - both widths come
+ * from the formatter's own constant rather than from a literal repeated here.
+ *
+ * Found by label within the BANDS block specifically: PARTIALS carries a `d` row too, and a
+ * whole-text search for one would silently assert about the wrong block.
  */
-const bandRow = (text: string, label: 'hz' | 'db' | 'd'): string[] => {
+const bandLine = (text: string, label: 'hz' | 'db' | 'd'): string => {
   const lines = text.split('\n')
   const start = lines.findIndex((line) => line.startsWith('BANDS'))
   expect(start, 'BANDS').toBeGreaterThanOrEqual(0)
-  const line = lines.slice(start + 1).find((value) => value.startsWith(` ${label.padEnd(5)}`))
+  const line = lines.slice(start + 1).find((value) => value.startsWith(` ${label} `))
   expect(line, label).toBeDefined()
-  return (line!.slice(COLUMN).match(new RegExp(`.{${COLUMN}}`, 'g')) ?? []).map((cell) => cell.trim())
+  return line!
 }
+
+/** That row, split back into its fixed-width cells. */
+const bandRow = (text: string, label: 'hz' | 'db' | 'd'): string[] =>
+  (bandLine(text, label).slice(COLUMN).match(new RegExp(`.{${COLUMN}}`, 'g')) ?? []).map((cell) => cell.trim())
 
 /** Which band columns read `n/a`, in either block. */
 const naBands = (text: string, label: 'db' | 'd'): number[] =>
@@ -360,6 +368,38 @@ describe('formatDiff', () => {
     expect(brightness.split(' | ')).toHaveLength(4)
   })
 
+  /**
+   * The payload that motivated widening `COLUMN` from 6 to 7, and the reason the test above
+   * could not catch it: `signedDb1(-100)` is six characters, so at the old width two floored
+   * cells rendered flush - `-14.4-100.0+100.0`, with one value's minus sign doubling as the
+   * separator of the value before it. Every cell was still the same width and every boundary
+   * still fell on the same column, so the alignment assertions all passed on a row a reader
+   * cannot segment. What was missing was the assertion that a SEPARATOR survives, which is
+   * what a column width is for.
+   *
+   * -100 dB is `bandsDb`'s floor, so a floor on one side against a real level on the other is
+   * exactly how a +-100 pair arises - a band-limited sample against a full-range reference.
+   */
+  it('keeps a visible gap between cells at the +-100 dB extremes', () => {
+    const at = (bandsDb: number[]) => makeMetrics({ sampleRateHz: 48000, bandsDb })
+    const text = formatDiff(
+      diffAudioMetrics(
+        at([-40, -30, -22, -16, 0, -100, -18, -24, -32, -44]),
+        at([-41.2, -29.6, -19.9, -30.4, -100, 0, -22.4, -31.2, -41.8, -56]),
+        comparison(0.3)
+      ),
+      context
+    )
+    // No band is above the Nyquist at 48 kHz, so these are printed numbers rather than n/a.
+    expect(bandRow(text, 'd').slice(3, 6)).toEqual(['-14.4', '-100.0', '+100.0'])
+    expect(bandLine(text, 'd')).toContain('-14.4 -100.0 +100.0')
+    // The exact rendering the old width produced, stated so a narrowing cannot come back.
+    expect(bandLine(text, 'd')).not.toContain('-14.4-100.0')
+    // And the block is still a block: same length rows, boundaries on the same columns.
+    expect(bandLine(text, 'd').length).toBe(bandLine(text, 'hz').length)
+    for (const token of forbidden) expect(text).not.toContain(token)
+  })
+
   it('stays inside the token budget', () => {
     // ~4 characters per token; the block layout is ASCII, so the proxy is generous.
     expect(formatDiff(diffFixture(), context).length).toBeLessThan(4000)
@@ -393,6 +433,103 @@ describe('formatDiff', () => {
     expect(text).toContain(' 5. ')
     expect(text).not.toContain(' 6. ')
     for (const token of forbidden) expect(text).not.toContain(token)
+  })
+})
+
+/**
+ * A signed integer smaller than the unit it is printed in is still a MEASUREMENT, and the
+ * sign is all of it that survives the rounding. `signedDb1` has said so since it was fixed
+ * for this - `+0.0` dB is a small positive error, `0.0` is none - and `signedInt` guarded the
+ * ROUNDED value instead, so a +0.4 ms attack error and a true zero both printed `0`.
+ */
+describe('a signed integer smaller than its unit', () => {
+  /** Under half a millisecond late, and under half a millisecond early, against the same ref. */
+  const subMillisecond = () =>
+    formatDiff(
+      diffAudioMetrics(makeMetrics(), makeMetrics({ attackMs: 10.4, timeToPeakMs: 39.6 }), comparison(0.9)),
+      context
+    )
+
+  it('keeps the sign on an error too small to round to a whole unit', () => {
+    const text = subMillisecond()
+    expect(text).toContain('attack +0 ms')
+    expect(text).toContain('time-to-peak -0 ms')
+    for (const token of forbidden) expect(text).not.toContain(token)
+  })
+
+  it('prints an exact zero unsigned, so the two cannot be confused', () => {
+    const text = formatDiff(diffAudioMetrics(makeMetrics(), makeMetrics(), comparison(1)), context)
+    expect(text).toContain('attack 0 ms   time-to-peak 0 ms')
+    expect(text).not.toContain('attack +0 ms')
+    expect(text).not.toContain('attack -0 ms')
+    // Both renderings really are reachable from the same field, so an agreement of two
+    // identical strings is not what passed the pair.
+    expect(subMillisecond()).not.toContain('attack 0 ms')
+  })
+
+  /**
+   * The chosen rendering for cents, argued in `signedInt`: `-0c` keeps the direction, and a
+   * bound like `<1c` throws it away. The fixture's candidate really is 261.6 Hz, 0.17 cents
+   * under C4, and it used to read `C4 0c` - flat by a measured amount, printed as in tune.
+   */
+  it('says which side of the note a sub-cent offset falls on', () => {
+    const text = formatDiff(diffFixture(), context)
+    expect(text).toContain('you 261.6 Hz  C4 -0c')
+    expect(text).toContain('ref 261.9 Hz  C4 +2c')
+    // Not a tolerance band: the reader is told the direction, not merely the magnitude.
+    expect(text).not.toContain('<1c')
+  })
+
+  it('leaves an offset the analyzer reported as exactly zero unsigned', () => {
+    // `centsOffset` is carried on the pitch object rather than derived, so the candidate's
+    // own analysis says 0 - and that is a different fact from the -0.17 the same frequency
+    // derives against C4. The absolute block prints the first, the diff the second.
+    expect(formatMetrics(candidateMetrics())).toContain('pitch 261.6 Hz  C4 0c')
+    for (const token of forbidden) expect(formatMetrics(candidateMetrics())).not.toContain(token)
+  })
+})
+
+/**
+ * `MAX_ACTIONS` is a rendering cap, and `compare_audio` takes a `maxActions` input, so the
+ * two can disagree: eight ranked moves in `diff.actions` and five in the block. Dropping the
+ * other three in silence makes the block answer a question nobody asked - a list that was CUT
+ * reads exactly like a list that ENDED.
+ */
+describe('an actions block that printed fewer moves than it was given', () => {
+  const ranked = (count: number): MatchAction[] =>
+    Array.from({ length: count }, (_, index) => ({
+      ...RANKED_ACTIONS[index % RANKED_ACTIONS.length],
+      finding: `ranked move ${index + 1}`
+    }))
+  const block = (count: number) => formatDiff({ ...diffFixture(), actions: ranked(count) }, context)
+
+  it('says how many were dropped, why, and where the rest are', () => {
+    const text = block(8)
+    expect(text).toContain(' 5. ranked move 5')
+    expect(text).not.toContain('ranked move 6')
+    // The count of what is MISSING leads: the five that printed are visible already, and the
+    // number a reader needs is the one they cannot see.
+    expect(text).toContain('3 further ranked moves are not printed here')
+    // A layout limit rather than the advisor running out of findings.
+    expect(text).toContain('this block stops at 5')
+    // And the field that still has every one of them, named the way the other note names it.
+    expect(text).toContain('All 8 are in diff.actions')
+    expect(text).toContain('parameter ids and target values')
+    for (const token of forbidden) expect(text).not.toContain(token)
+  })
+
+  it('counts one dropped move in the singular', () => {
+    expect(block(6)).toContain('1 further ranked move is not printed here')
+    expect(block(6)).toContain('All 6 are in diff.actions')
+  })
+
+  it('adds nothing when every ranked move was printed', () => {
+    // The common path: `adviseFromDiff` at the default `maxActions` returns at most five, so
+    // a full block is byte-identical to what it printed before the note existed.
+    for (const count of [1, 3, 5]) {
+      expect(block(count), String(count)).not.toContain('further ranked')
+      expect(block(count), String(count)).not.toContain('diff.actions')
+    }
   })
 })
 

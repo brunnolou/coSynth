@@ -1,3 +1,61 @@
+/**
+ * A VALUE THAT COULD NOT BE MEASURED MUST NEVER BE PRESENTED AS THOUGH IT HAD BEEN.
+ *
+ * That one sentence is the same bug this module has now been fixed for seven times, across
+ * six files, and it never looked the same twice: a null term dropped from an unweighted
+ * mean, so a candidate that destroyed its own pitch scored 1.0; a window 55 dB down
+ * reporting a 4,978 Hz centroid, and with it a phantom 4.9-octave brightness swing; an
+ * all-gated brightness comparison falling back to scoring pure noise; a reference's -120 dB
+ * floor charged as candidate error, so an exact match scored 0.333; bands above the Nyquist
+ * scored as a free perfect match on both sides; `formatMetrics` printing `tilt 0.0 dB/oct`
+ * for a rendered sine, which has one partial and no slope; a suggestion list truncated in
+ * silence. Five reviewers and two eval runs found them, one at a time. The rule is written
+ * down here so the eighth is caught by someone reading rather than by a sixth reviewer.
+ *
+ * A measurement that could not be taken is neither agreement nor failure. It gets one of
+ * three treatments, and the test that picks between them is WHETHER AN AGENT CAN MOVE IT.
+ *
+ * - EXCLUDED FROM THE SCORE - `similarity: null`, and the term leaves the mean - when
+ *   neither side could measure it, or when only the reference could not. That is absence of
+ *   evidence about the target, and a candidate cannot reach that state by changing itself,
+ *   so it is not a lever. See `harmonicTerm` and `brightnessDetail`.
+ * - SCORED AS FAILURE - 0, or the full per-element clamp - when the reference measured it
+ *   and the candidate did not, and a patch move could have produced it. The reference
+ *   established that the dimension exists and what its value is. This is the only assignment
+ *   under which a candidate can never improve by losing a dimension the reference has. See
+ *   `harmonicTerm`, and the one-sided partial in `harmonicsDetail`.
+ * - SCORED AS AGREEMENT - 1, or no error at all - when both sides genuinely lack it and that
+ *   absence is itself a feature a patch can reproduce. A band-limited square's missing even
+ *   partials are the example: the only way to collect the credit is to actually reproduce
+ *   the reference's absence, which is the match. See `harmonicsDetail`.
+ *
+ * `bands` above the Nyquist and `harmonics` at the floor look like one case and land on
+ * opposite sides of that test. A missing partial is reachable - a patch move puts it back or
+ * takes it away - so its absence is a measurement and is scored. A band above
+ * `sampleRateHz / 2` is reachable by nothing: `bandsDb` reads its -100 floor there whatever
+ * the sound is, so scoring it hands out a free 1.000 or charges an error no patch can ever
+ * close, and either way it is a fact about the FILE rather than about the sound.
+ * `bandsDetail` drops those bands and reports `bandsCompared`, so a reader holding a
+ * ten-band table and an eight-band score can see which it was.
+ *
+ * THE SENTINEL RULE. `HARMONIC_AMPLITUDE_FLOOR_DB` (-120) says a partial is absent, which is
+ * a fact; how far down it reads is an artefact of the clamp, since the underlying reading was
+ * -240 or -Infinity. So every reader that consumes the NUMBER must drop it -
+ * `measureHarmonicShape`'s two least-squares fits, `measuredTilt`, and the printed deltas in
+ * `diffHarmonics` and `formatDiff` - while a reader needing only the FACT may keep it:
+ * `oddEvenDb`, and the absent-on-both credit in `harmonicsDetail`. `isMeasuredPartial` is
+ * the single predicate that answers "was this measured", exported so that no module answers
+ * it a second way. `BAND_FLOOR_DB` and `SPECTRAL_WINDOW_NOISE_GATE_DB` carry the same split,
+ * with `isBandMeasurable` and `isSpectralWindowBelowNoiseFloor` as their predicates.
+ *
+ * THE SAME DISCIPLINE GOVERNS WHAT IS PRINTED. An unmeasurable figure renders `n/a` with the
+ * reason it is unmeasurable - never a bare `0`, never a `null` or `undefined` reaching the
+ * page, and never a list silently truncated to a limit it does not mention. A score that
+ * excludes a term and a table that prints it as a number contradict each other in front of
+ * the agent, which is exactly how a fabricated 4.9-octave swing once ranked the wrong action
+ * first.
+ */
+
 import { fft } from './fft'
 import type { HarmonicShape, PitchEstimate } from './match-types'
 import { hzToNearestMidi } from './notes'
@@ -56,8 +114,10 @@ export interface AudioMetrics {
   /** Geometric over arithmetic mean of the power spectrum: 0 is tonal, 1 is noise. */
   spectralFlatness: number
   /**
-   * Four consecutive, equal, non-overlapping slices of the buffer, earliest first, each
-   * analysed on its own samples. Every other spectral field above collapses the whole
+   * Consecutive, equal, non-overlapping slices of the buffer, earliest first, each
+   * analysed on its own samples. Four of them unless `AnalyzeAudioOptions.windows` asked
+   * for more, so the two sides of a comparison can carry different counts and are aligned
+   * by position rather than by index. Every other spectral field above collapses the whole
    * buffer into one number, so a sound whose brightness *falls* - a piano, anything with
    * `env -> cutoff` - is indistinguishable from a steady one. Read the trend across these
    * to see that.
@@ -86,9 +146,12 @@ export interface AudioMetrics {
    * It exists because half of `bandsDb` can be unmeasurable. An octave band whose lower edge
    * sits above `sampleRateHz / 2` cannot hold energy, so it reads the -100 floor whatever the
    * sound is, and `bandsDetail` leaves those bands out rather than scoring them. Without a
-   * rate there is no way to tell that floor from a band that really is empty, so a comparison
-   * missing it on either side falls back to scoring all ten - today's behaviour, and the
-   * reason adding this field changes nothing for a pair of full-rate renders.
+   * rate there is no way to tell that floor from a band that really is empty, so a missing
+   * rate reads as an unbounded Nyquist (`nyquistOrUnbounded`) and the pair is gated by
+   * `Math.min` of the two. A rate on EITHER side therefore still gates the comparison, and
+   * only a pair carrying no rate on BOTH sides falls back to scoring all ten - which is why
+   * adding this field changes nothing for a pair of full-rate renders, and why a metrics
+   * object built by hand still gets gated when it is compared against a real analysis.
    */
   sampleRateHz?: number
 }
@@ -134,8 +197,9 @@ export interface SpectralWindow {
    * *any* slice, so both the overall decay and the per-partial decay rates are readable:
    * a piano's eighth partial falls tens of dB while its fundamental barely moves.
    *
-   * Present only when `analyzeAudio` was given a usable `f0Hz` and the slices are long
-   * enough to resolve partials; present on every slice or on none, never fabricated. On a
+   * Present only when a fundamental was available - supplied as `f0Hz` or detected by
+   * `resolvePitch`, the same source `harmonics` uses - and the slices are long enough to
+   * resolve partials; present on every slice or on none, never fabricated. On a
    * `belowNoiseFloor` slice these are peaks picked out of noise: the *level* they report is
    * real - the partials have gone - but their shape across n is not.
    *
@@ -357,15 +421,32 @@ const roundTenth = (value: number): number => {
   return rounded === 0 ? 0 : rounded
 }
 const BAND_COUNT = 10
-/** Octave band centres: 31.25 Hz doubled nine times, ending at 16 kHz. */
-const BAND_CENTERS_HZ = Array.from({ length: BAND_COUNT }, (_, index) => 31.25 * 2 ** index)
+/**
+ * Octave band centres: 31.25 Hz doubled nine times, ending at 16 kHz.
+ *
+ * Exported because this is where the bands are DEFINED - `measureBands` splits the spectrum
+ * on exactly these centres to produce `bandsDb` - so every consumer that labels, means or
+ * gates that array reads its axis from here. Restating it downstream, in `match-diff.ts`
+ * with `metrics-format.ts` importing it from there, put the definition of the bands below
+ * the analyzer that produces them.
+ */
+export const BAND_CENTERS_HZ: readonly number[] =
+  Array.from({ length: BAND_COUNT }, (_, index) => 31.25 * 2 ** index)
 const BAND_FLOOR_DB = -100
 /**
  * Highest frequency a buffer at this rate can carry, or `Infinity` when the rate is unknown
  * and every band therefore has to be taken as measurable - which is what a metrics object
  * built by hand, or serialized before `sampleRateHz` existed, gives us.
+ *
+ * `Infinity` never widens the limit a pair is capped to, since both sides go through
+ * `Math.min`: a rate present on one side alone still gates the comparison, and only a pair
+ * missing it on both takes every band as measurable.
+ *
+ * Exported alongside `isBandMeasurable` because the score, the diff and the printed table
+ * must gate the same bands - three copies of this rule is how `formatMetrics` and
+ * `formatDiff` came to need a test asserting they still agreed.
  */
-const nyquistOrUnbounded = (sampleRateHz: number | undefined): number =>
+export const nyquistOrUnbounded = (sampleRateHz: number | undefined): number =>
   typeof sampleRateHz === 'number' && Number.isFinite(sampleRateHz) && sampleRateHz > 0
     ? sampleRateHz / 2
     : Number.POSITIVE_INFINITY
@@ -374,8 +455,11 @@ const nyquistOrUnbounded = (sampleRateHz: number | undefined): number =>
  * at f spans f/sqrt(2) to f*sqrt(2); once its LOWER edge is above the limit there is nothing
  * in it to measure at any level. A band straddling the limit keeps its real, if partial,
  * content and stays in.
+ *
+ * The test is strict, so a band whose lower edge lands exactly on the limit is out: at the
+ * Nyquist itself there is no bandwidth left below it to hold anything.
  */
-const isBandMeasurable = (index: number, limitHz: number): boolean =>
+export const isBandMeasurable = (index: number, limitHz: number): boolean =>
   BAND_CENTERS_HZ[index] / Math.SQRT2 < limitHz
 const HARMONIC_COUNT = 12
 /** Partials quieter than this relative to the loudest are not real peaks; they do not constrain B. */
@@ -384,8 +468,9 @@ const HARMONIC_AMPLITUDE_FLOOR_DB = -120
 /**
  * Did this partial have a peak above the noise at all? The one predicate every reader of an
  * `amplitudesDbRelF0` entry shares - `measureHarmonicShape`'s two fits, `harmonicsDetail`,
- * `tiltMeasurable`, and `isMeasuredPartial` in `match-diff.ts`, which is this function under
- * that name because the two modules must not disagree about which partials exist.
+ * `measuredTilt`, and `diffHarmonics` / `measuredOddEven` in `match-diff.ts` and the partial
+ * columns in `metrics-format.ts`, both of which import it rather than restate it, because
+ * the three modules must not disagree about which partials exist.
  */
 export const isMeasuredPartial = (value: number | undefined): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value > HARMONIC_AMPLITUDE_FLOOR_DB
@@ -932,8 +1017,12 @@ function harmonicsDetail(
  * comparison contributed a fabricated "flat spectrum" reading to the score. Handing
  * `harmonicTerm` a `null` puts it under the rule already argued there: unmeasurable on the
  * reference is excluded, unmeasurable on the candidate alone is a measured failure at 0.
+ *
+ * Exported so `match-diff.ts` prints `(same slope)` about exactly the slopes this term
+ * scores. `undefined` is accepted as well as `null`, so a caller holding an optional
+ * `harmonicShape` need not restate the absent-shape case.
  */
-const measuredTilt = (shape: HarmonicShape | undefined): number | null =>
+export const measuredTilt = (shape: HarmonicShape | undefined): number | null =>
   shape !== undefined && shape.amplitudesDbRelF0.filter(isMeasuredPartial).length >= 2
     ? shape.tiltDbPerOctave
     : null
@@ -1163,8 +1252,9 @@ function risingHull(values: Float32Array): Float32Array {
  * Where the attack ends, and the level it reached. The global peak may arrive much later
  * (tremolo, unison beating, a swell), which is what `timeToPeakMs` reports.
  *
- * Measured as growth of the rising hull over PLATEAU_HOLD_MS, compared against the fastest
- * growth since onset. A fixed fractional growth per fixed hold cannot work: any rising
+ * Measured as growth of the rising hull over a window of at least `PLATEAU_HOLD_MS` that
+ * widens with elapsed time (`ATTACK_SPAN_FRACTION`), compared against the run's own AVERAGE
+ * growth since the buffer start. A fixed fractional growth per fixed hold cannot work: any rising
  * envelope's fractional growth per 10 ms drops below 8 % about 125 ms in, so every attack
  * longer than that read the same ~94 ms.
  */
@@ -1562,14 +1652,14 @@ function analyzeHarmonics(
 }
 
 /**
- * Spectral evolution across four equal slices of the buffer, earliest first.
+ * Spectral evolution across `windowCount` equal slices of the buffer, earliest first.
  *
  * Every slice is analysed *only* on its own samples - one FFT size, one tile count, chosen
  * from the shared slice length - so a value can be compared with the same value in the
  * slice before it. Slices are equal by construction rather than by dividing the buffer at
  * rounded boundaries: unequal spans would change the tile count and shift the raw partial
  * amplitudes that `harmonicsDb` compares across slices. The last few samples of a buffer
- * that does not divide by four are therefore not analysed, which `endMs` states.
+ * that does not divide by `windowCount` are therefore not analysed, which `endMs` states.
  *
  * Levels are relative to the loudest slice and partials to the loudest partial in any
  * slice, so a decay reads as a fall towards the floor instead of every slice reading 0.

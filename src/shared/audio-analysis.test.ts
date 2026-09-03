@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
-  analyzeAudio, compareAudioMetrics, isSpectralWindowBelowNoiseFloor, SPECTRAL_WINDOW_NOISE_GATE_DB,
+  analyzeAudio, BAND_CENTERS_HZ, compareAudioMetrics, isBandMeasurable,
+  isSpectralWindowBelowNoiseFloor, measuredTilt, nyquistOrUnbounded, SPECTRAL_WINDOW_NOISE_GATE_DB,
   type AudioMetrics, type AudioMetricsComparison, type ComparedMetricKey, type SpectralWindow
 } from './audio-analysis'
+import type { HarmonicShape } from './match-types'
 
 function sine(frequency: number, sampleRate: number, seconds: number, amplitude = 1, phase = 0): Float32Array {
   return Float32Array.from({ length: Math.round(sampleRate * seconds) }, (_, i) =>
@@ -1859,5 +1861,132 @@ describe('compareAudioMetrics', () => {
     expect(JSON.stringify(result)).not.toContain('null')
     const parsed = JSON.parse(JSON.stringify(result))
     expect(typeof parsed.similarity).toBe('number')
+  })
+})
+
+/**
+ * The predicates three modules share.
+ *
+ * `match-diff.ts` and `metrics-format.ts` each carried their own copy of these, kept honest
+ * by cross-module tests that asserted the copies still agreed. They import them now, so
+ * these tests pin the contract itself rather than the agreement between restatements.
+ */
+describe('shared measurement predicates', () => {
+  describe('nyquistOrUnbounded', () => {
+    it('halves a real rate and reads anything else as unbounded', () => {
+      expect(nyquistOrUnbounded(48000)).toBe(24000)
+      expect(nyquistOrUnbounded(16000)).toBe(8000)
+      // Absent, or not a rate at all: unbounded, never a limit of 0 that would gate every
+      // band. A metrics object built by hand or serialized before `sampleRateHz` existed
+      // must score exactly as it did before the field.
+      for (const value of [undefined, 0, -44100, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(nyquistOrUnbounded(value)).toBe(Number.POSITIVE_INFINITY)
+      }
+    })
+
+    it('lets one side gate the pair, and falls back only when both sides lack a rate', () => {
+      const limitHz = (reference?: number, candidate?: number) =>
+        Math.min(nyquistOrUnbounded(reference), nyquistOrUnbounded(candidate))
+      // Neither side missing: the lower of the two, so a 16 kHz reference cuts the same band
+      // off a 48 kHz render.
+      expect(limitHz(16000, 48000)).toBe(8000)
+      expect(limitHz(48000, 16000)).toBe(8000)
+      // Missing on ONE side: `Infinity` never widens a `Math.min`, so the side that does
+      // carry a rate still gates the pair. This is the sentence `AudioMetrics.sampleRateHz`
+      // used to get backwards.
+      expect(limitHz(undefined, 16000)).toBe(8000)
+      expect(limitHz(16000, undefined)).toBe(8000)
+      // Missing on BOTH: nothing to gate with, so every band is taken as measurable.
+      expect(limitHz(undefined, undefined)).toBe(Number.POSITIVE_INFINITY)
+    })
+
+    it('gates exactly the bands `compareAudioMetrics` scored', () => {
+      const measurableCount = (limit: number) =>
+        BAND_CENTERS_HZ.filter((_, index) => isBandMeasurable(index, limit)).length
+      const rates: (number | undefined)[][] = [
+        [16000, 48000], [undefined, 16000], [16000, undefined],
+        [44100, 44100], [undefined, undefined], [40, 40]
+      ]
+      for (const [referenceRate, candidateRate] of rates) {
+        const reference: AudioMetrics = { ...referenceMetrics, sampleRateHz: referenceRate }
+        const candidate: AudioMetrics = { ...referenceMetrics, sampleRateHz: candidateRate }
+        expect(compareAudioMetrics(reference, candidate).details.bands.bandsCompared).toBe(
+          measurableCount(Math.min(nyquistOrUnbounded(referenceRate), nyquistOrUnbounded(candidateRate)))
+        )
+      }
+    })
+  })
+
+  describe('isBandMeasurable', () => {
+    it('keeps a band straddling the limit and drops one entirely above it', () => {
+      // 16 kHz: Nyquist 8 kHz. The band centred at 8 kHz starts at 5.66 kHz and holds real,
+      // if partial, content; the one centred at 16 kHz starts at 11.3 kHz and holds nothing
+      // at any level, so `bandsDb` reads its floor there whatever the sound is.
+      const limitHz = nyquistOrUnbounded(16000)
+      expect(isBandMeasurable(8, limitHz)).toBe(true)
+      expect(isBandMeasurable(9, limitHz)).toBe(false)
+      expect(BAND_CENTERS_HZ.every((_, index) => isBandMeasurable(index, Number.POSITIVE_INFINITY))).toBe(true)
+    })
+
+    it('excludes a band whose lower edge sits exactly on the limit', () => {
+      // The boundary is strict on purpose: at the Nyquist itself there is no bandwidth left
+      // below it for the band to hold anything in.
+      const index = 9
+      const lowerEdgeHz = BAND_CENTERS_HZ[index] / Math.SQRT2
+      expect(isBandMeasurable(index, lowerEdgeHz)).toBe(false)
+      expect(isBandMeasurable(index, lowerEdgeHz - 1e-6)).toBe(false)
+      expect(isBandMeasurable(index, lowerEdgeHz + 1e-6)).toBe(true)
+      // Reached the way a comparison reaches it, from a sample rate. Doubling and halving a
+      // double are both exact, so the edge case is representable rather than theoretical.
+      expect(isBandMeasurable(index, nyquistOrUnbounded(2 * lowerEdgeHz))).toBe(false)
+    })
+  })
+
+  describe('measuredTilt', () => {
+    /** `amplitudesDbRelF0` with the first `measured` partials above the noise, the rest on the -120 dB floor. */
+    const partials = (measured: number): number[] =>
+      Array.from({ length: 12 }, (_, index) =>
+        index < measured ? Math.round(-60 * Math.log10(index + 1)) / 10 : -120)
+    const shape = (measured: number, tiltDbPerOctave = -6): HarmonicShape => ({
+      amplitudesDbRelF0: partials(measured),
+      tiltDbPerOctave,
+      oddEvenDb: 0
+    })
+
+    it('is null below two measurable partials, whatever the field says', () => {
+      // `measureHarmonicShape` writes 0 for these, and 0 is also what a genuinely flat
+      // spectrum produces - the rendered sine that printed `tilt 0.0 dB/oct` and scored as a
+      // measured flat spectrum. One partial is not a slope.
+      expect(measuredTilt(undefined)).toBeNull()
+      expect(measuredTilt(shape(0, 0))).toBeNull()
+      expect(measuredTilt(shape(1, 0))).toBeNull()
+      // Not a floor-depth question either: a shape whose lone partial claims a real slope is
+      // still unmeasurable, because the count is what decides.
+      expect(measuredTilt(shape(1, -6))).toBeNull()
+    })
+
+    it('is the fitted slope at two measurable partials and above', () => {
+      expect(measuredTilt(shape(2))).toBe(-6)
+      expect(measuredTilt(shape(3))).toBe(-6)
+      expect(measuredTilt(shape(12))).toBe(-6)
+      // The field is read, never recomputed: this is the one number `measureHarmonicShape`
+      // fitted, and the count only decides whether it means anything.
+      expect(measuredTilt(shape(12, 0))).toBe(0)
+      expect(measuredTilt(shape(2, 3.5))).toBe(3.5)
+    })
+
+    it('scores an unmeasurable candidate tilt as failure and an unmeasurable reference as excluded', () => {
+      // The asymmetry `harmonicTerm` draws, reached through this predicate: a candidate that
+      // loses the dimension stays in the mean at 0, so no candidate improves by flattening
+      // itself out of measurability.
+      const withShape = (measured: number): AudioMetrics => ({
+        ...referenceMetrics,
+        harmonicShape: shape(measured),
+        harmonics: { amplitudesDb: partials(measured), inharmonicity: 1e-4 }
+      })
+      expect(compareAudioMetrics(withShape(12), withShape(1)).details.tilt.similarity).toBe(0)
+      expect(compareAudioMetrics(withShape(1), withShape(12)).details.tilt.similarity).toBeNull()
+      expect(compareAudioMetrics(withShape(1), withShape(1)).details.tilt.similarity).toBe(1)
+    })
   })
 })

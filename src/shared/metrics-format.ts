@@ -17,33 +17,53 @@
  */
 
 import type { AudioMetrics } from './audio-analysis'
-import { isMeasuredPartial, isSpectralWindowBelowNoiseFloor } from './audio-analysis'
-import { BAND_CENTERS_HZ } from './match-diff'
+import {
+  BAND_CENTERS_HZ, isBandMeasurable, isMeasuredPartial, isSpectralWindowBelowNoiseFloor,
+  nyquistOrUnbounded
+} from './audio-analysis'
 import type { MatchAction, MatchDiff } from './match-types'
 import { hzToNearestMidi, noteName } from './notes'
 
 /**
- * Width of one partial or band column. Wide enough for `-100.0`, the band floor, and for a
- * 5-cell bar.
+ * Width of one partial or band column, INCLUDING the space that separates it from the cell
+ * on its left. Seven, because the widest cell is six: `signedDb1(-100)` renders `-100.0`,
+ * the band floor, and `signedDb1(+100)` the same length again.
+ *
+ * At six it was exactly the width of that widest cell and no more, so two floored cells sat
+ * flush against each other and a real BANDS row read `-14.4-100.0+100.0` - three numbers a
+ * reader has to re-segment by eye, and the minus sign of the second doing double duty as the
+ * separator of the first. A column that only separates the values it happens to have seen is
+ * the same defect as a figure that only reports the cases it could measure: the row LOOKS
+ * uniform right up to the payload that breaks it, and the payload that breaks it is a
+ * near-Nyquist band, which is exactly when a reader is trying to work out what is real.
  *
  * Exported so the tests slice rows by this rather than by a literal 6 - they asserted the
  * width they assumed rather than the width the formatter uses, which meant an alignment test
- * that could agree with a wrong answer.
- *
- * Known limitation: `signedDb1(-100)` is exactly six characters, so two floored cells sit
- * flush against each other (`-14.4-100.0+100.0`). Widening to 7 also needs the label prefix
- * and both snapshots moved; worth doing on its own rather than inside a batch.
+ * that could agree with a wrong answer. `row()` derives the LABEL field from it for the same
+ * reason: the label used to be padded to a hardcoded 5 behind a hardcoded leading space, so
+ * it occupied a column's width by coincidence, and widening the cells alone silently knocked
+ * every row one character out of true.
  */
-export const COLUMN = 6
+export const COLUMN = 7
 /** Partials at or below this read as absent from the sparkline rather than as a short bar. */
 const SPARK_FLOOR_DB = -40
-/** Tallest bar. Five cells fit inside `COLUMN` with a separating space, so rows stay aligned. */
+/**
+ * Tallest bar, and deliberately NOT derived from `COLUMN`: the cell count is the sparkline's
+ * resolution - `SPARK_FLOOR_DB / SPARK_MAX` dB per cell, and `SPARK_DELTA_DB` per cell on the
+ * delta row - so tying it to the column width would silently rescale what the bars MEAN every
+ * time the layout moved. It only has to fit, which `SPARK_MAX < COLUMN` guarantees: five cells
+ * inside a seven-wide column leave two spaces, so a full-height bar never touches its
+ * neighbour and the rows stay aligned.
+ */
 const SPARK_MAX = 5
 /** dB of signed error per bar cell in a delta sparkline. */
 const SPARK_DELTA_DB = 3
 /** Beyond this the pitch line is flagged; inside it, a match. */
 const PITCH_OK_CENTS = 5
-/** `formatDiff` renders at most this many actions, in the order given. */
+/**
+ * `formatDiff` renders at most this many actions, in the order given, and SAYS SO when it
+ * drops any - see `truncatedActionsNote`.
+ */
 const MAX_ACTIONS = 5
 
 /**
@@ -95,19 +115,16 @@ const NYQUIST_BAND_NOTE = {
  * metrics object built by hand, or serialized before `sampleRateHz` existed, which then
  * takes every band as measurable exactly as it did before the flag.
  *
- * The same rule as `nyquistOrUnbounded` / `isBandMeasurable` in `match-diff.ts`, which is
- * where it is argued, and as their originals in `audio-analysis.ts`; both are private to
- * their modules, so this is a third statement of it rather than an import. It is asserted
- * rather than trusted: a test below renders an `AudioMetrics` through `formatMetrics` and a
- * self-diff of it through `formatDiff`, and requires the two to mark the SAME bands, so this
- * copy cannot drift away from the flag whose meaning it is printing.
+ * `nyquistOrUnbounded` and `isBandMeasurable` come from `audio-analysis.ts`, which defines
+ * the bands and argues the rule. This was a third hand-written statement of it until those
+ * two were exported. The test below still earns its keep: it renders an `AudioMetrics`
+ * through `formatMetrics` and a self-diff of it through `formatDiff` and requires the two to
+ * mark the SAME bands, which now checks that both call sites read the shared predicate
+ * rather than that three copies happen to agree.
  */
 const measurableBands = (sampleRateHz: number | undefined): boolean[] => {
-  const limitHz =
-    typeof sampleRateHz === 'number' && Number.isFinite(sampleRateHz) && sampleRateHz > 0
-      ? sampleRateHz / 2
-      : Number.POSITIVE_INFINITY
-  return BAND_CENTERS_HZ.map((centerHz) => centerHz / Math.SQRT2 < limitHz)
+  const limitHz = nyquistOrUnbounded(sampleRateHz)
+  return BAND_CENTERS_HZ.map((_, index) => isBandMeasurable(index, limitHz))
 }
 
 /**
@@ -144,10 +161,28 @@ const signedDb1 = (value: number | null | undefined): string => {
   return `${value > 0 ? '+' : '-'}${Math.abs(value).toFixed(1)}`
 }
 const int = (value: number | null | undefined): string => (finite(value) ? String(Math.round(value)) : 'n/a')
+/**
+ * `signedDb1`'s rule on the integer units: the guard is on the VALUE, never on the rounded
+ * value, so an unsigned `0` means an exact zero and nothing else.
+ *
+ * It guarded the rounded value, and that made the two facts a reader most needs to tell
+ * apart print identically: a +0.4 ms attack error and a true zero both rendered `0`. That is
+ * this file's recurring defect in miniature - a measurement that WAS made, reported as
+ * though it had not been - and it is the one the sign exists to prevent, since below one
+ * unit the sign is the entire remaining content of the reading.
+ *
+ * A sub-unit reading therefore prints `+0` / `-0`, ugly and honest, rather than a bound like
+ * `<1c`. The bound is prettier and throws away the half of the datum that survived the
+ * rounding: `<1c` cannot say WHICH SIDE, and direction is the thing every block header here
+ * spends a clause establishing (`you - ref`). `-0c` costs a reader one beat to parse and
+ * then tells them the truth - flat, by less than a cent - while `<1c` reads as a tolerance
+ * band and quietly asks them to guess. It also keeps one rule across the file: `+0.0` dB has
+ * meant exactly this since the dB renderer was fixed for the same bug.
+ */
 const signedInt = (value: number | null | undefined): string => {
   if (!finite(value)) return 'n/a'
-  const rounded = Math.round(value)
-  return rounded === 0 ? '0' : `${rounded > 0 ? '+' : '-'}${Math.abs(rounded)}`
+  if (value === 0) return '0'
+  return `${value > 0 ? '+' : '-'}${Math.abs(Math.round(value))}`
 }
 const ratio2 = (value: number | null | undefined): string => (finite(value) ? value.toFixed(2) : 'n/a')
 /** Similarity keeps three decimals: the eval trajectories are read at that resolution. */
@@ -253,9 +288,15 @@ const deltaBar = (db: number | null): string => {
   return (db > 0 ? '+' : '-').repeat(cells)
 }
 
-/** A row of fixed-width cells behind a fixed-width label, so every column lines up. */
+/**
+ * A row of fixed-width cells behind a LABEL FIELD OF THE SAME WIDTH, so every column lines
+ * up. The label used to be padded to a hardcoded 5 behind a hardcoded leading space, which
+ * happened to total `COLUMN` while `COLUMN` was 6; the two could disagree and the rows would
+ * still look plausible, just shifted. Padding the space-prefixed label to `COLUMN` makes the
+ * agreement structural.
+ */
 const row = (label: string, cells: string[]): string =>
-  ` ${label.padEnd(5)}${cells.map((cell) => pad(cell)).join('')}`
+  `${` ${label}`.padEnd(COLUMN)}${cells.map((cell) => pad(cell)).join('')}`
 
 const heading = (values: readonly unknown[]): string =>
   row('n', values.map((_, index) => String(index + 1)))
@@ -387,6 +428,35 @@ export function formatMetrics(metrics: AudioMetrics): string {
   return lines.join('\n')
 }
 
+/**
+ * What the block says when it printed fewer moves than it was given.
+ *
+ * `MAX_ACTIONS` is a rendering cap and nothing else, while `compare_audio` takes a
+ * `maxActions` input: a caller who asks for eight gets eight in `diff.actions` and five
+ * here. Truncating them away in silence makes the block answer a question it was never
+ * asked - an agent reads five ranked moves ending at 5. and concludes that is all the advice
+ * there is, which is the absence-as-measurement error `n/a` exists to prevent everywhere
+ * else in this file, one axis over: a list that was CUT and a list that ENDED look the same.
+ *
+ * The fix is the one already applied one field over, where the block collapses to a pointer
+ * line that states `diff.actions.length` rather than the five it would have printed. Same
+ * honesty here: lead with the number dropped, name the cap that dropped them so the reader
+ * knows this is a layout limit rather than the advisor running out, and name the field that
+ * still has all of them.
+ *
+ * It costs nothing on the common path. `adviseFromDiff` at the default `maxActions` returns
+ * at most five, and text mode ships the moves structurally and prints no block at all, so
+ * this line appears only for the caller that actually asked for more than fits.
+ */
+const truncatedActionsNote = (total: number): string => {
+  const dropped = total - MAX_ACTIONS
+  return (
+    ` ${dropped} further ranked ${dropped === 1 ? 'move is' : 'moves are'} not printed here:` +
+    ` this block stops at ${MAX_ACTIONS}. All ${total} are in diff.actions,` +
+    ' with the parameter ids and target values to apply them.'
+  )
+}
+
 function formatActions(actions: readonly MatchAction[]): string[] {
   const lines: string[] = ['', 'ACTIONS  ranked, best first']
   actions.slice(0, MAX_ACTIONS).forEach((action, index) => {
@@ -396,6 +466,7 @@ function formatActions(actions: readonly MatchAction[]): string[] {
       : `${action.direction} ${action.paramIds.join(', ') || 'n/a (no parameter mapped)'}`
     lines.push(`    -> ${move}  [${action.confidence}]`)
   })
+  if (actions.length > MAX_ACTIONS) lines.push(truncatedActionsNote(actions.length))
   return lines
 }
 
