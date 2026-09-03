@@ -1,0 +1,49 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`formatDiff > renders the match payload 1`] = `
+"MATCH  ref "bell-c4.wav"  |  comparison 3  |  best so far 0.588
+overall 0.612   (all deltas below are you - ref)
+
+PITCH   ref 261.9 Hz  C4 +2c   you 261.6 Hz  C4 0c   ->  -2 cents   ok
+
+PARTIALS  dB relative to the fundamental, signed error (you - ref)
+ n         1     2     3     4     5     6     7     8     9    10    11    12
+ d       0.0  -8.6  -6.4  -4.8  -2.1  -2.3  -4.1  -6.6 -10.1 -11.9 -13.4 -15.0
+ bar       ·   ---    --    --     -     -     -    --   ---  ----  ---- -----
+  tilt -5.3 dB/oct  (you darker)   odd/even +4.1 dB   inharm -3.1e-4
+  n/a in a column means that partial was above the noise on one side only.
+
+BANDS   dB vs total power, signed error (you - ref)
+ hz       31    63   125   250   500    1k    2k    4k    8k   16k
+ d      -1.2  +0.4  +2.1  +3.0  +0.8  -1.9  -4.4  -7.2  -9.8 -12.0
+
+ENVELOPE  signed error (you - ref)
+  attack +4 ms   time-to-peak -12 ms   T60 -210 ms   sustain -6.2 dB
+
+BRIGHTNESS  centroid, octaves (you - ref), per window
+  0-165ms -0.31 | 165-330ms -0.61 | 330-495ms -1.02 | 495-660ms -1.45
+
+OTHER   flatness -0.18   width -0.22   loudness -1.4 dB"
+`;
+
+exports[`formatMetrics > renders a standalone analysis 1`] = `
+"SOUND
+  pitch 261.9 Hz  C4 +2c  (conf 0.91, detected)
+  loudness -16.0 dB   peak -1.0 dB   flatness 0.20   width 0.30
+
+PARTIALS  dB relative to the fundamental
+ n         1     2     3     4     5     6     7     8     9    10    11    12
+ db      0.0  -6.2  -3.1 -11.4 -18.0 -22.7 -26.1 -30.0 -34.2 -38.1 -41.7 -45.0
+ bar   #####  #### #####  ####   ###    ##    ##     #     #     #     .     .
+  tilt -6.1 dB/oct   odd/even +2.8 dB   inharm 3.1e-4
+
+BANDS   dB vs total power
+ hz       31    63   125   250   500    1k    2k    4k    8k   16k
+ db    -40.0 -30.0 -22.0 -16.0 -12.0 -14.0 -18.0 -24.0 -32.0 -44.0
+
+ENVELOPE
+  attack 10 ms   time-to-peak 40 ms   T60 800 ms   sustain -6.0 dB
+
+BRIGHTNESS  centroid Hz, per window
+  0-165ms 2000 | 165-330ms 1600 | 330-495ms 1200 | 495-660ms 900"
+`;
