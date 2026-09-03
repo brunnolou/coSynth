@@ -1,4 +1,7 @@
 import { fft } from './fft'
+import type { HarmonicShape, PitchEstimate } from './match-types'
+import { hzToNearestMidi } from './notes'
+import { detectPitch } from './pitch'
 
 export interface AudioMetrics {
   peakDb: number
@@ -44,8 +47,18 @@ export interface AudioMetrics {
    * to see that.
    */
   spectralWindows: SpectralWindow[]
-  /** Present only when `analyzeAudio` was given an `f0Hz`; never fabricated. */
+  /**
+   * Present whenever a fundamental was available - supplied as `f0Hz` or measured here -
+   * and the buffer held partials to measure. Never fabricated.
+   */
   harmonics?: HarmonicMetrics
+  /**
+   * The fundamental this analysis used, whether supplied by the caller or measured here.
+   * `null` when nothing periodic was found, which is also when `harmonics` is absent.
+   */
+  pitch?: PitchEstimate | null
+  /** Present whenever `harmonics` is. The two axes a wavetable synth actually has. */
+  harmonicShape?: HarmonicShape
 }
 
 /** One time slice of the buffer. See `AudioMetrics.spectralWindows`. */
@@ -91,10 +104,26 @@ export interface HarmonicMetrics {
 
 export interface AnalyzeAudioOptions {
   /**
-   * Fundamental of the tone in Hz. Supply it for a single-pitch render and the analyzer
-   * adds `harmonics`; without it `harmonics` is absent rather than guessed.
+   * Fundamental of the tone in Hz. Supply it for a single-pitch render - a rendered
+   * candidate knows its own MIDI note - and the analyzer skips detection entirely.
    */
   f0Hz?: number
+  /**
+   * Detect the fundamental when `f0Hz` is absent. Defaults to **true**.
+   *
+   * Without this an uploaded reference file could never grow a `harmonics` block, while a
+   * rendered candidate always did: the model saw its own spectrum and not the target's,
+   * which is the asymmetry that made harmonic matching unusable. Set it to `false` only
+   * for material that has no single fundamental - a drum loop, a chord, noise - where the
+   * cost of the detector outweighs a result it will refuse anyway.
+   */
+  detectPitch?: boolean
+  /**
+   * Number of spectral windows. Defaults to `SPECTRAL_WINDOW_COUNT` (4); 4…32 inclusive.
+   * More windows resolve a faster-moving filter sweep at a proportional cost in response
+   * size, since each window carries its own 12 partials.
+   */
+  windows?: number
 }
 
 /** Metrics `compareAudioMetrics` scores one against one. */
@@ -144,6 +173,17 @@ export interface AudioMetricsComparison {
      * which `spectralCentroidHz` alone cannot.
      */
     & { brightness: AudioMetricComparisonDetail }
+    /**
+     * Mean per-partial dB difference across `harmonicShape.amplitudesDbRelF0`, each partial
+     * capped at `HARMONIC_ERROR_CLAMP_DB` and read linearly against that cap - the
+     * `bandsDetail` treatment, for the same reason. reference/candidate are their mean
+     * levels relative to the fundamental.
+     */
+    & { harmonics: NullableMetricComparisonDetail }
+    /** From `harmonicShape.tiltDbPerOctave`: one number for brighter versus darker. */
+    & { tilt: NullableMetricComparisonDetail }
+    /** From `harmonics.inharmonicity`: computed since the first harmonic pass, never scored until now. */
+    & { inharmonicity: NullableMetricComparisonDetail }
 }
 
 const clampSimilarity = (value: number): number => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0))
@@ -190,6 +230,13 @@ const SPECTRAL_FFT_MAX = 4096
  * unconditionally. A spectrogram would be no harder to compute and useless to read.
  */
 const SPECTRAL_WINDOW_COUNT = 4
+/**
+ * Bounds on `AnalyzeAudioOptions.windows`. The floor is the four windows the reasoning
+ * above settles on; the ceiling keeps the worst case - 32 x 12 partials - inside the same
+ * order of magnitude as the rest of the response.
+ */
+const SPECTRAL_WINDOW_COUNT_MIN = 4
+const SPECTRAL_WINDOW_COUNT_MAX = 32
 /** A window with a shorter FFT than this cannot resolve partials; `harmonicsDb` is omitted. */
 const SPECTRAL_WINDOW_MIN_HARMONIC_FFT = 256
 /**
@@ -198,6 +245,30 @@ const SPECTRAL_WINDOW_MIN_HARMONIC_FFT = 256
  * and starts reporting how deep `BAND_FLOOR_DB` is.
  */
 const BAND_ERROR_CLAMP_DB = 20
+/**
+ * Largest per-partial dB gap the harmonic comparison counts, and the same 20 dB as
+ * `BAND_ERROR_CLAMP_DB` for the same reason: 20 dB below the fundamental is 1 % of its
+ * power, past which the two sounds share nothing in that partial and further dB report how
+ * deep `HARMONIC_AMPLITUDE_FLOOR_DB` is rather than anything about the timbre. Without a cap
+ * the -120 dB floor entries a square wave's even partials produce would dominate every
+ * comparison it takes part in, exactly as the empty octave bands once did.
+ */
+const HARMONIC_ERROR_CLAMP_DB = 20
+/**
+ * Exponential scale for the spectral-tilt difference. A sawtooth falls about 6 dB/octave and
+ * a flat spectrum 0, so 3 dB/octave is half that full span: half a "saw versus flat" apart
+ * scores e^-1 = 0.37, and the audible range of tilts covers most of 0…1 instead of pinning
+ * every plausible candidate near either end.
+ */
+const TILT_SCALE_DB_PER_OCTAVE = 3
+/**
+ * B is compared as a ratio, not a difference: the useful range spans four orders of
+ * magnitude (an organ at 0, a guitar near 1e-4, a piano 1e-4…1e-3, bell-like partials
+ * higher). The floor is where stretching stops being audible, so two effectively harmonic
+ * series score 1 instead of being separated by their measurement noise; a factor of 4 is
+ * roughly one step along that instrument ladder.
+ */
+const INHARMONICITY_FLOOR = 1e-4
 /** The per-window centroid trajectory is compared in octaves, on this scale. */
 const BRIGHTNESS_SCALE_OCTAVES = 0.5
 /** Added to both centroids before the ratio, so a silent window is not a divide by zero. */
@@ -223,8 +294,17 @@ const assertBandsDb = (label: string, values: unknown): number[] =>
   assertNumberArray(label, 'bandsDb', values, BAND_COUNT)
 
 function assertSpectralWindows(label: string, value: unknown): SpectralWindow[] {
-  if (!Array.isArray(value) || value.length !== SPECTRAL_WINDOW_COUNT) {
-    throw new Error(`${label}.spectralWindows must be an array of ${SPECTRAL_WINDOW_COUNT} windows`)
+  // A range rather than an exact count, since `AnalyzeAudioOptions.windows` lets one side
+  // have been analysed at a finer resolution than the other.
+  if (
+    !Array.isArray(value) ||
+    value.length < SPECTRAL_WINDOW_COUNT_MIN ||
+    value.length > SPECTRAL_WINDOW_COUNT_MAX
+  ) {
+    throw new Error(
+      `${label}.spectralWindows must be an array of ` +
+      `${SPECTRAL_WINDOW_COUNT_MIN}…${SPECTRAL_WINDOW_COUNT_MAX} windows`
+    )
   }
   for (const window of value) {
     if (!window || typeof window !== 'object') {
@@ -341,10 +421,17 @@ function brightnessDetail(
 ): AudioMetricComparisonDetail {
   const mean = (windows: readonly SpectralWindow[]) =>
     windows.reduce((sum, window) => sum + window.spectralCentroidHz, 0) / windows.length
+  // The two sides may have been analysed at different `windows` resolutions. Each window
+  // is a fixed *fraction* of its own buffer, so index i of a 4-window run and index i of a
+  // 16-window run describe different spans; the trajectories are therefore resampled onto
+  // the coarser grid by position rather than compared index for index.
+  const points = Math.min(reference.length, candidate.length)
+  const at = (windows: readonly SpectralWindow[], index: number) =>
+    windows[Math.min(windows.length - 1, Math.round(index * (windows.length - 1) / (points - 1)))]
   let absoluteError = 0
-  for (let index = 0; index < reference.length; index++) {
-    const left = Math.max(0, reference[index].spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
-    const right = Math.max(0, candidate[index].spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
+  for (let index = 0; index < points; index++) {
+    const left = Math.max(0, at(reference, index).spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
+    const right = Math.max(0, at(candidate, index).spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
     absoluteError += Math.abs(Math.log2(right / left))
   }
   const referenceMean = mean(reference)
@@ -353,7 +440,7 @@ function brightnessDetail(
     reference: referenceMean,
     candidate: candidateMean,
     delta: candidateMean - referenceMean,
-    similarity: exponentialSimilarity(absoluteError / reference.length, BRIGHTNESS_SCALE_OCTAVES)
+    similarity: exponentialSimilarity(absoluteError / points, BRIGHTNESS_SCALE_OCTAVES)
   }
 }
 
@@ -364,6 +451,74 @@ function envelopeDetail(reference: readonly number[], candidate: readonly number
   const referenceMean = mean(reference)
   const candidateMean = mean(candidate)
   return { reference: referenceMean, candidate: candidateMean, delta: candidateMean - referenceMean, similarity }
+}
+
+/**
+ * The shared shape of every harmonic comparison term.
+ *
+ * Timbre is measurable on a side only when that side has a usable fundamental. Exactly one
+ * side missing it is an absence of evidence - `similarity: null`, excluded from the overall
+ * mean - by the same argument `decayDetail` already makes: scoring it 0 would say "as
+ * unlike as two timbres can be" about a pair nothing ever compared, and would punish an
+ * uploaded reference for being a recording rather than a render. Both sides missing is a
+ * match at 1, as with two buffers that both never decayed.
+ */
+function harmonicTerm(
+  reference: number | null,
+  candidate: number | null,
+  score: (reference: number, candidate: number) => number
+): NullableMetricComparisonDetail {
+  if (reference === null || candidate === null) {
+    return {
+      reference,
+      candidate,
+      delta: null,
+      similarity: reference === null && candidate === null ? 1 : null
+    }
+  }
+  return {
+    reference,
+    candidate,
+    delta: candidate - reference,
+    similarity: clampSimilarity(score(reference, candidate))
+  }
+}
+
+/**
+ * Mean per-partial dB difference over `amplitudesDbRelF0`, each partial capped at
+ * `HARMONIC_ERROR_CLAMP_DB` and the mean read linearly against that cap.
+ *
+ * Relative to the *fundamental*, never to the loudest partial: two sounds whose loudest
+ * partial is a different n have every `amplitudesDb` entry offset by an unknown constant,
+ * so a per-partial difference between them measures that offset rather than the timbre.
+ * That is why the field exists and why this term reads it.
+ *
+ * `reference`/`candidate` are the mean partial levels, mirroring `bandsDetail`.
+ */
+function harmonicsDetail(
+  reference: HarmonicShape | undefined,
+  candidate: HarmonicShape | undefined
+): NullableMetricComparisonDetail {
+  const mean = (shape: HarmonicShape | undefined) => shape
+    ? shape.amplitudesDbRelF0.reduce((sum, value) => sum + value, 0) / shape.amplitudesDbRelF0.length
+    : null
+  const detail = harmonicTerm(mean(reference), mean(candidate), () => 0)
+  if (detail.similarity === null || !reference || !candidate) return detail
+
+  const partials = Math.min(reference.amplitudesDbRelF0.length, candidate.amplitudesDbRelF0.length)
+  let cappedError = 0
+  for (let index = 0; index < partials; index++) {
+    cappedError += Math.min(
+      HARMONIC_ERROR_CLAMP_DB,
+      Math.abs(candidate.amplitudesDbRelF0[index] - reference.amplitudesDbRelF0[index])
+    )
+  }
+  return {
+    ...detail,
+    similarity: partials > 0
+      ? clampSimilarity(1 - cappedError / partials / HARMONIC_ERROR_CLAMP_DB)
+      : 1
+  }
 }
 
 /**
@@ -384,6 +539,17 @@ export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMet
     assertEnvelopeDb(label, metrics.envelopeDb)
     assertBandsDb(label, metrics.bandsDb)
     assertSpectralWindows(label, metrics.spectralWindows)
+    if (metrics.harmonicShape) {
+      assertNumberArray(label, 'harmonicShape.amplitudesDbRelF0', metrics.harmonicShape.amplitudesDbRelF0, HARMONIC_COUNT)
+      for (const field of ['tiltDbPerOctave', 'oddEvenDb'] as const) {
+        if (!Number.isFinite(metrics.harmonicShape[field])) {
+          throw new Error(`${label}.harmonicShape.${field} must be finite`)
+        }
+      }
+    }
+    if (metrics.harmonics && !Number.isFinite(metrics.harmonics.inharmonicity)) {
+      throw new Error(`${label}.harmonics.inharmonicity must be finite`)
+    }
   }
   for (const key of metricKeys) {
     if (key === 'decayT60Ms') continue
@@ -421,12 +587,28 @@ export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMet
     decayT60Ms: decayDetail(reference.decayT60Ms, candidate.decayT60Ms, logRatio),
     envelope: envelopeDetail(reference.envelopeDb, candidate.envelopeDb),
     bands: bandsDetail(reference.bandsDb, candidate.bandsDb),
-    brightness: brightnessDetail(reference.spectralWindows, candidate.spectralWindows)
+    brightness: brightnessDetail(reference.spectralWindows, candidate.spectralWindows),
+    harmonics: harmonicsDetail(reference.harmonicShape, candidate.harmonicShape),
+    tilt: harmonicTerm(
+      reference.harmonicShape?.tiltDbPerOctave ?? null,
+      candidate.harmonicShape?.tiltDbPerOctave ?? null,
+      (left, right) => exponentialSimilarity(right - left, TILT_SCALE_DB_PER_OCTAVE)
+    ),
+    inharmonicity: harmonicTerm(
+      reference.harmonics?.inharmonicity ?? null,
+      candidate.harmonics?.inharmonicity ?? null,
+      (left, right) => exponentialSimilarity(
+        logRatio(left, right, INHARMONICITY_FLOOR), Math.log(4)
+      )
+    )
   }
 
   const overallKeys = [
     ...metricKeys.filter(key => key !== 'clippingCount'),
-    'envelope' as const, 'bands' as const, 'brightness' as const
+    'envelope' as const, 'bands' as const, 'brightness' as const,
+    // Timbre was absent from the overall score entirely: `harmonics` was computed and only
+    // ever reported, and `inharmonicity` was computed and never compared at all.
+    'harmonics' as const, 'tilt' as const, 'inharmonicity' as const
   ]
   // A metric that could not be measured on one side is left out of the mean rather than
   // averaged in as a zero: the pair carries no evidence either way, and counting it as
@@ -838,6 +1020,70 @@ const partialsDb = (partials: readonly Partial[], reference: number): number[] =
   })
 
 /**
+ * The two axes a wavetable synth actually has, read off the same 12 partials.
+ *
+ * `amplitudesDbRelF0` is the reason this exists. `HarmonicMetrics.amplitudesDb` is relative
+ * to the *loudest* partial, which cannot be compared across two sounds: when their loudest
+ * partial is a different n, every per-partial difference between them carries an unknown
+ * constant offset, so the comparison measures which partial happened to win rather than the
+ * timbre. Relative to the fundamental there is no such offset, and entry 0 is 0 dB by
+ * construction.
+ *
+ * Both fits ignore partials sitting on `HARMONIC_AMPLITUDE_FLOOR_DB`: that value means "no
+ * peak above the noise", so feeding it to a least-squares fit would fit the floor's depth.
+ *
+ * Degenerate cases, with fewer than the three measurable partials either fit wants:
+ * - `tiltDbPerOctave` is 0 when fewer than two partials are measurable, because a slope
+ *   needs two points and log2(1) = 0 gives no spread. 0 then means "no tilt measurable",
+ *   which is the same number a genuinely flat spectrum produces.
+ * - `oddEvenDb` treats a parity with nothing above the noise as measured *at* the floor,
+ *   because that absence is exactly what this axis reports: a square wave's even partials
+ *   are missing, not unmeasured. It is 0 only when no partial at all was found, which is
+ *   also the number a sawtooth's near-balance produces; `amplitudesDbRelF0` tells the two
+ *   apart, by whether any entry is above the floor.
+ */
+function measureHarmonicShape(amplitudesDbRelF0: readonly number[]): HarmonicShape {
+  const measurable: { n: number; db: number }[] = []
+  for (let index = 0; index < amplitudesDbRelF0.length; index++) {
+    const db = amplitudesDbRelF0[index]
+    if (db > HARMONIC_AMPLITUDE_FLOOR_DB) measurable.push({ n: index + 1, db })
+  }
+
+  // Least squares of level against log2(n): the slope is dB per doubling of partial number,
+  // which for a harmonic series is dB per octave.
+  let tiltDbPerOctave = 0
+  if (measurable.length >= 2) {
+    const meanX = measurable.reduce((sum, point) => sum + Math.log2(point.n), 0) / measurable.length
+    const meanY = measurable.reduce((sum, point) => sum + point.db, 0) / measurable.length
+    let covariance = 0
+    let variance = 0
+    for (const point of measurable) {
+      const x = Math.log2(point.n) - meanX
+      covariance += x * (point.db - meanY)
+      variance += x * x
+    }
+    const slope = variance > 0 ? covariance / variance : 0
+    tiltDbPerOctave = Number.isFinite(slope) ? roundTenth(slope) : 0
+  }
+
+  const odd = measurable.filter(point => point.n % 2 === 1)
+  const even = measurable.filter(point => point.n % 2 === 0)
+  // A parity with nothing above the noise is not "unmeasurable", it is the measurement:
+  // a square wave has no even partials at all, and that absence is the entire content of
+  // this axis. Its mean is the floor, which also bounds how large the reading can get.
+  const mean = (points: readonly { db: number }[]) => points.length > 0
+    ? points.reduce((sum, point) => sum + point.db, 0) / points.length
+    : HARMONIC_AMPLITUDE_FLOOR_DB
+  const oddEvenDb = odd.length > 0 || even.length > 0 ? roundTenth(mean(odd) - mean(even)) : 0
+
+  return {
+    amplitudesDbRelF0: [...amplitudesDbRelF0],
+    tiltDbPerOctave,
+    oddEvenDb: Number.isFinite(oddEvenDb) ? oddEvenDb : 0
+  }
+}
+
+/**
  * Whole-buffer partial amplitudes and the stiffness coefficient B of `f_n = n·f0·√(1 + B·n²)`.
  *
  * The analysis window is taken at the envelope peak and is as long as the buffer allows (up
@@ -849,7 +1095,7 @@ function analyzeHarmonics(
   sampleRate: number,
   f0Hz: number,
   peakSampleIndex: number
-): HarmonicMetrics | undefined {
+): { harmonics: HarmonicMetrics; harmonicShape: HarmonicShape } | undefined {
   if (!Number.isFinite(f0Hz) || f0Hz <= 0) return undefined
   let size = 1
   while ((size << 1) <= Math.min(length, 32768)) size <<= 1
@@ -880,8 +1126,11 @@ function analyzeHarmonics(
   }
   const inharmonicity = denominator > 0 ? numerator / denominator : 0
   return {
-    amplitudesDb,
-    inharmonicity: Number.isFinite(inharmonicity) ? inharmonicity : 0
+    harmonics: {
+      amplitudesDb,
+      inharmonicity: Number.isFinite(inharmonicity) ? inharmonicity : 0
+    },
+    harmonicShape: measureHarmonicShape(partialsDb(partials, partials[0].amplitude))
   }
 }
 
@@ -902,9 +1151,10 @@ function measureSpectralWindows(
   channels: readonly Float32Array[],
   length: number,
   sampleRate: number,
-  f0Hz: number | undefined
+  f0Hz: number | undefined,
+  windowCount: number
 ): SpectralWindow[] {
-  const span = Math.floor(length / SPECTRAL_WINDOW_COUNT)
+  const span = Math.floor(length / windowCount)
   const bounds = (index: number) => ({
     startMs: roundTenth(index * span * 1000 / sampleRate),
     endMs: roundTenth((index + 1) * span * 1000 / sampleRate)
@@ -913,7 +1163,7 @@ function measureSpectralWindows(
   while ((size << 1) <= Math.min(span, SPECTRAL_FFT_MAX)) size <<= 1
   // A one-sample slice has no spectrum; report the timing and zeros rather than throwing.
   if (span < 2 || size < 2) {
-    return Array.from({ length: SPECTRAL_WINDOW_COUNT }, (_, index) => ({
+    return Array.from({ length: windowCount }, (_, index) => ({
       ...bounds(index),
       spectralCentroidHz: 0,
       spectralRolloffHz: 0,
@@ -924,7 +1174,7 @@ function measureSpectralWindows(
   const binHz = sampleRate / size
   const wantsHarmonics = f0Hz !== undefined && Number.isFinite(f0Hz) && f0Hz > 0 &&
     size >= SPECTRAL_WINDOW_MIN_HARMONIC_FFT
-  const measured = Array.from({ length: SPECTRAL_WINDOW_COUNT }, (_, index) => {
+  const measured = Array.from({ length: windowCount }, (_, index) => {
     const begin = index * span
     const end = begin + span
     const spectrum = accumulateSpectrum(channels, begin, end, size)
@@ -987,6 +1237,37 @@ function measureSpectralWindows(
   })
 }
 
+/**
+ * The fundamental this analysis will work from: the caller's if they gave one, otherwise a
+ * measurement, otherwise nothing. `null` is a real answer - the buffer holds no single
+ * pitch - and every harmonic field is then absent rather than invented.
+ *
+ * A supplied `f0Hz` that is not a positive number is refused outright rather than falling
+ * back to detection: the caller stated a fundamental, and quietly substituting a different
+ * one would hide their bug behind plausible numbers.
+ */
+function resolvePitch(
+  channels: readonly Float32Array[],
+  sampleRate: number,
+  options: AnalyzeAudioOptions
+): PitchEstimate | null {
+  if (options.f0Hz !== undefined) {
+    if (!Number.isFinite(options.f0Hz) || options.f0Hz <= 0) return null
+    const { midi, cents } = hzToNearestMidi(options.f0Hz)
+    return { f0Hz: options.f0Hz, confidence: 1, midi, centsOffset: cents, source: 'given' }
+  }
+  if (options.detectPitch === false) return null
+  try {
+    const detected = detectPitch(channels, sampleRate)
+    return detected && Number.isFinite(detected.f0Hz) && detected.f0Hz > 0 ? detected : null
+  } catch {
+    // A detector failure must not take the whole analysis down with it: every other metric
+    // here is still valid, and the caller loses only the harmonic block - the same thing
+    // they lose from unpitched material. Reported as "no pitch found", never as a fake one.
+    return null
+  }
+}
+
 export function analyzeAudio(
   channels: readonly Float32Array[],
   sampleRate: number,
@@ -998,6 +1279,16 @@ export function analyzeAudio(
   if (!Number.isFinite(sampleRate) || sampleRate <= 0) throw new Error('Sample rate must be positive')
   const length = channels[0].length
   if (channels.some(channel => channel.length !== length)) throw new Error('Audio channels must have equal lengths')
+  const windowCount = options.windows ?? SPECTRAL_WINDOW_COUNT
+  if (
+    !Number.isInteger(windowCount) ||
+    windowCount < SPECTRAL_WINDOW_COUNT_MIN ||
+    windowCount > SPECTRAL_WINDOW_COUNT_MAX
+  ) {
+    throw new Error(
+      `windows must be an integer ${SPECTRAL_WINDOW_COUNT_MIN}…${SPECTRAL_WINDOW_COUNT_MAX}`
+    )
+  }
 
   let peak = 0
   let sum = 0
@@ -1108,6 +1399,8 @@ export function analyzeAudio(
     stereoWidth = total > 0 ? sideRms / total : 0
   }
 
+  const pitch = resolvePitch(channels, sampleRate, options)
+
   const metrics: AudioMetrics = {
     peakDb: toDb(peak),
     rmsDb: toDb(Math.sqrt(sumSquares / count)),
@@ -1124,12 +1417,18 @@ export function analyzeAudio(
     bandsDb,
     spectralRolloffHz,
     spectralFlatness,
-    spectralWindows: measureSpectralWindows(channels, length, sampleRate, options.f0Hz)
+    spectralWindows: measureSpectralWindows(channels, length, sampleRate, pitch?.f0Hz, windowCount),
+    pitch
   }
-  if (options.f0Hz !== undefined) {
+  if (pitch) {
     const peakSampleIndex = Math.round(envelope.peakIndex * hopMs * sampleRate / 1000)
-    const harmonics = peak > 0 ? analyzeHarmonics(channels, length, sampleRate, options.f0Hz, peakSampleIndex) : undefined
-    if (harmonics) metrics.harmonics = harmonics
+    const analyzed = peak > 0
+      ? analyzeHarmonics(channels, length, sampleRate, pitch.f0Hz, peakSampleIndex)
+      : undefined
+    if (analyzed) {
+      metrics.harmonics = analyzed.harmonics
+      metrics.harmonicShape = analyzed.harmonicShape
+    }
   }
   for (const key of scalarMetricKeys) {
     if (!Number.isFinite(metrics[key])) {
@@ -1152,9 +1451,24 @@ export function analyzeAudio(
   )) {
     throw new Error('Audio analysis produced nonfinite metric: harmonics')
   }
+  if (metrics.harmonicShape && !(
+    metrics.harmonicShape.amplitudesDbRelF0.length === HARMONIC_COUNT &&
+    metrics.harmonicShape.amplitudesDbRelF0.every(Number.isFinite) &&
+    Number.isFinite(metrics.harmonicShape.tiltDbPerOctave) &&
+    Number.isFinite(metrics.harmonicShape.oddEvenDb)
+  )) {
+    throw new Error('Audio analysis produced nonfinite metric: harmonicShape')
+  }
+  if (metrics.pitch && !(
+    Number.isFinite(metrics.pitch.f0Hz) && metrics.pitch.f0Hz > 0 &&
+    Number.isFinite(metrics.pitch.confidence) &&
+    Number.isFinite(metrics.pitch.midi) && Number.isFinite(metrics.pitch.centsOffset)
+  )) {
+    throw new Error('Audio analysis produced nonfinite metric: pitch')
+  }
   // After the `harmonics` guard: the two share the peak-picking, so a buffer that overflows
   // it overflows both, and the narrower message is the more useful one.
-  if (metrics.spectralWindows.length !== SPECTRAL_WINDOW_COUNT || !metrics.spectralWindows.every(window =>
+  if (metrics.spectralWindows.length !== windowCount || !metrics.spectralWindows.every(window =>
     SPECTRAL_WINDOW_SCALAR_FIELDS.every(field => Number.isFinite(window[field])) &&
     (window.harmonicsDb === undefined ||
       (window.harmonicsDb.length === HARMONIC_COUNT && window.harmonicsDb.every(Number.isFinite)))

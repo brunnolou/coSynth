@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   analyzeAudio, compareAudioMetrics,
   type AudioMetrics, type ComparedMetricKey, type SpectralWindow
@@ -50,6 +50,17 @@ function sawtooth(frequency: number, sampleRate: number, seconds: number, amplit
     let value = 0
     for (let n = 1; n <= partials; n++) value += Math.sin(2 * Math.PI * frequency * n * t) / n
     return amplitude * value * 2 / Math.PI
+  })
+}
+
+/** Band-limited square: odd partials only, at 1/n. Same tilt as a saw, no even partials. */
+function squareWave(frequency: number, sampleRate: number, seconds: number, amplitude = 0.5): Float32Array {
+  const partials = Math.floor(sampleRate / 2 / frequency)
+  return Float32Array.from({ length: Math.round(sampleRate * seconds) }, (_, i) => {
+    const t = i / sampleRate
+    let value = 0
+    for (let n = 1; n <= partials; n += 2) value += Math.sin(2 * Math.PI * frequency * n * t) / n
+    return amplitude * value * 4 / Math.PI
   })
 }
 
@@ -226,7 +237,9 @@ describe('analyzeAudio', () => {
     // by then. Every pad and swell read the same wrong number.
     const measured = [2, 5, 50, 250, 1000, 2000].map(attackMs => ({
       attackMs,
-      reported: analyzeAudio([swell(attackMs, sampleRate, Math.max(3, attackMs / 500))], sampleRate).attackMs
+      // Pitch is irrelevant to an attack measurement, and detecting it on six multi-second
+      // buffers is what pushed this test past the parallel suite's 5 s ceiling.
+      reported: analyzeAudio([swell(attackMs, sampleRate, Math.max(3, attackMs / 500))], sampleRate, { detectPitch: false }).attackMs
     }))
     for (const { attackMs, reported } of measured) {
       // 10 % to 90 % of a linear ramp is 80 % of its length, plus the RMS window's smear.
@@ -373,12 +386,95 @@ describe('analyzeAudio', () => {
     expect(noisy.spectralRolloffHz).toBeGreaterThan(15000)
   })
 
-  it('omits harmonics entirely when no f0Hz is supplied', () => {
+  /**
+   * The regression this whole change exists for. `analyze_reference_audio` gated the
+   * harmonic block on a caller-supplied `f0Hz`, which a rendered candidate has (from its
+   * MIDI note) and an uploaded reference file never does - so the model could read its own
+   * timbre and not the target's, and had to leave the tool to measure the target at all.
+   */
+  it('detects the fundamental and produces harmonics with no f0Hz supplied', () => {
     const sampleRate = 48000
     const metrics = analyzeAudio([sawtooth(220, sampleRate, 0.5)], sampleRate)
+    expect(metrics.pitch).not.toBeNull()
+    expect(metrics.pitch!.source).toBe('detected')
+    expect(metrics.pitch!.f0Hz).toBeCloseTo(220, 0)
+    expect(metrics.pitch!.midi).toBe(57)
+    expect(Math.abs(metrics.pitch!.centsOffset)).toBeLessThan(10)
+    expect(metrics.harmonics!.amplitudesDb).toHaveLength(12)
+    expect(metrics.harmonicShape!.amplitudesDbRelF0).toHaveLength(12)
+    // The same partial levels a supplied f0Hz produces, since the detector found the tone.
+    expect(metrics.harmonics!.amplitudesDb)
+      .toEqual(analyzeAudio([sawtooth(220, sampleRate, 0.5)], sampleRate, { f0Hz: 220 }).harmonics!.amplitudesDb)
+  })
+
+  it('marks a supplied f0Hz as given and does not run the detector on it', () => {
+    const sampleRate = 48000
+    // A frequency the detector would never return for this buffer: `source: 'given'` and
+    // the harmonic block built around 330 Hz prove nothing overrode the caller.
+    const metrics = analyzeAudio([sawtooth(220, sampleRate, 0.5)], sampleRate, { f0Hz: 330 })
+    expect(metrics.pitch).toEqual({
+      f0Hz: 330,
+      confidence: 1,
+      midi: 64,
+      centsOffset: expect.closeTo(1.96, 1),
+      source: 'given'
+    })
+  })
+
+  it('suppresses detection, and with it harmonics, when detectPitch is false', () => {
+    const sampleRate = 48000
+    const metrics = analyzeAudio([sawtooth(220, sampleRate, 0.5)], sampleRate, { detectPitch: false })
+    expect(metrics.pitch).toBeNull()
     expect(metrics.harmonics).toBeUndefined()
-    expect('harmonics' in metrics).toBe(false)
-    expect(JSON.stringify(metrics)).not.toContain('harmonics')
+    expect(metrics.harmonicShape).toBeUndefined()
+    expect(metrics.spectralWindows.every(window => window.harmonicsDb === undefined)).toBe(true)
+    expect(JSON.stringify(metrics)).not.toContain('harmonic')
+  })
+
+  it('reports no pitch rather than failing when the detector throws', async () => {
+    // A detector fault must cost the caller the harmonic block and nothing else; every
+    // other metric in the buffer is still valid. Mocked because the shipped detector
+    // returns `null` on unpitched material instead of throwing.
+    vi.resetModules()
+    vi.doMock('./pitch', () => ({
+      detectPitch: () => { throw new Error('detectPitch: not implemented yet') }
+    }))
+    const { analyzeAudio: withBrokenDetector } = await import('./audio-analysis')
+    const sampleRate = 48000
+    const metrics = withBrokenDetector([sawtooth(220, sampleRate, 0.5)], sampleRate)
+    expect(metrics.pitch).toBeNull()
+    expect(metrics.harmonics).toBeUndefined()
+    expect(metrics.rmsDb).toBeLessThan(0)
+    expect(metrics.spectralWindows).toHaveLength(4)
+    vi.doUnmock('./pitch')
+    vi.resetModules()
+  })
+
+  it('reports no pitch, and no harmonics, for material with no fundamental', () => {
+    const sampleRate = 48000
+    let seed = 7
+    const noise = Float32Array.from({ length: sampleRate }, () => {
+      seed = (seed * 1103515245 + 12345) % 2147483648
+      return (seed / 2147483648) * 2 - 1
+    })
+    const metrics = analyzeAudio([noise], sampleRate)
+    expect(metrics.pitch).toBeNull()
+    expect(metrics.harmonics).toBeUndefined()
+    expect(metrics.harmonicShape).toBeUndefined()
+  })
+
+  it('returns the requested number of spectral windows', () => {
+    const sampleRate = 48000
+    const signal = sawtooth(220, sampleRate, 2)
+    expect(analyzeAudio([signal], sampleRate, { windows: 16 }).spectralWindows).toHaveLength(16)
+    expect(analyzeAudio([signal], sampleRate).spectralWindows).toHaveLength(4)
+    const sixteen = analyzeAudio([signal], sampleRate, { windows: 16 }).spectralWindows
+    expect(sixteen[0].startMs).toBe(0)
+    expect(sixteen[15].endMs).toBeCloseTo(2000, 0)
+    expect(sixteen.every(window => Number.isFinite(window.spectralCentroidHz))).toBe(true)
+    for (const windows of [3, 33, 4.5, Number.NaN]) {
+      expect(() => analyzeAudio([signal], sampleRate, { windows })).toThrow(/windows must be an integer/)
+    }
   })
 
   it('reports 1/n partial amplitudes and near-zero inharmonicity for a sawtooth', () => {
@@ -392,6 +488,51 @@ describe('analyzeAudio', () => {
     expect(harmonics!.amplitudesDb[3]).toBeCloseTo(-12.04, 0)
     expect(harmonics!.amplitudesDb[7]).toBeCloseTo(-18.06, 0)
     expect(Math.abs(harmonics!.inharmonicity)).toBeLessThan(2e-5)
+  })
+
+  it('reports partial levels relative to the fundamental, which is 0 dB by construction', () => {
+    const sampleRate = 48000
+    // A sawtooth whose fundamental is *not* the loudest partial: `amplitudesDb` is relative
+    // to the loudest and so puts a positive-looking offset on everything, while
+    // `amplitudesDbRelF0` anchors on the fundamental and is comparable across sounds.
+    const { harmonicShape } = analyzeAudio([sawtooth(220, sampleRate, 1)], sampleRate, { f0Hz: 220 })
+    expect(harmonicShape!.amplitudesDbRelF0).toHaveLength(12)
+    expect(harmonicShape!.amplitudesDbRelF0[0]).toBe(0)
+    expect(harmonicShape!.amplitudesDbRelF0[1]).toBeCloseTo(-6.02, 0)
+    expect(harmonicShape!.amplitudesDbRelF0[7]).toBeCloseTo(-18.06, 0)
+  })
+
+  it('fits a sawtooth tilt of about -6 dB per octave of partial number', () => {
+    const sampleRate = 48000
+    const { harmonicShape } = analyzeAudio([sawtooth(220, sampleRate, 1)], sampleRate, { f0Hz: 220 })
+    expect(harmonicShape!.tiltDbPerOctave).toBeGreaterThan(-7)
+    expect(harmonicShape!.tiltDbPerOctave).toBeLessThan(-5)
+  })
+
+  it('separates a square from a sawtooth by oddEvenDb, which no other metric does', () => {
+    const sampleRate = 48000
+    const saw = analyzeAudio([sawtooth(220, sampleRate, 1)], sampleRate, { f0Hz: 220 }).harmonicShape!
+    const square = analyzeAudio([squareWave(220, sampleRate, 1)], sampleRate, { f0Hz: 220 }).harmonicShape!
+
+    // A saw has every partial at 1/n, so odd and even differ only by the odd partials
+    // sitting at lower n on average - a couple of dB, not a timbre difference.
+    expect(Math.abs(saw.oddEvenDb)).toBeLessThan(4)
+    // A square has no even partials at all, so the gap is the depth of the noise between
+    // its odd ones: tens of dB, and unmistakable.
+    expect(square.oddEvenDb).toBeGreaterThan(20)
+    // Both fall at the same rate, so tilt alone cannot tell them apart. That is the point.
+    expect(Math.abs(square.tiltDbPerOctave - saw.tiltDbPerOctave)).toBeLessThan(6)
+  })
+
+  it('returns a degenerate-but-documented shape for a single-partial tone', () => {
+    const sampleRate = 48000
+    // A pure sine: only the fundamental is above the floor, so neither fit has points.
+    // Both fields read 0, and the floor entries in `amplitudesDbRelF0` are what tells that
+    // apart from a genuinely flat, balanced spectrum.
+    const { harmonicShape } = analyzeAudio([sine(440, sampleRate, 1, 0.5)], sampleRate, { f0Hz: 440 })
+    expect(harmonicShape!.amplitudesDbRelF0[0]).toBe(0)
+    expect(Number.isFinite(harmonicShape!.tiltDbPerOctave)).toBe(true)
+    expect(Number.isFinite(harmonicShape!.oddEvenDb)).toBe(true)
   })
 
   it('fits the stiffness coefficient B of stretched partials on a steady tone', () => {
@@ -541,7 +682,7 @@ describe('analyzeAudio', () => {
   it('omits per-window harmonicsDb exactly when the whole-buffer harmonics are omitted', () => {
     const sampleRate = 48000
     const signal = sawtooth(220, sampleRate, 1)
-    const without = analyzeAudio([signal], sampleRate)
+    const without = analyzeAudio([signal], sampleRate, { detectPitch: false })
     expect(without.harmonics).toBeUndefined()
     expect(without.spectralWindows.every(window => !('harmonicsDb' in window))).toBe(true)
     expect(JSON.stringify(without.spectralWindows)).not.toContain('harmonics')
@@ -649,21 +790,31 @@ describe('analyzeAudio', () => {
   })
 
   it('returns accepted metrics whose scalars are finite and never serialize as null', () => {
-    const metrics = analyzeAudio([pluck(8000, 1.5, 0.005, 0.4)], 8000)
-    const { decayT60Ms, envelopeDb, bandsDb, harmonics, spectralWindows, ...scalars } = metrics
+    const metrics = analyzeAudio([pluck(8000, 1.5, 0.005, 0.4)], 8000, { detectPitch: false })
+    const { decayT60Ms, envelopeDb, bandsDb, harmonics, spectralWindows, pitch, ...scalars } = metrics
     expect(Object.values(scalars).every(Number.isFinite)).toBe(true)
     expect(envelopeDb.every(Number.isFinite)).toBe(true)
     expect(bandsDb.every(Number.isFinite)).toBe(true)
     expect(spectralWindows.every(window => Object.values(window).every(Number.isFinite))).toBe(true)
     expect(harmonics).toBeUndefined()
     expect(decayT60Ms).toBeGreaterThan(0)
-    expect(JSON.stringify(metrics)).not.toContain('null')
+    // `pitch` joins `decayT60Ms` as a metric whose null is a real answer, so it is the one
+    // other null a caller may see here.
+    expect(pitch).toBeNull()
+    expect(JSON.stringify(metrics).match(/null/g)).toHaveLength(1)
   })
 
-  it('serializes decayT60Ms as null - the only nullable metric - when there is no measurable decay', () => {
+  it('serializes decayT60Ms and pitch as the only nullable metrics', () => {
     const metrics = analyzeAudio([sine(440, 48000, 0.01, 0.25)], 48000)
     expect(metrics.decayT60Ms).toBeNull()
-    expect(JSON.stringify(metrics).match(/null/g)).toHaveLength(1)
+    // 10 ms is far too short for the detector's window, so this reports no pitch too.
+    expect(metrics.pitch).toBeNull()
+    expect(JSON.stringify(metrics).match(/null/g)).toHaveLength(2)
+
+    // With a pitch found, the pitch block is a real object and only the decay is null.
+    const pitched = analyzeAudio([sine(440, 48000, 1, 0.25)], 48000)
+    expect(pitched.pitch!.f0Hz).toBeCloseTo(440, 0)
+    expect(JSON.stringify(pitched).match(/null/g)).toHaveLength(1)
   })
 })
 
@@ -671,7 +822,22 @@ const metricKeys: ComparedMetricKey[] = [
   'peakDb', 'rmsDb', 'clippingCount', 'dcOffset',
   'spectralCentroidHz', 'attackMs', 'stereoWidth', 'decayT60Ms'
 ]
-const detailKeys = [...metricKeys, 'envelope', 'bands', 'brightness'] as const
+const detailKeys = [
+  ...metricKeys, 'envelope', 'bands', 'brightness', 'harmonics', 'tilt', 'inharmonicity'
+] as const
+/** The three terms that are only measurable when both sides have a usable fundamental. */
+const harmonicDetailKeys = ['harmonics', 'tilt', 'inharmonicity'] as const
+
+const harmonicBlock = (amplitudesDbRelF0: number[], inharmonicity = 0) => ({
+  harmonics: { amplitudesDb: amplitudesDbRelF0.map(value => value - Math.max(...amplitudesDbRelF0)), inharmonicity },
+  harmonicShape: {
+    amplitudesDbRelF0,
+    tiltDbPerOctave: -6,
+    oddEvenDb: 0
+  }
+})
+/** 1/n partials, the sawtooth shape, relative to the fundamental. */
+const SAW_PARTIALS_REL_F0 = Array.from({ length: 12 }, (_, index) => Math.round(-20 * Math.log10(index + 1) * 10) / 10)
 
 /** A decaying shape, so envelope correlation has something to correlate. */
 const rampEnvelope = (start: number, end: number): number[] =>
@@ -972,9 +1138,89 @@ describe('compareAudioMetrics', () => {
     expect(() => compareAudioMetrics(referenceMetrics, { ...referenceMetrics, clippingCount: 1.5 })).toThrow(/clippingCount.*nonnegative integer/i)
   })
 
-  it('returns only finite JSON numeric details, deltas, similarities, and overall score', () => {
-    const result = compareAudioMetrics(referenceMetrics, {
+  it('excludes the harmonic terms from the mean when only one side has a fundamental', () => {
+    const withHarmonics = { ...referenceMetrics, ...harmonicBlock(SAW_PARTIALS_REL_F0) }
+    const result = compareAudioMetrics(withHarmonics, referenceMetrics)
+
+    // "Not measurable on one side", never "as wrong as it gets": an uploaded reference that
+    // yielded a pitch must not penalise a candidate that did not, or the reverse.
+    for (const key of harmonicDetailKeys) {
+      expect(result.details[key].similarity).toBeNull()
+      expect(result.details[key].delta).toBeNull()
+    }
+    expect(result.details.harmonics.candidate).toBeNull()
+    expect(result.details.inharmonicity.reference).toBe(0)
+
+    // The overall score is exactly the mean of the terms that *were* measurable.
+    const contributing = detailKeys
+      .filter(key => key !== 'clippingCount')
+      .map(key => result.details[key].similarity)
+      .filter((value): value is number => value !== null)
+    expect(contributing).toHaveLength(detailKeys.length - 1 - harmonicDetailKeys.length)
+    expect(result.similarity).toBeCloseTo(
+      contributing.reduce((sum, value) => sum + value, 0) / contributing.length, 12
+    )
+
+    // Both sides absent is a match, and both sides present is scored normally.
+    const neither = compareAudioMetrics(referenceMetrics, { ...referenceMetrics })
+    for (const key of harmonicDetailKeys) expect(neither.details[key].similarity).toBe(1)
+    const both = compareAudioMetrics(withHarmonics, { ...withHarmonics })
+    for (const key of harmonicDetailKeys) expect(both.details[key].similarity).toBe(1)
+    expect(both.similarity).toBe(1)
+  })
+
+  it('scores partial levels, tilt and inharmonicity, so timbre reaches the overall score', () => {
+    const saw = { ...referenceMetrics, ...harmonicBlock(SAW_PARTIALS_REL_F0) }
+
+    // Every even partial gone: a square against a saw. The per-partial term must see it.
+    const square = {
       ...referenceMetrics,
+      ...harmonicBlock(SAW_PARTIALS_REL_F0.map((value, index) => index % 2 === 0 ? value : -120))
+    }
+    const timbre = compareAudioMetrics(saw, square)
+    expect(timbre.details.harmonics.similarity as number).toBeLessThan(0.6)
+    expect(timbre.similarity).toBeLessThan(1)
+
+    // A uniform 3 dB per octave darker tilt, with the partials themselves untouched, is
+    // read by `tilt` alone - `harmonics` sees no change at all.
+    const darker = {
+      ...saw,
+      harmonicShape: { ...saw.harmonicShape, tiltDbPerOctave: -9 }
+    }
+    const tilted = compareAudioMetrics(saw, darker).details.tilt
+    expect(tilted.delta).toBeCloseTo(-3, 5)
+    expect(tilted.similarity as number).toBeCloseTo(Math.exp(-1), 5)
+
+    // B is compared as a ratio above a floor: two effectively harmonic series match, and a
+    // bell against a guitar does not.
+    const organ = { ...referenceMetrics, ...harmonicBlock(SAW_PARTIALS_REL_F0, 0) }
+    const barelyStretched = { ...referenceMetrics, ...harmonicBlock(SAW_PARTIALS_REL_F0, 2e-5) }
+    expect(compareAudioMetrics(organ, barelyStretched).details.inharmonicity.similarity as number)
+      .toBeGreaterThan(0.85)
+    const bell = { ...referenceMetrics, ...harmonicBlock(SAW_PARTIALS_REL_F0, 2e-2) }
+    expect(compareAudioMetrics(organ, bell).details.inharmonicity.similarity as number).toBeLessThan(0.1)
+  })
+
+  it('compares brightness trajectories measured at different window counts', () => {
+    // One side analysed with `windows: 8`, the other with the default 4. The trajectories
+    // are resampled by position, so the same falling sweep still matches itself.
+    const eight = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([2000, 2000, 1400, 1400, 1000, 1000, 700, 700])
+    }
+    const coarse = compareAudioMetrics(referenceMetrics, eight).details.brightness
+    expect(coarse.similarity).toBeGreaterThan(0.9)
+    const rising = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([700, 700, 1000, 1000, 1400, 1400, 2000, 2000])
+    }
+    expect(compareAudioMetrics(referenceMetrics, rising).details.brightness.similarity).toBeLessThan(0.4)
+  })
+
+  it('returns only finite JSON numeric details, deltas, similarities, and overall score', () => {
+    const withHarmonics = { ...referenceMetrics, ...harmonicBlock(SAW_PARTIALS_REL_F0, 1e-4) }
+    const result = compareAudioMetrics(withHarmonics, {
+      ...withHarmonics,
       peakDb: -160,
       spectralCentroidHz: 0,
       attackMs: 0,
