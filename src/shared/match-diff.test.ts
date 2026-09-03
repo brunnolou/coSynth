@@ -359,6 +359,11 @@ describe('diffAudioMetrics', () => {
     const meanError = (rows: readonly { octaveDelta: number }[]) =>
       rows.reduce((sum, row) => sum + Math.abs(row.octaveDelta), 0) / rows.length
     const scored = compareAudioMetrics(reference, candidate).details.brightness.similarity
+    // Three of the four pairs survived the gate, so the term is a number rather than the
+    // `null` an all-gated comparison reports. Narrowed here so the arithmetic below is
+    // arithmetic on the score, not on a `null` coerced to 0.
+    expect(typeof scored).toBe('number')
+    if (scored === null) throw new Error('unreachable')
     expect(scored).toBeCloseTo(Math.exp(-meanError(measured) / 0.5), 12)
     // The marked row is not a rounding detail: counting it moves the score by half again.
     expect(Math.exp(-meanError(diff.brightness) / 0.5)).toBeLessThan(scored * 0.8)

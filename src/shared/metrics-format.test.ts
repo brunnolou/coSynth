@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { AudioMetrics, AudioMetricsComparison } from './audio-analysis'
+import { compareAudioMetrics } from './audio-analysis'
 import type { MatchAction } from './match-types'
 import { diffAudioMetrics } from './match-diff'
 import { formatDiff, formatMetrics } from './metrics-format'
@@ -187,6 +188,35 @@ describe('formatDiff', () => {
       expect(brightnessBlock(text)[0].split(' | ')[3]).toBe('495-660ms n/a')
       for (const token of forbidden) expect(text).not.toContain(token)
     }
+  })
+
+  /**
+   * The one payload where `compareAudioMetrics` reports `brightness` as not measurable: a
+   * decaying reference against a late-starting candidate gates one side of every pair, so
+   * the whole term is `null`. Built through the real comparison rather than the `comparison`
+   * stub, so the null actually reaches the page rather than being assumed away.
+   */
+  it('prints every window as n/a when the whole brightness term is not measurable', () => {
+    const levels = (levelsDb: readonly number[], centroids: readonly number[]) =>
+      (metrics: AudioMetrics): AudioMetrics => ({
+        ...metrics,
+        spectralWindows: metrics.spectralWindows.map((window, index) => ({
+          ...window, levelDb: levelsDb[index], spectralCentroidHz: centroids[index]
+        }))
+      })
+    const reference = levels([0, -20, -50, -70], [1200, 1000, 7100, 8300])(makeMetrics())
+    const candidate = levels([-70, -50, -20, 0], [7900, 8600, 1050, 1150])(candidateMetrics())
+
+    const scored = compareAudioMetrics(reference, candidate)
+    expect(scored.details.brightness.similarity).toBeNull()
+
+    const text = formatDiff(diffAudioMetrics(reference, candidate, scored), context)
+    const [windows, note] = brightnessBlock(text)
+    for (const cell of windows.split(' | ')) expect(cell.trim()).toMatch(/^\d+-\d+ms n\/a$/)
+    expect(note).toContain('below the noise floor')
+    // The whole point: no centroid figure from a half-hiss pair reaches the reader, and the
+    // nullable term prints nothing the language would have to spell.
+    for (const token of forbidden) expect(text).not.toContain(token)
   })
 
   it('adds no noise-floor note when every window was measured', () => {

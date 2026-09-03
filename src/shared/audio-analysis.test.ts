@@ -1405,6 +1405,132 @@ describe('compareAudioMetrics', () => {
     expect(justBelow.details.brightness.similarity).toBe(1)
   })
 
+  /**
+   * A decaying reference against a late-starting candidate. `levelDb` is relative to each
+   * buffer's OWN loudest slice, so both sides carry a 0 dB window - but at opposite ends,
+   * and every resampled pair therefore has exactly one side in the noise. Neither buffer is
+   * remotely silent: each has two windows well above the gate.
+   *
+   * There is no fallback to the ungated comparison, because the ungated comparison here IS
+   * the phantom the gate exists to stop: it scores 0.003, "as unrelated as two sounds get",
+   * off four centroid pairs of which four are half hiss.
+   */
+  it('reports brightness as not measurable when every window pair has a gated side', () => {
+    const decaying = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([1200, 1000, 7100, 8300], [0, -20, -50, -70])
+    }
+    const lateStarting = {
+      ...referenceMetrics,
+      // One term deliberately wrong, so the overall mean below is not trivially 1 and the
+      // "neither dragged up nor down" assertions have room on both sides.
+      attackMs: 90,
+      spectralWindows: windowTrajectory([7900, 8600, 1050, 1150], [-70, -50, -20, 0])
+    }
+
+    // The premise: both buffers are loud, and every pair still has one gated side.
+    for (const metrics of [decaying, lateStarting]) {
+      expect(metrics.spectralWindows.filter(window => !isSpectralWindowBelowNoiseFloor(window))).toHaveLength(2)
+      expect(metrics.spectralWindows.some(window => window.levelDb === 0)).toBe(true)
+    }
+    for (let index = 0; index < 4; index++) {
+      expect(
+        isSpectralWindowBelowNoiseFloor(decaying.spectralWindows[index]) !==
+        isSpectralWindowBelowNoiseFloor(lateStarting.spectralWindows[index])
+      ).toBe(true)
+    }
+
+    const result = compareAudioMetrics(decaying, lateStarting)
+    // Refusing beats fabricating - `decayT60Ms` and the harmonic terms already say so. The
+    // fallback this replaces scored 0.0034 here, a fabricated number and the exact kind that
+    // ranked a wrong action first.
+    expect(result.details.brightness.similarity).toBeNull()
+    expect(result.details.brightness.reference).toBeNull()
+    expect(result.details.brightness.candidate).toBeNull()
+    expect(result.details.brightness.delta).toBeNull()
+
+    // Excluded, so it drags the overall score in neither direction: the mean is exactly the
+    // mean of the terms that remain.
+    const contributing = detailKeys
+      .filter(key => key !== 'clippingCount')
+      .map(key => result.details[key].similarity)
+      .filter((value): value is number => value !== null)
+    expect(contributing).toHaveLength(detailKeys.length - 2)
+    const remaining = contributing.reduce((sum, value) => sum + value, 0) / contributing.length
+    expect(result.similarity).toBeCloseTo(remaining, 12)
+    // And that is strictly between what scoring it 0 and what scoring it 1 would have given,
+    // so "excluded" is distinguishable from either verdict rather than coinciding with one.
+    const withVerdict = (score: number) =>
+      (contributing.reduce((sum, value) => sum + value, 0) + score) / (contributing.length + 1)
+    expect(result.similarity).toBeGreaterThan(withVerdict(0))
+    expect(result.similarity).toBeLessThan(withVerdict(1))
+  })
+
+  /**
+   * The means and the score have to read one set of pairs. Gating each side's own windows
+   * independently mixed a window the score never looked at into the other side's mean: here
+   * it inverts the sign, reporting the candidate 67 Hz darker when the pairs that were
+   * actually compared put it 150 Hz brighter.
+   */
+  it('averages the reported centroids over exactly the pairs that were scored', () => {
+    // Reference gated at window 3, candidate at window 1: pairs 0 and 2 survive.
+    const reference = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([2000, 1400, 1000, 9000], [0, -10, -20, -60])
+    }
+    const candidate = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([2200, 8000, 1100, 900], [0, -50, -20, -10])
+    }
+
+    const brightness = compareAudioMetrics(reference, candidate).details.brightness
+    expect(brightness.reference).toBe((2000 + 1000) / 2)
+    expect(brightness.candidate).toBe((2200 + 1100) / 2)
+    expect(brightness.delta).toBe(150)
+    // Each side's own ungated windows would have averaged 1466.7 against 1400: a *negative*
+    // delta, from two sets of three windows that were never compared with each other.
+    expect(brightness.reference).not.toBeCloseTo((2000 + 1400 + 1000) / 3, 5)
+    expect(brightness.candidate).not.toBeCloseTo((2200 + 1100 + 900) / 3, 5)
+
+    // The score reads the same two pairs: exp(-mean |octave error| / 0.5) over them alone.
+    const error = (left: number, right: number) => Math.abs(Math.log2((right + 20) / (left + 20)))
+    expect(brightness.similarity).toBeCloseTo(
+      Math.exp(-((error(2000, 2200) + error(1000, 1100)) / 2) / 0.5), 12
+    )
+    expect(brightness.similarity).toBeCloseTo(0.7625143, 6)
+  })
+
+  it('leaves the partially gated and ungated paths exactly as they were', () => {
+    // The reviewer's original fixture, pinned to its exact value rather than a bound: two
+    // pairs survive, both centroids agree, so this is 1 and not 0.9-something.
+    const reference = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([700, 735, 700, 700], [0, -29.6, -59.6, -89.6])
+    }
+    const noisyTail = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([700, 735, 8887, 11121], [0, -29.6, -54.2, -55.6])
+    }
+    const gated = compareAudioMetrics(reference, noisyTail).details.brightness
+    expect(gated.similarity).toBe(1)
+    expect(gated.reference).toBe(717.5)
+    expect(gated.candidate).toBe(717.5)
+    expect(gated.delta).toBe(0)
+
+    // Nothing gated: all four pairs counted, and the mean is the mean of all four windows.
+    const identical = compareAudioMetrics(referenceMetrics, { ...referenceMetrics }).details.brightness
+    expect(identical.similarity).toBe(1)
+    expect(identical.reference).toBe((2000 + 1400 + 1000 + 700) / 4)
+    expect(identical.delta).toBe(0)
+
+    const darker = { ...referenceMetrics, spectralWindows: windowTrajectory([1000, 700, 500, 350]) }
+    const dark = compareAudioMetrics(referenceMetrics, darker).details.brightness
+    expect(dark.reference).toBe(1275)
+    expect(dark.candidate).toBe((1000 + 700 + 500 + 350) / 4)
+    expect(dark.similarity as number).toBeGreaterThan(0.1)
+    expect(dark.similarity as number).toBeLessThan(0.2)
+  })
+
   it('scores partial levels, tilt and inharmonicity, so timbre reaches the overall score', () => {
     const saw = { ...referenceMetrics, ...harmonicBlock(SAW_PARTIALS_REL_F0) }
 

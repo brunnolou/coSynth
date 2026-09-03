@@ -165,18 +165,21 @@ export interface AudioMetricComparisonDetail {
 }
 
 /**
- * `decayT60Ms` is absent whenever the buffer never decayed, and the harmonic terms are
- * absent whenever a side had no usable fundamental, so their details carry nulls.
+ * `decayT60Ms` is absent whenever the buffer never decayed, the harmonic terms are absent
+ * whenever a side had no usable fundamental, and `brightness` is absent whenever the noise
+ * gate leaves no comparable window pair, so their details carry nulls.
  *
  * `similarity` is `null` - and the metric is left out of the overall mean - when the pair
  * was not measurable rather than maximally different. Both sides `null` is a match and
  * scores 1; two measured values score normally.
  *
- * Which single-sided absences count as "not measurable" differs by metric, and the two
- * rules are argued where they live: symmetric for `decayT60Ms` (see `decayDetail`),
- * asymmetric for `harmonics`, `tilt` and `inharmonicity` (see `harmonicTerm`), where a
- * reference that *has* a fundamental and a candidate that does not is a measured failure of
- * the candidate and scores 0.
+ * Which absences count as "not measurable" differs by metric, and the three rules are argued
+ * where they live: symmetric for `decayT60Ms` (see `decayDetail`), asymmetric for
+ * `harmonics`, `tilt` and `inharmonicity` (see `harmonicTerm`), where a reference that *has*
+ * a fundamental and a candidate that does not is a measured failure of the candidate and
+ * scores 0, and never-a-match for `brightness` (see `brightnessDetail`), where both sides
+ * being unreadable is a fact about two noise floors rather than an agreement between two
+ * sounds.
  */
 export interface NullableMetricComparisonDetail {
   reference: number | null
@@ -204,10 +207,14 @@ export interface AudioMetricsComparison {
      * shape score - absolute brightness is part of a timbre match - but it separates two
      * sounds with the same mean brightness that arrive at it from opposite directions,
      * which `spectralCentroidHz` alone cannot. Windows below
-     * `SPECTRAL_WINDOW_NOISE_GATE_DB` on either side are excluded from both the error and
-     * the means.
+     * `SPECTRAL_WINDOW_NOISE_GATE_DB` on either side are excluded from the error and from
+     * the means alike, which are taken over exactly the surviving pairs.
+     *
+     * `null` when no pair survives the gate - a decaying reference against a late-starting
+     * candidate, where every pair has one side in the noise. See `brightnessDetail` for why
+     * that is "not measurable" rather than the agreement `harmonicTerm` reports.
      */
-    & { brightness: AudioMetricComparisonDetail }
+    & { brightness: NullableMetricComparisonDetail }
     /**
      * Mean per-partial dB difference across `harmonicShape.amplitudesDbRelF0`, each partial
      * capped at `HARMONIC_ERROR_CLAMP_DB` and read linearly against that cap - the
@@ -492,16 +499,37 @@ function bandsDetail(reference: readonly number[], candidate: readonly number[])
  * The level difference that put the slice under the gate is not lost by leaving it out:
  * `envelope`, `rmsDb` and `decayT60Ms` read level directly and are where a candidate that
  * dies too early is charged for it.
+ *
+ * ONE SET OF PAIRS FEEDS ALL FOUR FIELDS. `reference`, `candidate` and `delta` are means
+ * over exactly the pairs that contributed to the error, never over each side's own ungated
+ * windows: `levelDb` is relative to each buffer's own loudest slice, so the two sides gate
+ * at different indices and two independently-gated means describe a set of windows that was
+ * never compared. The printed table and the score have to agree about which windows counted.
+ *
+ * WHEN NO PAIR SURVIVES THE GATE the term is `null` - not measurable - rather than a number.
+ * There is no fallback to the ungated comparison, and the reachability is not theoretical:
+ * each buffer has a 0 dB slice by construction, but the two peaks need not share an index,
+ * so a decaying reference against a late-starting candidate can have one gated side in every
+ * single pair while neither buffer is remotely silent. Scoring those pairs anyway would
+ * reintroduce, in the one case that reaches it, the phantom centroid swing the gate exists
+ * to stop - the same fabrication that once ranked a wrong action first.
+ *
+ * `harmonicTerm`'s "neither side is measurable, so they agree, so score 1" does NOT carry
+ * over here, and the difference is what `null` is measuring. A missing fundamental is a
+ * property of the sound: both sides having none is a real, shared fact about them. A gated
+ * window is a property of where a slice sits in its OWN envelope, and its centroid was
+ * measured on hiss - so an all-gated comparison says nothing whatever about whether the two
+ * sounds' brightness agrees, and 1 would assert a match on the strength of two hiss
+ * readings. Scoring it 1 would also be a lever: `levelDb` is buffer-relative, so a candidate
+ * could gate its own windows by collapsing into one loud slice and collect a free 1.0 for
+ * destroying its sustain. Exclusion is neutral, and a candidate cannot profit by reaching
+ * this state either, because near-disjoint envelopes are what it takes to get here and
+ * `envelope`, `attackMs`, `rmsDb` and `decayT60Ms` all charge for that directly.
  */
 function brightnessDetail(
   reference: readonly SpectralWindow[],
   candidate: readonly SpectralWindow[]
-): AudioMetricComparisonDetail {
-  const mean = (windows: readonly SpectralWindow[]) => {
-    const measured = windows.filter(window => !isSpectralWindowBelowNoiseFloor(window))
-    const counted = measured.length > 0 ? measured : windows
-    return counted.reduce((sum, window) => sum + window.spectralCentroidHz, 0) / counted.length
-  }
+): NullableMetricComparisonDetail {
   // The two sides may have been analysed at different `windows` resolutions. Each window
   // is a fixed *fraction* of its own buffer, so index i of a 4-window run and index i of a
   // 16-window run describe different spans; the trajectories are therefore resampled onto
@@ -509,36 +537,33 @@ function brightnessDetail(
   const points = Math.min(reference.length, candidate.length)
   const at = (windows: readonly SpectralWindow[], index: number) =>
     windows[Math.min(windows.length - 1, Math.round(index * (windows.length - 1) / (points - 1)))]
-  const measuredErrors: number[] = []
-  const everyError: number[] = []
+  const errors: number[] = []
+  const referenceCentroids: number[] = []
+  const candidateCentroids: number[] = []
   for (let index = 0; index < points; index++) {
     const referenceWindow = at(reference, index)
     const candidateWindow = at(candidate, index)
+    if (
+      isSpectralWindowBelowNoiseFloor(referenceWindow) ||
+      isSpectralWindowBelowNoiseFloor(candidateWindow)
+    ) {
+      continue
+    }
+    referenceCentroids.push(referenceWindow.spectralCentroidHz)
+    candidateCentroids.push(candidateWindow.spectralCentroidHz)
     const left = Math.max(0, referenceWindow.spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
     const right = Math.max(0, candidateWindow.spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
-    const error = Math.abs(Math.log2(right / left))
-    everyError.push(error)
-    if (
-      !isSpectralWindowBelowNoiseFloor(referenceWindow) &&
-      !isSpectralWindowBelowNoiseFloor(candidateWindow)
-    ) {
-      measuredErrors.push(error)
-    }
+    errors.push(Math.abs(Math.log2(right / left)))
   }
-  // The loudest slice of a buffer reads 0 dB by construction, so a pair always survives in
-  // practice; a resampling coarse enough to sample only gated slices on both sides falls
-  // back to the ungated comparison rather than scoring an empty mean.
-  const counted = measuredErrors.length > 0 ? measuredErrors : everyError
-  const referenceMean = mean(reference)
-  const candidateMean = mean(candidate)
+  if (errors.length === 0) return { reference: null, candidate: null, delta: null, similarity: null }
+  const mean = (values: readonly number[]) => values.reduce((sum, value) => sum + value, 0) / values.length
+  const referenceMean = mean(referenceCentroids)
+  const candidateMean = mean(candidateCentroids)
   return {
     reference: referenceMean,
     candidate: candidateMean,
     delta: candidateMean - referenceMean,
-    similarity: exponentialSimilarity(
-      counted.reduce((sum, error) => sum + error, 0) / counted.length,
-      BRIGHTNESS_SCALE_OCTAVES
-    )
+    similarity: exponentialSimilarity(mean(errors), BRIGHTNESS_SCALE_OCTAVES)
   }
 }
 
