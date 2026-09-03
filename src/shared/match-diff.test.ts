@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { AudioMetrics, AudioMetricsComparison, SpectralWindow } from './audio-analysis'
+import { SPECTRAL_WINDOW_NOISE_GATE_DB, compareAudioMetrics } from './audio-analysis'
 import { diffAudioMetrics } from './match-diff'
 
 /**
@@ -58,6 +59,24 @@ const spectralWindows = (centroidsHz: readonly number[], totalMs = 660): Spectra
 /** The octave delta the diff should report for one pair of centroids, floor included. */
 const expectedDelta = (referenceHz: number, candidateHz: number): number =>
   Math.log2((candidateHz + 20) / (referenceHz + 20))
+
+/**
+ * The level of the failing window from the eval: a tail that had decayed into the noise and
+ * still reported a 4,978 Hz centroid. Deep under the -40 dB gate, so no rounding argument
+ * can put it back over.
+ */
+const DECAYED_LEVEL_DB = -55
+
+/**
+ * Push the named windows under the gate, leaving `belowNoiseFloor` UNSET. Every gate
+ * assertion below therefore runs against windows that carry only `levelDb` - a hand-built
+ * fixture, or an analysis serialized before the flag existed - which is the case the
+ * exported predicate exists to cover.
+ */
+const decayed = (windows: readonly SpectralWindow[], ...indices: readonly number[]): SpectralWindow[] =>
+  windows.map((window, index) =>
+    indices.includes(index) ? { ...window, levelDb: DECAYED_LEVEL_DB } : window
+  )
 
 const comparison = (similarity = 0.612): AudioMetricsComparison =>
   ({ similarity, details: {} } as unknown as AudioMetricsComparison)
@@ -245,6 +264,104 @@ describe('diffAudioMetrics', () => {
     expect(diff.brightness.map((window) => [window.startMs, window.endMs])).toEqual(
       makeMetrics().spectralWindows.map((window) => [window.startMs, window.endMs])
     )
+  })
+
+  it('marks a brightness row when the reference slice, the candidate slice or both are gated', () => {
+    const bright = spectralWindows([2000, 1600, 1200, 900])
+    const cases = [
+      { side: 'reference', reference: decayed(bright, 3), candidate: bright },
+      { side: 'candidate', reference: bright, candidate: decayed(bright, 3) },
+      { side: 'both', reference: decayed(bright, 3), candidate: decayed(bright, 3) }
+    ] as const
+
+    for (const { side, reference, candidate } of cases) {
+      const diff = diffAudioMetrics(
+        makeMetrics({ spectralWindows: reference }),
+        makeMetrics({ spectralWindows: candidate }),
+        comparison()
+      )
+      // Marked, never dropped: the count and the timeline stay readable.
+      expect(diff.brightness, side).toHaveLength(4)
+      expect(diff.brightness[3].belowNoiseFloor, side).toBe(true)
+      expect([diff.brightness[3].startMs, diff.brightness[3].endMs], side).toEqual([495, 660])
+      expect(Number.isFinite(diff.brightness[3].octaveDelta), side).toBe(true)
+      // And no measured row is caught by it.
+      for (const row of diff.brightness.slice(0, 3)) expect(row.belowNoiseFloor, side).toBeUndefined()
+    }
+  })
+
+  it('gates on levelDb through the exported predicate, so an unflagged window is gated too', () => {
+    const base = spectralWindows([2000, 1600, 1200, 900])
+    const at = (levelDb: number, extra: Partial<SpectralWindow> = {}): SpectralWindow[] =>
+      base.map((window, index) => (index === 3 ? { ...window, levelDb, ...extra } : window))
+    const rows = (windows: SpectralWindow[]) =>
+      diffAudioMetrics(
+        makeMetrics({ spectralWindows: base }),
+        makeMetrics({ spectralWindows: windows }),
+        comparison()
+      ).brightness
+
+    // A hand-built window, or one deserialized from an analysis older than the flag: it
+    // carries a level and nothing else, and it is gated on that alone.
+    const unflagged = at(SPECTRAL_WINDOW_NOISE_GATE_DB - 0.1)
+    expect(unflagged[3].belowNoiseFloor).toBeUndefined()
+    expect(rows(unflagged)[3].belowNoiseFloor).toBe(true)
+    // The analyzer's flag is set from the same predicate, so adding it changes nothing.
+    expect(rows(at(SPECTRAL_WINDOW_NOISE_GATE_DB - 0.1, { belowNoiseFloor: true }))).toEqual(rows(unflagged))
+    // The threshold test is strict, so a window sitting exactly on it is still measured.
+    expect(rows(at(SPECTRAL_WINDOW_NOISE_GATE_DB))[3].belowNoiseFloor).toBeUndefined()
+  })
+
+  it('gates the pair each row compared, not the trajectories it was resampled from', () => {
+    // Reference finer than the candidate: rows 0…3 sample reference windows 0, 2, 5 and 7,
+    // so windows 1, 3, 4 and 6 are differenced by no row at all. Gating the source arrays
+    // before resampling would mark rows for slices that nothing compared.
+    const fine = spectralWindows(Array(8).fill(1000), 660)
+    const coarse = spectralWindows(Array(4).fill(1000), 1650)
+    const marks = (reference: SpectralWindow[]) =>
+      diffAudioMetrics(
+        makeMetrics({ spectralWindows: reference }),
+        makeMetrics({ spectralWindows: coarse }),
+        comparison()
+      ).brightness.map((row) => row.belowNoiseFloor ?? false)
+
+    expect(marks(decayed(fine, 1, 3, 4, 6))).toEqual([false, false, false, false])
+    // Window 5 is the one row 2 samples, so that row - and only that row - is marked.
+    expect(marks(decayed(fine, 5))).toEqual([false, false, true, false])
+  })
+
+  it('adds nothing at all to a row whose two slices were both measured', () => {
+    const diff = diffAudioMetrics(
+      makeMetrics(),
+      makeMetrics({ spectralWindows: spectralWindows([1000, 800, 600, 450]) }),
+      comparison()
+    )
+    // `toEqual` reads a present-but-undefined key as absent, so the keys are checked by
+    // name: an ungated run emits the same three-key row it emitted before the gate existed.
+    for (const row of diff.brightness) expect(Object.keys(row)).toEqual(['startMs', 'endMs', 'octaveDelta'])
+  })
+
+  it('marks exactly the windows compareAudioMetrics left out of the score', () => {
+    const reference = makeMetrics({ spectralWindows: spectralWindows([2000, 1600, 1200, 900]) })
+    // The failure this gate exists for: a tail that had decayed to -55 dB and still reported
+    // a 4,978 Hz centroid, brighter than the note that produced it.
+    const candidate = makeMetrics({ spectralWindows: decayed(spectralWindows([1000, 800, 600, 4978]), 3) })
+
+    const diff = diffAudioMetrics(reference, candidate, comparison())
+    const measured = diff.brightness.filter((row) => !row.belowNoiseFloor)
+    expect(measured).toHaveLength(3)
+    expect(Math.abs(diff.brightness[3].octaveDelta)).toBeGreaterThan(2)
+
+    // `brightnessDetail` scores exp(-mean |octave error| / 0.5) over the windows it counted.
+    // Recomputing that from the rows this module did NOT mark is the agreement: the table
+    // and the score cannot be reading different sets of windows and still land on the same
+    // number. Assert it rather than trust it - they resample independently.
+    const meanError = (rows: readonly { octaveDelta: number }[]) =>
+      rows.reduce((sum, row) => sum + Math.abs(row.octaveDelta), 0) / rows.length
+    const scored = compareAudioMetrics(reference, candidate).details.brightness.similarity
+    expect(scored).toBeCloseTo(Math.exp(-meanError(measured) / 0.5), 12)
+    // The marked row is not a rounding detail: counting it moves the score by half again.
+    expect(Math.exp(-meanError(diff.brightness) / 0.5)).toBeLessThan(scored * 0.8)
   })
 
   it('labels each row with the reference slice it sampled, never the candidate timeline', () => {

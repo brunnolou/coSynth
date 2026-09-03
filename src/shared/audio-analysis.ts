@@ -45,6 +45,9 @@ export interface AudioMetrics {
    * buffer into one number, so a sound whose brightness *falls* - a piano, anything with
    * `env -> cutoff` - is indistinguishable from a steady one. Read the trend across these
    * to see that.
+   *
+   * Skip any window carrying `belowNoiseFloor` when reading that trend: its spectral
+   * figures measure the analyzer's noise floor, not the sound.
    */
   spectralWindows: SpectralWindow[]
   /**
@@ -67,9 +70,17 @@ export interface SpectralWindow {
   startMs: number
   /** End of the analysed slice, ms from the buffer start. */
   endMs: number
-  /** Spectral centroid of this slice alone - the brightness figure to read a trend from. */
+  /**
+   * Spectral centroid of this slice alone - the brightness figure to read a trend from.
+   *
+   * Read `belowNoiseFloor` first: when that is set this number describes the noise the
+   * slice decayed into and says nothing about the sound.
+   */
   spectralCentroidHz: number
-  /** Frequency below which 85% of this slice's power lies. */
+  /**
+   * Frequency below which 85% of this slice's power lies. Subject to the same
+   * `belowNoiseFloor` caveat as `spectralCentroidHz`.
+   */
   spectralRolloffHz: number
   /**
    * RMS of this slice in dB relative to the loudest slice, so the loudest reads 0. Tells a
@@ -77,12 +88,27 @@ export interface SpectralWindow {
    */
   levelDb: number
   /**
+   * `true` - and never `false` - on a slice whose `levelDb` sits below
+   * `SPECTRAL_WINDOW_NOISE_GATE_DB`. Every spectral figure on such a slice
+   * (`spectralCentroidHz`, `spectralRolloffHz`, `harmonicsDb`) was measured on the noise
+   * the sound decayed into, so it is a number without a meaning: report it as `n/a (below
+   * the noise floor)` and leave it out of any trend, difference or score.
+   *
+   * The slice is kept rather than dropped, so the window count stays predictable and
+   * `startMs`/`endMs` still tile the buffer. Absent means "this slice was measured"; the
+   * flag is derived from `levelDb` alone, so `isSpectralWindowBelowNoiseFloor` gives the
+   * same answer for windows that reached you without it.
+   */
+  belowNoiseFloor?: true
+  /**
    * The first 12 partials of this slice in dB relative to the loudest partial found in
    * *any* slice, so both the overall decay and the per-partial decay rates are readable:
    * a piano's eighth partial falls tens of dB while its fundamental barely moves.
    *
    * Present only when `analyzeAudio` was given a usable `f0Hz` and the slices are long
-   * enough to resolve partials; present on every slice or on none, never fabricated.
+   * enough to resolve partials; present on every slice or on none, never fabricated. On a
+   * `belowNoiseFloor` slice these are peaks picked out of noise: the *level* they report is
+   * real - the partials have gone - but their shape across n is not.
    */
   harmonicsDb?: number[]
 }
@@ -139,17 +165,24 @@ export interface AudioMetricComparisonDetail {
 }
 
 /**
- * `decayT60Ms` is absent whenever the buffer never decayed, so its detail carries nulls.
+ * `decayT60Ms` is absent whenever the buffer never decayed, and the harmonic terms are
+ * absent whenever a side had no usable fundamental, so their details carry nulls.
  *
- * `similarity` is `null` - and the metric is left out of the overall mean - when exactly one
- * side is `null`, because the pair was not measurable rather than maximally different. Both
- * sides `null` is a match and scores 1; two measured values score normally.
+ * `similarity` is `null` - and the metric is left out of the overall mean - when the pair
+ * was not measurable rather than maximally different. Both sides `null` is a match and
+ * scores 1; two measured values score normally.
+ *
+ * Which single-sided absences count as "not measurable" differs by metric, and the two
+ * rules are argued where they live: symmetric for `decayT60Ms` (see `decayDetail`),
+ * asymmetric for `harmonics`, `tilt` and `inharmonicity` (see `harmonicTerm`), where a
+ * reference that *has* a fundamental and a candidate that does not is a measured failure of
+ * the candidate and scores 0.
  */
 export interface NullableMetricComparisonDetail {
   reference: number | null
   candidate: number | null
   delta: number | null
-  /** `null` means "not measurable on one side", never "as wrong as it gets". */
+  /** `null` means "not measurable", never "as wrong as it gets". */
   similarity: number | null
 }
 
@@ -170,7 +203,9 @@ export interface AudioMetricsComparison {
      * reference/candidate are their mean centroids. Unlike `envelope` this is not a pure
      * shape score - absolute brightness is part of a timbre match - but it separates two
      * sounds with the same mean brightness that arrive at it from opposite directions,
-     * which `spectralCentroidHz` alone cannot.
+     * which `spectralCentroidHz` alone cannot. Windows below
+     * `SPECTRAL_WINDOW_NOISE_GATE_DB` on either side are excluded from both the error and
+     * the means.
      */
     & { brightness: AudioMetricComparisonDetail }
     /**
@@ -269,6 +304,41 @@ const TILT_SCALE_DB_PER_OCTAVE = 3
  * roughly one step along that instrument ladder.
  */
 const INHARMONICITY_FLOOR = 1e-4
+/**
+ * A `SpectralWindow` whose `levelDb` falls below this is noise, and every spectral figure
+ * measured on it describes that noise rather than the sound.
+ *
+ * Near-silence has a broadband, roughly even spectrum, so its centroid lands near the
+ * middle of the analysed band whatever the sound had been doing. A real reference run put a
+ * 4,978 Hz centroid on a -55 dB slice whose partials were all sitting on the -120 dB floor;
+ * the +4.9 octave "brightness swing" that invented was read as a filter closing too fast
+ * and sent `filter-envelope-depth` to the top of the advice ranking. The gate lives here,
+ * in the analyzer, so the score, the diff and the printed table all reach the same verdict
+ * instead of each re-deriving one.
+ *
+ * -40 dB is 1/10,000 of the loudest slice's power, and exactly twice the
+ * `BAND_ERROR_CLAMP_DB` span at which this module already treats two spectra as sharing
+ * nothing. It is deep enough to keep every tail worth reading: a note whose T60 outlasts
+ * the buffer still reads about -30 dB in its final quarter, while the failure above sat at
+ * -55 dB. Nearer -35 it starts gating the tails of ordinary plucks, and nearer -45 the
+ * noise comes back.
+ *
+ * The test is strict, so a slice sitting exactly on the threshold is still measured.
+ */
+export const SPECTRAL_WINDOW_NOISE_GATE_DB = -40
+
+/**
+ * Whether a slice's spectral figures describe the noise floor rather than the sound.
+ *
+ * Derived from `levelDb` rather than read off `SpectralWindow.belowNoiseFloor`, so it
+ * answers the same for a window hand-built in a test, deserialized from an older analysis,
+ * or produced by any other path. `measureSpectralWindows` sets the flag from this same
+ * predicate, which is what stops the score and the printed table disagreeing about which
+ * windows counted.
+ */
+export const isSpectralWindowBelowNoiseFloor = (window: SpectralWindow): boolean =>
+  window.levelDb < SPECTRAL_WINDOW_NOISE_GATE_DB
+
 /** The per-window centroid trajectory is compared in octaves, on this scale. */
 const BRIGHTNESS_SCALE_OCTAVES = 0.5
 /** Added to both centroids before the ratio, so a silent window is not a divide by zero. */
@@ -414,13 +484,24 @@ function bandsDetail(reference: readonly number[], candidate: readonly number[])
  * a *steady* tone's centroid have no variance to correlate, so two identical steady sounds
  * would have scored 0.5. An octave distance scores those 1 and still separates a falling
  * trajectory from a rising one with the same mean.
+ *
+ * Windows below `SPECTRAL_WINDOW_NOISE_GATE_DB` are left out of both the error and the
+ * reported means, on either side. A pair with one side under the gate is not a brightness
+ * disagreement at all - one of the two centroids is the noise floor's, so nothing was
+ * compared - and counting it produced exactly the phantom swings this gate exists to stop.
+ * The level difference that put the slice under the gate is not lost by leaving it out:
+ * `envelope`, `rmsDb` and `decayT60Ms` read level directly and are where a candidate that
+ * dies too early is charged for it.
  */
 function brightnessDetail(
   reference: readonly SpectralWindow[],
   candidate: readonly SpectralWindow[]
 ): AudioMetricComparisonDetail {
-  const mean = (windows: readonly SpectralWindow[]) =>
-    windows.reduce((sum, window) => sum + window.spectralCentroidHz, 0) / windows.length
+  const mean = (windows: readonly SpectralWindow[]) => {
+    const measured = windows.filter(window => !isSpectralWindowBelowNoiseFloor(window))
+    const counted = measured.length > 0 ? measured : windows
+    return counted.reduce((sum, window) => sum + window.spectralCentroidHz, 0) / counted.length
+  }
   // The two sides may have been analysed at different `windows` resolutions. Each window
   // is a fixed *fraction* of its own buffer, so index i of a 4-window run and index i of a
   // 16-window run describe different spans; the trajectories are therefore resampled onto
@@ -428,19 +509,36 @@ function brightnessDetail(
   const points = Math.min(reference.length, candidate.length)
   const at = (windows: readonly SpectralWindow[], index: number) =>
     windows[Math.min(windows.length - 1, Math.round(index * (windows.length - 1) / (points - 1)))]
-  let absoluteError = 0
+  const measuredErrors: number[] = []
+  const everyError: number[] = []
   for (let index = 0; index < points; index++) {
-    const left = Math.max(0, at(reference, index).spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
-    const right = Math.max(0, at(candidate, index).spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
-    absoluteError += Math.abs(Math.log2(right / left))
+    const referenceWindow = at(reference, index)
+    const candidateWindow = at(candidate, index)
+    const left = Math.max(0, referenceWindow.spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
+    const right = Math.max(0, candidateWindow.spectralCentroidHz) + BRIGHTNESS_FLOOR_HZ
+    const error = Math.abs(Math.log2(right / left))
+    everyError.push(error)
+    if (
+      !isSpectralWindowBelowNoiseFloor(referenceWindow) &&
+      !isSpectralWindowBelowNoiseFloor(candidateWindow)
+    ) {
+      measuredErrors.push(error)
+    }
   }
+  // The loudest slice of a buffer reads 0 dB by construction, so a pair always survives in
+  // practice; a resampling coarse enough to sample only gated slices on both sides falls
+  // back to the ungated comparison rather than scoring an empty mean.
+  const counted = measuredErrors.length > 0 ? measuredErrors : everyError
   const referenceMean = mean(reference)
   const candidateMean = mean(candidate)
   return {
     reference: referenceMean,
     candidate: candidateMean,
     delta: candidateMean - referenceMean,
-    similarity: exponentialSimilarity(absoluteError / points, BRIGHTNESS_SCALE_OCTAVES)
+    similarity: exponentialSimilarity(
+      counted.reduce((sum, error) => sum + error, 0) / counted.length,
+      BRIGHTNESS_SCALE_OCTAVES
+    )
   }
 }
 
@@ -454,14 +552,35 @@ function envelopeDetail(reference: readonly number[], candidate: readonly number
 }
 
 /**
- * The shared shape of every harmonic comparison term.
+ * The shared shape of every harmonic comparison term, and the one place the "which side is
+ * missing?" question is answered.
  *
- * Timbre is measurable on a side only when that side has a usable fundamental. Exactly one
- * side missing it is an absence of evidence - `similarity: null`, excluded from the overall
- * mean - by the same argument `decayDetail` already makes: scoring it 0 would say "as
- * unlike as two timbres can be" about a pair nothing ever compared, and would punish an
- * uploaded reference for being a recording rather than a render. Both sides missing is a
- * match at 1, as with two buffers that both never decayed.
+ * Timbre is measurable on a side only when that side has a usable fundamental. The three
+ * cases are not symmetric, and treating them as if they were is what let a candidate raise
+ * its overall score by destroying its own pitch: an unweighted mean over the terms that
+ * survive goes *up* when the terms a candidate was failing drop out of it. A high shelf
+ * pushed one eval candidate past the pitch detector, `harmonics` (0.08) and `tilt` (0.00)
+ * both went `null`, and the overall similarity reached a new best.
+ *
+ * - **Neither side has a fundamental.** Nothing was ever measurable and the two agree about
+ *   that, so the term matches at 1 - as two buffers that both never decayed do.
+ * - **The reference has none and the candidate does.** This is absence of evidence about
+ *   the *target*: `detectPitch` failing on an uploaded recording says nothing about what
+ *   the candidate should sound like, and scoring it would punish a reference for being a
+ *   recording rather than a render. `similarity: null`, excluded from the mean. A candidate
+ *   cannot reach this case by changing itself, so it is not a lever.
+ * - **The reference has one and the candidate does not.** This is not "not measurable". The
+ *   reference established that this dimension exists and what its value is; the candidate
+ *   answered with a sound that has no measurable partial series at all. That is a measured
+ *   failure of the candidate, and it scores 0 - the only assignment under which a candidate
+ *   can never improve by losing a dimension the reference has.
+ *
+ * `decayT60Ms` keeps the older symmetric rule (see `decayDetail`) on purpose. A null there
+ * is a property of the *measurement*: `measureDecayT60Ms` refuses the fit for curvature, for
+ * decays faster than one hop per 10 dB, and for buffers that end before -25 dB, so it is
+ * null for most reference material and for many perfectly good candidates. A null pitch is a
+ * property of the *sound* - nothing periodic was found in it - which is why the asymmetry
+ * belongs here and not there.
  */
 function harmonicTerm(
   reference: number | null,
@@ -473,7 +592,7 @@ function harmonicTerm(
       reference,
       candidate,
       delta: null,
-      similarity: reference === null && candidate === null ? 1 : null
+      similarity: reference === null ? (candidate === null ? 1 : null) : 0
     }
   }
   return {
@@ -610,10 +729,15 @@ export function compareAudioMetrics(reference: AudioMetrics, candidate: AudioMet
     // ever reported, and `inharmonicity` was computed and never compared at all.
     'harmonics' as const, 'tilt' as const, 'inharmonicity' as const
   ]
-  // A metric that could not be measured on one side is left out of the mean rather than
-  // averaged in as a zero: the pair carries no evidence either way, and counting it as
-  // maximal disagreement penalises a candidate for a property nothing established. The
-  // metric still appears in `details` with `similarity: null`, so the absence is legible.
+  // A metric the pair carries no evidence about is left out of the mean rather than averaged
+  // in as a zero: counting it as maximal disagreement would penalise a candidate for a
+  // property nothing established. The metric still appears in `details` with
+  // `similarity: null`, so the absence is legible.
+  //
+  // Exclusion is a hole in an unweighted mean, so it has to be reserved for genuine absence
+  // of evidence. `harmonicTerm` is where that line is drawn: a candidate that loses a
+  // dimension the reference *has* scores 0 on it and stays in the mean, so no candidate can
+  // raise this number by making itself less measurable.
   const contributing = overallKeys
     .map(key => details[key].similarity)
     .filter((value): value is number => value !== null)
@@ -1231,6 +1355,11 @@ function measureSpectralWindows(
       // Mirrors `envelopeDb`: with nothing to be relative to, the level is 0, not the floor.
       levelDb: loudestRms > 0 ? roundTenth(relativeToPeakDb(rms, loudestRms, ENVELOPE_FLOOR_DB)) : 0
     }
+    // Marked, never dropped: the count stays predictable and the bounds still tile the
+    // buffer, so a consumer can print `n/a (below the noise floor)` in the row's place.
+    // Set from the rounded `levelDb` the caller will read, so a caller re-deriving the gate
+    // from that field can never disagree with the flag.
+    if (isSpectralWindowBelowNoiseFloor(slice)) slice.belowNoiseFloor = true
     // A slice that fell silent still gets its twelve entries, all at the floor.
     if (reportHarmonics) slice.harmonicsDb = partialsDb(partials ?? SILENT_PARTIALS, loudestPartial)
     return slice

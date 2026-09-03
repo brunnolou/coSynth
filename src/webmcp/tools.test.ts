@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { PARAMS, defaultValues, normToValue, paramDef, paramIndex } from '../shared/params'
 import { DEFAULT_FX_ORDER, FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, defaultLfoShape, modSourceIndex, type ModSlotState } from '../shared/messages'
-import { FACTORY_PRESETS } from '../shared/factory-presets'
+import { FACTORY_PRESETS, getFactoryPreset } from '../shared/factory-presets'
+import { clearCurrentPreset, currentPresetState, listPresets, validatePresetData } from '../shared/preset-store'
 import type { PresetData, RecordedAudio, SynthEngine } from '../audio/engine'
 import { createWebMcpTools, type WebMcpToolDependencies } from './tools'
 import { encodeWav } from './offline-render'
@@ -27,6 +28,25 @@ class FakeEngine {
   ctx = { sampleRate: 8000 }
   scopeL = new Float32Array([0, 0.2, -0.2, 0])
   scopeR = new Float32Array([0, 0.1, -0.1, 0])
+  /**
+   * Stands in for the engine's rolling capture. Tests assign the whole buffer;
+   * `recentAudio` then slices the newest `seconds` out of it exactly as the real
+   * ring does, so a request longer than what is held returns what is held.
+   */
+  recentBuffer: [Float32Array, Float32Array] | null = null
+  recentAudio = vi.fn((seconds = 4) => {
+    if (!this.recentBuffer) return null
+    const sampleRate = this.ctx.sampleRate
+    const held = this.recentBuffer[0].length
+    const frames = Math.min(held, Math.max(1, Math.round(seconds * sampleRate)))
+    return {
+      channelData: this.recentBuffer.map(channel => channel.slice(held - frames)) as [Float32Array, Float32Array],
+      sampleRate,
+      duration: frames / sampleRate,
+      heldSeconds: held / sampleRate,
+      full: held >= 4 * sampleRate
+    }
+  })
   voiceCount = 2
   peakL = 0.2
   peakR = 0.1
@@ -84,10 +104,11 @@ function decodedReference(overrides: Partial<DecodedBase64Audio> = {}): DecodedB
 
 function setup(
   lifecycleSignal?: AbortSignal,
-  decodeAudio: NonNullable<WebMcpToolDependencies['decodeAudio']> = vi.fn(async () => decodedReference())
+  decodeAudio: NonNullable<WebMcpToolDependencies['decodeAudio']> = vi.fn(async () => decodedReference()),
+  extra: Omit<WebMcpToolDependencies, 'decodeAudio'> = {}
 ) {
   const engine = new FakeEngine()
-  const tools = createWebMcpTools(engine as unknown as SynthEngine, lifecycleSignal, { decodeAudio })
+  const tools = createWebMcpTools(engine as unknown as SynthEngine, lifecycleSignal, { decodeAudio, ...extra })
   const byName = new Map(tools.map(tool => [tool.name, tool]))
   const execute = async (name: string, input: Record<string, unknown> = {}, signal = new AbortController().signal) =>
     await byName.get(name)!.execute(input, { signal }) as any
@@ -95,6 +116,10 @@ function setup(
 }
 
 beforeEach(() => {
+  // Preset identity is module state in `preset-store.ts`, which is what makes it
+  // survive a reload of the tools in the real app - and what makes one test's
+  // `load_preset` leak into the next one's `get_synth_state` here.
+  clearCurrentPreset()
   vi.stubGlobal('localStorage', new MemoryStorage())
   vi.stubGlobal('URL', {
     createObjectURL: vi.fn(() => `blob:render-${Math.random()}`),
@@ -107,23 +132,34 @@ afterEach(() => {
 })
 
 describe('WebMCP tool metadata', () => {
-  it('exposes exactly fifteen strict object schemas in composable workflow order', () => {
+  it('exposes exactly eighteen strict object schemas in composable workflow order', () => {
     const { tools } = setup()
     // The three patch-editing tools sit together, `apply_patch` last of them
-    // because it composes the other two plus the preset save.
+    // because it composes the other two plus the preset save. `capture_audio`
+    // follows `analyze_audio`: it reads the same rolling buffer that tool's
+    // `source: "recent"` reads, and an agent that finds one should find the other.
+    // The preset block runs save/load/list/delete/export, the order the same five
+    // operations are named in every other CRUD surface an agent has seen.
     expect(tools.map(tool => tool.name)).toEqual([
       'get_synth_state', 'get_parameter_schema', 'update_parameters', 'set_modulation',
       'set_fx_order', 'apply_patch',
-      'play_notes', 'render_audio', 'analyze_audio', 'analyze_reference_audio',
-      'compare_audio', 'suggest_patch', 'save_preset', 'load_preset', 'list_presets'
+      'play_notes', 'render_audio', 'analyze_audio', 'capture_audio', 'analyze_reference_audio',
+      'compare_audio', 'suggest_patch', 'save_preset', 'load_preset', 'list_presets',
+      'delete_preset', 'export_preset'
     ])
     for (const tool of tools) {
       expect(tool.description.length).toBeGreaterThan(10)
       expect(tool.inputSchema).toMatchObject({ type: 'object', additionalProperties: false })
       expect(tool.execute).toBeTypeOf('function')
     }
+    // `capture_audio` belongs here and `analyze_audio` does not, which is the
+    // whole distinction: capture reads a ring the engine fills on its own —
+    // it plays nothing, renders nothing, and leaves no `last-render` behind.
+    // `export_preset` belongs here for a reason worth stating: it reads a stored
+    // preset through `listPresets`, never the store's `loadPreset`, so it cannot
+    // announce a load that never happened.
     expect(tools.filter(tool => tool.annotations?.readOnlyHint).map(tool => tool.name)).toEqual([
-      'get_synth_state', 'get_parameter_schema', 'suggest_patch', 'list_presets'
+      'get_synth_state', 'get_parameter_schema', 'capture_audio', 'suggest_patch', 'list_presets', 'export_preset'
     ])
     // `compare_audio` renders by default now, so it is no longer read-only:
     // it replaces `last-render`, and on the realtime fallback it makes sound.
@@ -132,7 +168,7 @@ describe('WebMCP tool metadata', () => {
     // replaces the active reference and resets the best-so-far with it.
     expect(tools.filter(tool => tool.annotations?.readOnlyHint === false).map(tool => tool.name)).toEqual([
       'update_parameters', 'set_modulation', 'set_fx_order', 'apply_patch', 'play_notes', 'render_audio',
-      'analyze_audio', 'analyze_reference_audio', 'compare_audio', 'save_preset', 'load_preset'
+      'analyze_audio', 'analyze_reference_audio', 'compare_audio', 'save_preset', 'load_preset', 'delete_preset'
     ])
     const reference = tools.find(tool => tool.name === 'analyze_reference_audio')!
     expect(reference.annotations?.untrustedContentHint).toBe(true)
@@ -168,9 +204,29 @@ describe('WebMCP tool metadata', () => {
     // accepted). ~1300 B per tool against ~1015 B before, and the prose half —
     // what a truncating client renders first — moved from ~338 to ~415 B per
     // tool, with the per-tool cap below unchanged at 600 B.
-    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(20000)
+    //
+    // Sixteen now: `capture_audio` costs 509 B of prose and 759 B of schema,
+    // and `analyze_audio`, `compare_audio` and `suggest_patch` each grew by a
+    // sentence for the rolling capture, the summary mode and the stale-advice
+    // warning. 19443 B -> 21444 B, i.e. 1340 B per tool against 1296 B for
+    // fifteen: the ceiling moved because a tool was added, not because the
+    // prose was allowed to spread. The per-tool cap is untouched, and every one
+    // of the four that changed was trimmed back under it.
+    //
+    // Eighteen: `delete_preset` and `export_preset` cost 755 B of prose and
+    // 512 B of schema, and `get_synth_state` grew a sentence for `patch.preset`.
+    // The raise is smaller than the additions, because the same round found
+    // three places where one fact was written twice and paid for twice —
+    // `capture_audio` restating the 21 ms scope trap that `analyze_audio` (where
+    // the wrong option is actually chosen) and the page brief both already
+    // carry, `list_presets` restating load_preset's shadowing rule, and
+    // `export_preset` restating it a third time. 21444 B -> 22954 B: 1275 B per
+    // tool against 1340 for sixteen, and 438 B of prose per tool against 444.
+    // Both averages fell, which is the only reading of this ceiling that means
+    // anything — the total may only grow when a tool is added.
+    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(23000)
     const prose = listing.reduce((total, tool) => total + bytes(tool.description), 0)
-    expect(prose).toBeLessThanOrEqual(6400)
+    expect(prose).toBeLessThanOrEqual(7900)
     for (const tool of listing) {
       // No single tool may dominate the read: render_audio's description alone
       // was 1273 B, a tenth of the whole listing.
@@ -876,7 +932,7 @@ describe('render and analysis tools', () => {
   it('selects the analysis source explicitly', async () => {
     vi.useFakeTimers()
     const { byName, execute } = setup()
-    expect((byName.get('analyze_audio')!.inputSchema as any).properties.source.enum).toEqual(['scope', 'last-render', 'reference'])
+    expect((byName.get('analyze_audio')!.inputSchema as any).properties.source.enum).toEqual(['scope', 'recent', 'last-render', 'reference'])
     await expect(execute('analyze_audio', { source: 'last-render' })).rejects.toThrow(/render_audio first/i)
 
     const rendering = execute('render_audio', { notes: [{ midi: 60, velocity: 1, start: 0, duration: 0.01 }], duration: 0.02 })
@@ -918,6 +974,196 @@ describe('render and analysis tools', () => {
     stopped.engine.running = false
     ;(stopped.engine as unknown as { ctx: null }).ctx = null
     await expect(stopped.execute('analyze_audio')).resolves.toMatchObject({ source: 'scope', sampleRate: 48000 })
+  })
+
+  /**
+   * A note that sounds for `noteSeconds` and then stops, followed by silence.
+   * The shape of the real complaint: the human plays, releases, and asks whether
+   * anything was heard, by which time the live scope holds only the silence.
+   */
+  function playedThenReleased(sampleRate: number, noteSeconds: number, silenceSeconds: number): Float32Array {
+    const noteFrames = Math.round(noteSeconds * sampleRate)
+    const total = noteFrames + Math.round(silenceSeconds * sampleRate)
+    const buffer = new Float32Array(total)
+    for (let index = 0; index < noteFrames; index++) {
+      // Struck and decaying, so there is a real attack and a real T60 to find.
+      const decay = Math.exp(-4 * index / noteFrames)
+      buffer[index] = 0.8 * decay * Math.sin(2 * Math.PI * 220 * index / sampleRate)
+    }
+    return buffer
+  }
+
+  /** A fake engine at a real sample rate, so "1024 samples" means 21 ms. */
+  function liveRateSetup() {
+    const running = setup()
+    running.engine.ctx = { sampleRate: 48000 }
+    return running
+  }
+
+  it('hears a note on the rolling capture that the 21 ms scope has already thrown away', async () => {
+    const { engine, execute } = liveRateSetup()
+    const played = playedThenReleased(48000, 0.5, 0.5)
+    engine.recentBuffer = [played, played.slice()]
+    // What the worklet's scope holds a beat after note-off: the newest 1024
+    // samples of a buffer whose last half-second is silence.
+    engine.scopeL = played.slice(played.length - 1024)
+    engine.scopeR = engine.scopeL.slice()
+
+    const scope = await execute('analyze_audio', { source: 'scope' })
+    const recent = await execute('analyze_audio', { source: 'recent' })
+
+    // 1024 samples at 48 kHz is 21.3 ms. The whole of what the scope can see is
+    // the silence after the note, so it answers "did you hear that?" with
+    // digital silence — the exact failure this source exists to fix.
+    expect(1024 / 48000).toBeCloseTo(0.0213, 4)
+    expect(scope.metrics.peakDb).toBeLessThanOrEqual(-100)
+    expect(scope.metrics.decayT60Ms).toBeNull()
+    expect(scope.scopeNote).toContain('21 ms')
+
+    // The same live output, kept instead of overwritten: a note with a level, an
+    // attack that took longer than the scope's entire window, and a decay.
+    expect(recent.source).toBe('recent')
+    expect(recent.duration).toBeCloseTo(1, 2)
+    expect(recent.metrics.peakDb).toBeGreaterThan(-6)
+    expect(recent.metrics.decayT60Ms).toBeGreaterThan(0)
+    expect(recent.metrics.envelopeDb).toHaveLength(64)
+    // The envelope spans a note rather than a fragment: the last of its 64
+    // points is far below the first, which 21 ms of steady tail can never show.
+    expect(recent.metrics.envelopeDb.at(-1)).toBeLessThan(recent.metrics.envelopeDb[0] - 20)
+    expect(recent.recentNote).toContain('LIVE output')
+  })
+
+  it('caps the analyzed window at what the buffer holds and refuses seconds on every other source', async () => {
+    const { engine, execute } = liveRateSetup()
+    const played = playedThenReleased(48000, 0.4, 0.1)
+    engine.recentBuffer = [played, played.slice()]
+
+    const half = await execute('analyze_audio', { source: 'recent', seconds: 0.25 })
+    expect(half.duration).toBeCloseTo(0.25, 3)
+    expect(half.heldSeconds).toBeCloseTo(0.5, 2)
+
+    // Asking for more than the ring holds returns the ring, not padding.
+    const all = await execute('analyze_audio', { source: 'recent', seconds: 4 })
+    expect(all.duration).toBeCloseTo(0.5, 2)
+
+    await expect(execute('analyze_audio', { source: 'recent', seconds: 5 })).rejects.toThrow(/limited to 4/)
+    await expect(execute('analyze_audio', { source: 'scope', seconds: 1 })).rejects.toThrow(/only accepted with source: "recent"/)
+  })
+
+  it('says the capture is empty rather than analyzing a buffer that was never filled', async () => {
+    const { execute } = liveRateSetup()
+    await expect(execute('analyze_audio', { source: 'recent' })).rejects.toThrow(/rolling capture is empty/i)
+    await expect(execute('capture_audio')).rejects.toThrow(/CLICK TO START AUDIO/)
+    // Naming the offline escape matters: render_audio is what an agent should
+    // reach for when no human is at the keyboard.
+    await expect(execute('capture_audio')).rejects.toThrow(/render_audio/)
+  })
+
+  it('captures the requested window and hands back the samples the metrics describe', async () => {
+    const { engine, byName, execute } = liveRateSetup()
+    const played = playedThenReleased(48000, 1, 0)
+    engine.recentBuffer = [played, played.slice()]
+
+    const result = await execute('capture_audio', { captureSeconds: 0.5, format: 'base64' })
+    expect(result.source).toBe('recent')
+    expect(result.duration).toBeCloseTo(0.5, 3)
+    expect(result.requestedSeconds).toBe(0.5)
+    expect(result.silent).toBe(false)
+    expect(result).not.toHaveProperty('silenceNote')
+    expect(result.audio).toMatchObject({ mimeType: 'audio/wav', channels: 1, base64: expect.any(String) })
+    expect(result.audio.base64.length).toBeGreaterThan(100)
+    // The honest answer to "return actual audio content": WebMCP's execute
+    // returns a JSON value and the API has no audio content block, so Base64
+    // inside the JSON is the whole of what this transport can carry.
+    expect(result.audio.transportNote).toMatch(/no audio content block/i)
+    expect(byName.get('capture_audio')!.annotations).toMatchObject({ readOnlyHint: true })
+    expect(await execute('capture_audio')).not.toHaveProperty('audio')
+  })
+
+  it('reports a silent buffer as silence instead of failing the call', async () => {
+    const { engine, execute } = liveRateSetup()
+    const silence = new Float32Array(48000)
+    engine.recentBuffer = [silence, silence.slice()]
+
+    const result = await execute('capture_audio', { captureSeconds: 0.5 })
+    // Nobody played anything is an answer, not an error: the caller asked what
+    // came out of the speakers and the truthful reply is "nothing".
+    expect(result.silent).toBe(true)
+    expect(result.metrics.peakDb).toBeLessThanOrEqual(-100)
+    expect(result.silenceNote).toMatch(/digital silence/i)
+    expect(result.silenceNote).toMatch(/render_audio/)
+  })
+
+  it('waits for a human to start playing, then captures the sound that arrived', async () => {
+    vi.useFakeTimers()
+    const { engine, execute } = liveRateSetup()
+    const silence = new Float32Array(48000)
+    engine.recentBuffer = [silence, silence.slice()]
+
+    const capturing = execute('capture_audio', { waitForSignal: true, captureSeconds: 0.5, maxWaitSeconds: 3 })
+    await vi.advanceTimersByTimeAsync(200)
+    // The human plays a second into the wait; the ring fills behind the poll.
+    const played = playedThenReleased(48000, 0.5, 0)
+    engine.recentBuffer = [played, played.slice()]
+    await vi.advanceTimersByTimeAsync(1000)
+
+    const result = await capturing
+    expect(result.waitForSignal).toBe(true)
+    expect(result.signalDetected).toBe(true)
+    expect(result.silent).toBe(false)
+    expect(result.metrics.peakDb).toBeGreaterThan(-6)
+    // Detected around 200 ms, then `captureSeconds` more so the window ends up
+    // holding the note instead of the silence it began in.
+    expect(result.waitedSeconds).toBeGreaterThanOrEqual(0.7)
+    expect(result.waitedSeconds).toBeLessThan(1.2)
+  })
+
+  it('treats a wait that hears nothing as a silent window rather than a timeout error', async () => {
+    vi.useFakeTimers()
+    const { engine, execute } = liveRateSetup()
+    const silence = new Float32Array(48000)
+    engine.recentBuffer = [silence, silence.slice()]
+
+    const capturing = execute('capture_audio', { waitForSignal: true, captureSeconds: 0.5, maxWaitSeconds: 1 })
+    await vi.advanceTimersByTimeAsync(1500)
+    const result = await capturing
+
+    expect(result.signalDetected).toBe(false)
+    expect(result.waitedSeconds).toBeGreaterThanOrEqual(1)
+    expect(result.silent).toBe(true)
+    expect(result.silenceNote).toMatch(/nobody played/i)
+  })
+
+  it('cancels a wait the moment the invocation is aborted, and bounds how long it may run', async () => {
+    vi.useFakeTimers()
+    const { engine, byName, execute } = liveRateSetup()
+    const silence = new Float32Array(48000)
+    engine.recentBuffer = [silence, silence.slice()]
+
+    const controller = new AbortController()
+    const capturing = execute('capture_audio', { waitForSignal: true, maxWaitSeconds: 10 }, controller.signal)
+    await vi.advanceTimersByTimeAsync(100)
+    controller.abort()
+    await expect(capturing).rejects.toThrow(/aborted/i)
+
+    // A call that sits waiting is a call the client is timing out against, so
+    // the ceiling is part of the schema rather than a matter of taste.
+    expect((byName.get('capture_audio')!.inputSchema as any).properties.maxWaitSeconds.maximum).toBe(10)
+    await expect(execute('capture_audio', { waitForSignal: true, maxWaitSeconds: 11 })).rejects.toThrow(/limited to 10/)
+    await expect(execute('capture_audio', { maxWaitSeconds: 3 })).rejects.toThrow(/waitForSignal: true/)
+    await expect(execute('capture_audio', { captureSeconds: 9 })).rejects.toThrow(/limited to 4/)
+  })
+
+  it('refuses to capture once the page lifecycle has been torn down', async () => {
+    const lifecycle = new AbortController()
+    const { engine, execute } = setup(lifecycle.signal)
+    engine.ctx = { sampleRate: 48000 }
+    const played = playedThenReleased(48000, 0.5, 0)
+    engine.recentBuffer = [played, played.slice()]
+    await expect(execute('capture_audio', { captureSeconds: 0.25 })).resolves.toMatchObject({ silent: false })
+
+    lifecycle.abort()
+    await expect(execute('capture_audio', { captureSeconds: 0.25 })).rejects.toThrow(/aborted/i)
   })
 
   it('analyzes Base64 reference PCM with the same metrics without returning Base64 or PCM', async () => {
@@ -1014,7 +1260,9 @@ describe('render and analysis tools', () => {
 
     const reference = await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', mimeType: 'audio/wav' })
     const analysis = await execute('analyze_audio')
-    const result = await execute('compare_audio')
+    // `format: "json"` is where "candidate is exactly what analyze_audio
+    // returns" holds; text mode drops the arrays its table restates, and says so.
+    const result = await execute('compare_audio', { format: 'json' })
     expect(result.reference).toEqual(reference)
     expect(result.candidate).toEqual(analysis)
     expect(result.comparison.similarity).toBeGreaterThanOrEqual(0)
@@ -1023,6 +1271,89 @@ describe('render and analysis tools', () => {
       'peakDb', 'rmsDb', 'clippingCount', 'dcOffset',
       'spectralCentroidHz', 'attackMs', 'stereoWidth'
     ]))
+  })
+
+  /**
+   * A comparison against a reference long enough to carry real spectral
+   * windows, so the response sizes below are the ones an agent actually pays.
+   */
+  async function comparisonSizes(windows: number) {
+    const target = Float32Array.from({ length: 8000 }, (_, index) =>
+      0.6 * Math.exp(-2 * index / 8000) * Math.sin(2 * Math.PI * 220 * index / 8000))
+    const decodeAudio = vi.fn(async () => decodedReference({
+      decodedBytes: target.length * 4, duration: 1, channelData: [target]
+    }))
+    const { execute } = setup(undefined, decodeAudio)
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'target.wav', windows })
+    const comparing = execute('compare_audio', { format: 'text' })
+    await vi.advanceTimersByTimeAsync(1200)
+    const text = await comparing
+    const comparingJson = execute('compare_audio', { format: 'json' })
+    await vi.advanceTimersByTimeAsync(1200)
+    const json = await comparingJson
+    const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length
+    return {
+      text, json,
+      textBytes: bytes(text),
+      jsonBytes: bytes(json),
+      // What text mode cost before the arrays were trimmed out of it: the same
+      // response with both metrics objects whole, which is what it used to be.
+      previousTextBytes: bytes(text) - bytes(text.reference) - bytes(text.candidate) - bytes(text.metricsOmitted)
+        + bytes(json.reference) + bytes(json.candidate)
+    }
+  }
+
+  it('makes text mode a summary in the strict sense, without moving one byte of `comparison`', async () => {
+    vi.useFakeTimers()
+    const { text, json, textBytes, jsonBytes, previousTextBytes } = await comparisonSizes(4)
+
+    // The defect: the table was additive on top of two complete metrics objects,
+    // so every band, envelope point and spectral window was serialised twice —
+    // once as the prose an agent reads and once as arrays it does not.
+    for (const side of [text.reference, text.candidate]) {
+      expect(side.metrics).not.toHaveProperty('envelopeDb')
+      expect(side.metrics).not.toHaveProperty('bandsDb')
+      expect(side.metrics).not.toHaveProperty('spectralWindows')
+      expect(side).not.toHaveProperty('metricNotes')
+      // Everything a text-mode caller might want and the table lacks survives.
+      expect(side.metrics).toMatchObject({ peakDb: expect.any(Number), loudnessDb: expect.any(Number) })
+    }
+    expect(text.metricsOmitted.fields).toEqual(['envelopeDb', 'bandsDb', 'spectralWindows', 'metricNotes'])
+    expect(text.metricsOmitted.note).toContain('format: "json"')
+    expect(json.candidate.metrics.envelopeDb).toHaveLength(64)
+    expect(json).not.toHaveProperty('metricsOmitted')
+
+    // The eval-comparability guard. `docs/agent-match-eval.md` reads
+    // `detailSimilarities` and `similarityTrajectory` off `comparison`; a
+    // response that trimmed it in one mode would make every recorded run
+    // incomparable with every other. Byte-identical, not merely equivalent.
+    expect(JSON.stringify(text.comparison)).toBe(JSON.stringify(json.comparison))
+
+    // The budget, and why it is the number it is. The trimmed fields are ~2.9 kB
+    // of a ~10.9 kB response, so text mode has to land under three quarters of
+    // what it used to cost. It must also come in under json mode — the mode it
+    // claims to summarize — which it could not while carrying json's arrays AND
+    // a 1.8 kB table on top of them. Measured against json twice: whole, and
+    // with the table set aside, because the structured half is the part the two
+    // modes actually have in common and it is a quarter smaller here.
+    const tableBytes = new TextEncoder().encode(text.text).length
+    expect(tableBytes).toBeGreaterThan(1000)
+    expect(textBytes).toBeLessThan(previousTextBytes * 0.75)
+    expect(textBytes).toBeLessThan(jsonBytes)
+    expect(textBytes - tableBytes).toBeLessThan(jsonBytes * 0.75)
+    expect(textBytes).toBeLessThanOrEqual(8200)
+  })
+
+  it('stops text mode growing with the window count, which is where the arrays hurt most', async () => {
+    vi.useFakeTimers()
+    const few = await comparisonSizes(4)
+    const many = await comparisonSizes(12)
+
+    // Each spectral window carries twelve partials per side, so `windows` is the
+    // multiplier on the very arrays text mode drops. json triples them; text
+    // mode pays only the handful of extra columns the BRIGHTNESS row prints.
+    expect(many.jsonBytes - few.jsonBytes).toBeGreaterThan(1500)
+    expect(many.textBytes - few.textBytes).toBeLessThan(400)
   })
 
   it('carries the session best so a peak that has passed is visible in one response', async () => {
@@ -1147,7 +1478,7 @@ describe('render and analysis tools', () => {
     })
     await vi.advanceTimersByTimeAsync(30)
     const render = await rendering
-    const result = await execute('compare_audio')
+    const result = await execute('compare_audio', { format: 'json' })
     expect(result.reference).toEqual(latest)
     expect(result.reference.name).toBe('latest.wav')
     expect(result.candidate).toMatchObject({ source: 'last-render', metrics: render.metrics, url: render.url })
@@ -1700,6 +2031,162 @@ describe('preset tools', () => {
       .rejects.toThrow(/in either the factory presets or this browser's user presets/)
     await expect(execute('load_preset', { name: 'Init', source: 'both' })).rejects.toThrow(/source must be one of/)
   })
+
+  /** A preset that carries one real parameter, which `loadPreset` on the fake engine applies back. */
+  function volumePreset(engine: FakeEngine) {
+    return (name: string): PresetData => ({
+      name, version: 2, params: { 'master.volume': engine.values[paramIndex('master.volume')] }, mods: [],
+      lfoShapes: engine.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
+    })
+  }
+
+  it('answers "is there unsaved work here" in get_synth_state, in both formats', async () => {
+    const { engine, execute } = setup()
+    engine.toPreset.mockImplementation(volumePreset(engine))
+
+    // Nothing loaded: no name, and `dirty` is false because there is nothing to
+    // differ from. Reporting an unattributed patch as modified would be true of
+    // every fresh page and therefore useless.
+    expect((await execute('get_synth_state')).patch.preset).toEqual({ name: null, source: null, dirty: false })
+
+    await execute('save_preset', { name: 'Bench' })
+    expect((await execute('get_synth_state')).patch.preset).toEqual({ name: 'Bench', source: 'user', dirty: false })
+
+    await execute('update_parameters', { updates: [{ id: 'master.volume', value: 0.5 }] })
+    expect((await execute('get_synth_state')).patch.preset).toEqual({ name: 'Bench', source: 'user', dirty: true })
+
+    // A real round trip: the fake engine applies `master.volume` back out of the
+    // stored preset, so this is the value returning, not the flag being reset.
+    await execute('load_preset', { name: 'Bench' })
+    expect((await execute('get_synth_state')).patch.preset).toEqual({ name: 'Bench', source: 'user', dirty: false })
+    expect(normToValue(paramDef('master.volume'), engine.values[paramIndex('master.volume')])).toBeCloseTo(0.7)
+
+    // A factory load is attributed to the factory space, and is clean on arrival:
+    // the reference is read back out of the ENGINE, not off the file, so the
+    // parameters a factory preset omits do not read as edits.
+    await execute('load_preset', { name: 'Deep Saw Bass' })
+    const factory = { name: 'Deep Saw Bass', source: 'factory', dirty: false }
+    expect((await execute('get_synth_state')).patch.preset).toEqual(factory)
+    // Compact is the format an agent verifying a patch actually calls, so the
+    // answer has to be there too - and it is three short fields, not a page.
+    expect((await execute('get_synth_state', { format: 'compact' })).patch.preset).toEqual(factory)
+  })
+
+  it('deletes a user preset, refuses a factory name, and says which space it searched', async () => {
+    const { engine, execute } = setup()
+    engine.toPreset.mockImplementation(volumePreset(engine))
+    await execute('save_preset', { name: 'Scratch' })
+
+    const deleted = await execute('delete_preset', { name: 'Scratch' })
+    expect(deleted).toMatchObject({ name: 'Scratch', deleted: true, storage: 'localStorage', detachedCurrentPatch: true })
+    expect(deleted.note).toMatch(/patch loaded in the synth is untouched/)
+    expect(deleted.note).toMatch(/no longer attributed to one/)
+    expect((await execute('list_presets')).user).toBe(0)
+    // The patch on screen is untouched by a delete, but it is no longer a copy of
+    // anything that exists, so it stops being attributed to the deleted preset.
+    expect((await execute('get_synth_state')).patch.preset).toEqual({ name: null, source: null, dirty: false })
+
+    // A factory preset is compiled into the page; deleting it is not a thing that
+    // can be done, and the refusal says why rather than reporting "not found".
+    await expect(execute('delete_preset', { name: 'Deep Saw Bass' }))
+      .rejects.toThrow(/factory preset.*cannot be deleted/)
+    expect((await execute('load_preset', { name: 'Deep Saw Bass' })).loaded).toBe(true)
+
+    // An unknown name searched the user space, which is the only space a delete
+    // can touch, and the message says so instead of leaving it to list_presets.
+    await expect(execute('delete_preset', { name: 'Never Saved' }))
+      .rejects.toThrow(/among this browser's user presets: Never Saved/)
+    await expect(execute('delete_preset', { name: ' ' })).rejects.toThrow(/preset name/i)
+  })
+
+  it('deletes a user preset that shadows a factory name and hands the built-in one back', async () => {
+    const { engine, execute } = setup()
+    engine.toPreset.mockImplementation((name: string): PresetData => ({
+      name, version: 2, params: { 'master.volume': 0.125 }, mods: [],
+      lfoShapes: engine.lfoShapes.map(shape => shape.map(point => ({ ...point }))), fxOrder: [...FX_IDS]
+    }))
+    await execute('save_preset', { name: 'Deep Saw Bass' })
+    expect((await execute('load_preset', { name: 'Deep Saw Bass' })).source).toBe('user')
+
+    // Deliberate work saved under a factory name is still the only copy of it, so
+    // it IS deletable - and what comes back is the built-in patch, which is the
+    // only outcome a human would expect.
+    const deleted = await execute('delete_preset', { name: 'Deep Saw Bass' })
+    expect(deleted).toMatchObject({ name: 'Deep Saw Bass', deleted: true, factoryPresetRestored: true })
+    expect(deleted.note).toMatch(/returns the built-in patch again/)
+    expect(listPresets()).toEqual([])
+
+    const restored = await execute('load_preset', { name: 'Deep Saw Bass' })
+    expect(restored).toEqual({ name: 'Deep Saw Bass', loaded: true, source: 'factory' })
+    expect(engine.loadPreset.mock.lastCall![0].mods).toEqual([
+      { source: 'env2', dest: 'filter1.cutoff', depth: 0.45, enabled: true }
+    ])
+  })
+
+  it('exports factory, user and live patches as JSON an import takes back', async () => {
+    const { engine, execute } = setup()
+    engine.toPreset.mockImplementation(volumePreset(engine))
+
+    const factory = await execute('export_preset', { name: 'Deep Saw Bass' })
+    expect(factory).toMatchObject({ name: 'Deep Saw Bass', source: 'factory', filename: 'deep-saw-bass.cosynth.json' })
+    expect(factory.where).toMatch(/Nothing was written to disk/)
+    // The round trip is the whole contract: what comes out has to go back in.
+    const reimported = validatePresetData(JSON.parse(factory.json))
+    expect(reimported).toEqual(getFactoryPreset('Deep Saw Bass'))
+    expect(reimported.version).toBe(2)
+
+    await execute('save_preset', { name: 'Mine' })
+    const user = await execute('export_preset', { name: 'Mine' })
+    expect(user).toMatchObject({ name: 'Mine', source: 'user', filename: 'mine.cosynth.json' })
+    expect(validatePresetData(JSON.parse(user.json)).params['master.volume']).toBeCloseTo(engine.values[paramIndex('master.volume')])
+
+    // No name at all is the live patch, named after whatever it came from.
+    const live = await execute('export_preset')
+    expect(live).toMatchObject({ name: 'Mine', source: 'live' })
+    expect(live.note).toMatch(/still matches the user preset "Mine"/)
+    await execute('update_parameters', { updates: [{ id: 'master.volume', value: 0.5 }] })
+    const edited = await execute('export_preset')
+    expect(edited.note).toMatch(/HAS been edited since/)
+    expect(validatePresetData(JSON.parse(edited.json)).params['master.volume'])
+      .toBeCloseTo(engine.values[paramIndex('master.volume')])
+
+    // With nothing loaded the live patch still exports, under a name of its own.
+    clearCurrentPreset()
+    const unattributed = await execute('export_preset')
+    expect(unattributed).toMatchObject({ name: 'coSynth Patch', filename: 'cosynth-patch.cosynth.json' })
+    expect(unattributed.note).toMatch(/not a copy of any saved preset/)
+
+    await expect(execute('export_preset', { name: 'Nope' })).rejects.toThrow(/in either the factory presets/)
+    await expect(execute('export_preset', { source: 'user' })).rejects.toThrow(/needs a `name`/)
+  })
+
+  it('exports without announcing a load that never happened', async () => {
+    const { engine, execute } = setup()
+    engine.toPreset.mockImplementation(volumePreset(engine))
+    await execute('save_preset', { name: 'Held' })
+    await execute('update_parameters', { updates: [{ id: 'master.volume', value: 0.5 }] })
+    const before = currentPresetState(engine as unknown as SynthEngine)
+    expect(before).toEqual({ name: 'Held', source: 'user', dirty: true })
+
+    // The trap this tool was written around: reading a stored preset through the
+    // store's `loadPreset` notifies every preset-store listener, so an export
+    // would jump the UI's dropdown to a patch nobody loaded and reattribute the
+    // live patch to it. `listPresets` reads without announcing.
+    await execute('export_preset', { name: 'Held' })
+    await execute('export_preset', { name: 'Deep Saw Bass' })
+    await execute('export_preset')
+    expect(currentPresetState(engine as unknown as SynthEngine)).toEqual(before)
+    expect(engine.loadPreset).not.toHaveBeenCalled()
+
+    // A user preset wins the name here too, and says the built-in one was passed over.
+    await execute('save_preset', { name: 'Init' })
+    const shadowing = await execute('export_preset', { name: 'Init' })
+    expect(shadowing).toMatchObject({ source: 'user', shadowedFactoryPreset: true })
+    expect(JSON.parse(shadowing.json).params).toHaveProperty('master.volume')
+    const builtIn = await execute('export_preset', { name: 'Init', source: 'factory' })
+    expect(builtIn).toMatchObject({ source: 'factory' })
+    expect(builtIn).not.toHaveProperty('shadowedFactoryPreset')
+  })
 })
 
 describe('fx order tool', () => {
@@ -2069,12 +2556,13 @@ describe('matching a reference: harmonics on both sides, a gradient, and advice'
 
   function matchSetup(
     decoded: () => DecodedBase64Audio = pitchedReference,
-    renderOffline: ReturnType<typeof renderer> = renderer()
+    renderOffline: ReturnType<typeof renderer> = renderer(),
+    extra: Omit<WebMcpToolDependencies, 'renderOffline' | 'decodeAudio'> = {}
   ) {
     const engine = new FakeEngine()
     engine.running = false
     const decodeAudio = vi.fn(async () => decoded())
-    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, { renderOffline, decodeAudio })
+    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, { renderOffline, decodeAudio, ...extra })
     const byName = new Map(tools.map(tool => [tool.name, tool]))
     const execute = async (name: string, input: Record<string, unknown> = {}) =>
       await byName.get(name)!.execute(input, { signal: new AbortController().signal }) as any
@@ -2170,6 +2658,66 @@ describe('matching a reference: harmonics on both sides, a gradient, and advice'
     expect(capped.diff.actions).toHaveLength(1)
   })
 
+  /**
+   * A candidate whose upper partials collapse far faster than the reference's,
+   * so the brightness error drifts across the buffer and `filter-envelope-depth`
+   * has something to fire on. The reference decays as a whole and keeps its
+   * partial balance; this one goes dark while it is still sounding.
+   */
+  function darkeningRenderer() {
+    return vi.fn(async (_engine: unknown, notes: readonly { midi: number }[], duration: number): Promise<RecordedAudio> => {
+      const length = Math.max(64, Math.round(duration * RATE))
+      const f0 = 440 * Math.pow(2, ((notes[0]?.midi ?? 69) - 69) / 12)
+      const channel = Float32Array.from({ length }, (_, index) => {
+        const t = index / RATE
+        const bright = Math.exp(-3 * t)
+        let value = Math.sin(2 * Math.PI * f0 * t)
+        for (let partial = 2; partial <= 6; partial++) {
+          value += bright * Math.sin(2 * Math.PI * f0 * partial * t) / partial
+        }
+        return 0.45 * Math.exp(-2 * t) * value
+      })
+      return wav([channel, channel.slice()], duration)
+    })
+  }
+
+  /** The `filter-envelope-depth` finding, whatever branch it fired from. */
+  function envelopeDepthAction(result: any) {
+    return result.diff.actions.find((action: any) =>
+      action.paramIds?.includes('env2.decay') && action.finding.includes('env2 -> filter1.cutoff'))
+  }
+
+  it('reads the live mod matrix, so a missing route is advised as set_modulation rather than an inert env2.decay', async () => {
+    const { execute } = matchSetup(pitchedReference, darkeningRenderer())
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+
+    // The reviewer's complaint: env2 reaches the sound through this one route and
+    // nothing else, so with no route in the patch `env2.decay` is inert and
+    // recommending it is advice that cannot work however many rounds it is applied.
+    const missing = envelopeDepthAction(await execute('compare_audio'))
+    expect(missing).toBeDefined()
+    expect(missing.finding).toContain('set_modulation source=env2 destination=filter1.cutoff')
+    expect(missing.finding).toMatch(/INERT in this patch/)
+    // No move is offered, because the move that would help has no parameter id.
+    expect(missing.suggested).toBeUndefined()
+    expect(missing.finding).not.toMatch(/passed no modulation matrix/)
+
+    // Create the route and the same measurement reads differently: the advice
+    // now knows the lever exists, and reads its sign rather than assuming one.
+    await execute('set_modulation', { action: 'add', source: 'env2', destination: 'filter1.cutoff', depth: 0.45 })
+    const live = envelopeDepthAction(await execute('compare_audio'))
+    expect(live).toBeDefined()
+    expect(live.finding).toContain('route is live at depth 0.45')
+    expect(live.finding).not.toContain('set_modulation source=env2')
+    expect(live.suggested).toMatchObject({ id: 'env2.decay' })
+
+    // suggest_patch re-reads the same comparison and must see the same matrix:
+    // it builds its own advice rather than replaying the stored actions.
+    const advised = (await execute('suggest_patch', { focus: 'envelope' })).actions
+      .find((action: any) => action.finding.includes('env2 -> filter1.cutoff'))
+    expect(advised.finding).toContain('route is live at depth 0.45')
+  })
+
   it('keeps the legacy comparison shape, and the full numeric diff, under format json', async () => {
     const { execute } = matchSetup()
     await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
@@ -2202,6 +2750,57 @@ describe('matching a reference: harmonics on both sides, a gradient, and advice'
     const focused = await execute('suggest_patch', { focus: 'envelope', maxActions: 20 })
     expect(focused.actions.length).toBeLessThanOrEqual(again.actions.length + 20)
     await expect(execute('suggest_patch', { focus: 'nope' })).rejects.toThrow(/focus/i)
+    expect(again.basedOn.note).not.toMatch(/CHANGED/)
+    expect(again.basedOn).not.toHaveProperty('currentSoundEntryId')
+  })
+
+  it('warns that the sound moved under the advice, without withholding the advice', async () => {
+    let currentSoundEntryId = 'entry-1'
+    const { execute } = matchSetup(pitchedReference, renderer(), {
+      currentSoundEntryId: () => currentSoundEntryId
+    })
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'target.wav' })
+    const compared = await execute('compare_audio')
+
+    const fresh = await execute('suggest_patch')
+    expect(fresh.basedOn.stale).toBe(false)
+
+    // The agent takes the advice. Every patch edit commits a new sound-history
+    // entry, which is exactly what makes the previous comparison describe a
+    // sound that no longer exists.
+    currentSoundEntryId = 'entry-2'
+    const stale = await execute('suggest_patch')
+
+    expect(stale.basedOn.stale).toBe(true)
+    expect(stale.basedOn.comparedSoundEntryId).toBe('entry-1')
+    expect(stale.basedOn.currentSoundEntryId).toBe('entry-2')
+    expect(stale.basedOn.note).toMatch(/THE SOUND HAS CHANGED/)
+    expect(stale.basedOn.note).toMatch(/scores the patch you REPLACED/)
+    expect(stale.basedOn.note).toMatch(/compare_audio/)
+    // Warn, do not refuse. The measurement really happened, and the moves are
+    // re-derived against the patch as it is now, so they stay applicable — the
+    // sequence that trips this warning (apply the advice, ask what is next) is
+    // the one an agent should be doing. Only the *number* is about the old sound.
+    expect(stale.actions).toEqual(compared.diff.actions)
+    expect(stale.basedOn.similarity).toBe(fresh.basedOn.similarity)
+
+    // Undo restores the entry the comparison was measured against, so returning
+    // to that sound is not a change and must not keep warning.
+    currentSoundEntryId = 'entry-1'
+    expect((await execute('suggest_patch')).basedOn.stale).toBe(false)
+  })
+
+  it('claims nothing about staleness on a page with no sound history to compare against', async () => {
+    const { execute } = matchSetup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    await execute('compare_audio')
+    // Without `currentSoundEntryId` there is no way to know whether the patch
+    // moved, and `stale: false` would be a checked fact a caller is entitled to
+    // trust. Absent says "unknown"; false would be a lie of the kind
+    // SILENT_CANDIDATE_REFUSAL exists to prevent.
+    const advice = await execute('suggest_patch')
+    expect(advice.basedOn).not.toHaveProperty('stale')
+    expect(advice.basedOn.note).toMatch(/Re-read of the last compare_audio/)
   })
 
   it('measures the candidate\'s own pitch, so a transposed patch reports a real cents error', async () => {

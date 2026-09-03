@@ -9,7 +9,7 @@ import { chromium } from 'playwright'
 // instead.
 // Thirteen synth tools, four history tools, two guide tools. `webmcp-smoke.mjs`
 // holds the names; this file only ever needs the total.
-const TOOL_COUNT = 21
+const TOOL_COUNT = 24
 
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined })
 try {

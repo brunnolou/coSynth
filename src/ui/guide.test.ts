@@ -93,7 +93,9 @@ describe('UiGuideController with Driver.js', () => {
    */
   it('returns every teaching target as one line each in a single unpaged call', () => {
     target('param.env1.release', app, 'env1 Release', 'knob')
-    target('tab.env1', app, 'Env 1 amplitude envelope', 'tab')
+    // Active, as the tab whose knobs are the mounted ones always is: an
+    // inactive ENV tab is what makes the rest of its parameters predictable.
+    target('tab.env1', app, 'Env 1 amplitude envelope', 'tab').classList.add('on')
     target('fx.delay', app, 'Delay / echo effect', 'panel').hidden = true
 
     const page = guide.listTargets({ format: 'compact' })
@@ -111,7 +113,7 @@ describe('UiGuideController with Driver.js', () => {
 
   it('keeps compact paging and filtering honest, and leaves the full format alone', () => {
     target('param.env1.release', app, 'env1 Release', 'knob')
-    target('tab.env1', app, 'Env 1 amplitude envelope', 'tab')
+    target('tab.env1', app, 'Env 1 amplitude envelope', 'tab').classList.add('on')
     target('fx.delay', app, 'Delay / echo effect', 'panel')
 
     expect(guide.listTargets({ format: 'compact', search: 'echo' })).toMatchObject({
@@ -306,15 +308,108 @@ describe('UiGuideController with Driver.js', () => {
       expect(guide.listTargets({ search: 'Save preset' }).items).toEqual([
         { id: 'button.preset.save', label: 'Save preset', type: 'button', visible: false, revealable: true }
       ])
-      // A wrong ID and a closed tab both return nothing; only `unmatched` says
-      // which of the two happened.
-      envTabs()
-      expect(guide.listTargets({ search: 'param.env1.release' })).toMatchObject({
-        total: 0, unmatched: { search: 'param.env1.release', revealable: true, opens: ['tab.env1'] }
-      })
+      // A wrong ID is the one thing that still comes back empty, and it comes
+      // back empty in a shape of its own rather than as a fabricated row.
       expect(guide.listTargets({ search: 'param.reverb.sizzle' })).toMatchObject({
         total: 0, unmatched: { search: 'param.reverb.sizzle', revealable: false, opens: [] }
       })
+    })
+
+    /**
+     * The three states an agent has to tell apart, as three ordinary rows.
+     *
+     * The knobs of an unselected ENV tab are not in the document at all -
+     * `renderEnvKnobs` throws the previous tab's away - so this used to be an
+     * empty list with a note beside it. It is a row now, marked `mounted:
+     * false` because it is predicted from `PARAMS` rather than read off an
+     * element, and a wrong ID is still the only thing that returns nothing.
+     */
+    it('lists a control its tab has not built yet as an ordinary target', () => {
+      envTabs()
+      const visible = target('param.filter1.cutoff', app, 'filter1 Cutoff', 'knob')
+      const hidden = target('param.osc1.morph', panel('osc', 'Osc'), 'osc1 Morph', 'knob')
+      const find = (id: string) => (guide.listTargets({ search: id }).items as GuideTargetInfo[])
+        .find(item => item.id === id)
+
+      expect(find('param.env2.release')).toEqual({
+        id: 'param.env2.release', label: 'env2 Release', type: 'knob', visible: true
+      })
+      // Present, hidden, and the guide can open what hides it.
+      expect(find('param.osc1.morph')).toEqual({
+        id: 'param.osc1.morph', label: 'osc1 Morph', type: 'knob', visible: false, revealable: true
+      })
+      // Not present at all, and honest about which of the two it is.
+      expect(find('param.env1.release')).toEqual({
+        id: 'param.env1.release', label: 'env1 Release', type: 'knob',
+        visible: false, revealable: true, mounted: false
+      })
+      expect(find('param.filter1.cutoff')).toEqual({
+        id: 'param.filter1.cutoff', label: 'filter1 Cutoff', type: 'knob', visible: true
+      })
+      expect(find('param.env1.nonsense')).toBeUndefined()
+      expect(visible.isConnected && hidden.isConnected).toBe(true)
+
+      // The compact line carries the same three states.
+      const lines = guide.listTargets({ format: 'compact', search: 'env1' }).items as string[]
+      expect(lines).toContain('param.env1.release knob env1 Release (not mounted, revealable)')
+      expect(lines).toContain('tab.env1 tab Env 1')
+      expect(guide.listTargets({ format: 'compact', search: 'osc1 Morph' }).items)
+        .toEqual(['param.osc1.morph knob osc1 Morph (hidden, revealable)'])
+
+      // And the row is not a claim: opening the tab produces exactly it.
+      expect(guide.reveal({ id: 'param.env1.release' })).toMatchObject({ revealed: true, opened: ['tab.env1'] })
+      expect(find('param.env1.release')).toEqual({
+        id: 'param.env1.release', label: 'env1 Release', type: 'knob', visible: true
+      })
+    })
+
+    /**
+     * A parameter with no tab to open is left out rather than predicted: every
+     * parameter outside a rebuilt row is mounted for the life of the page, so
+     * an ID that fails that test has nothing behind it.
+     */
+    it('predicts nothing when no tab could produce it', () => {
+      target('param.filter1.cutoff', app, 'filter1 Cutoff', 'knob')
+      expect(guide.listTargets({ format: 'compact' }).items).toEqual([
+        'param.filter1.cutoff knob filter1 Cutoff'
+      ])
+      expect(guide.listTargets({ search: 'param.env1.release' })).toMatchObject({
+        total: 0, unmatched: { search: 'param.env1.release', revealable: false, opens: [] }
+      })
+    })
+
+    /**
+     * The prediction has to agree with what the app actually mounts, or the row
+     * is a well-formed lie. Type comes from the same `ParamDef` fields the three
+     * control factories switch on; this pins the answer for every parameter a
+     * rebuilt ENV or LFO row owns, which is the whole set ever predicted.
+     */
+    it('predicts the control kind the app would build', () => {
+      const kinds = new Map<string, string>()
+      for (const id of ['env1', 'env2', 'env3', 'env4', 'env5', 'env6']) {
+        for (const name of ['delay', 'attack', 'hold', 'decay', 'sustain', 'release', 'atk_curve', 'dec_curve', 'rel_curve']) {
+          kinds.set(`${id}.${name}`, 'knob')
+        }
+      }
+      for (let lfo = 1; lfo <= 8; lfo++) {
+        // app.ts: a Knob for rate, phase and smooth, paramToggle for sync,
+        // paramSelect for division and mode.
+        kinds.set(`lfo${lfo}.rate`, 'knob')
+        kinds.set(`lfo${lfo}.phase`, 'knob')
+        kinds.set(`lfo${lfo}.smooth`, 'knob')
+        kinds.set(`lfo${lfo}.sync`, 'button')
+        kinds.set(`lfo${lfo}.division`, 'select')
+        kinds.set(`lfo${lfo}.mode`, 'select')
+      }
+      const tabs = document.createElement('div')
+      app.append(tabs)
+      for (const group of [...new Set([...kinds.keys()].map(id => id.split('.')[0]))]) {
+        guideTarget(tabs.appendChild(document.createElement('button')), `tab.${group}`, group, 'tab')
+      }
+      const listed = new Map((guide.listTargets({ format: 'compact' }).items as string[])
+        .map(line => line.split(' ')).map(([id, type]) => [id, type]))
+      for (const [id, type] of kinds) expect(listed.get(`param.${id}`), id).toBe(type)
+      expect(listed.size).toBe(kinds.size + new Set([...kinds.keys()].map(id => id.split('.')[0])).size)
     })
 
     it('still warns, and reveals nothing, for an ID no tab could produce', async () => {

@@ -75,13 +75,42 @@
  * than adds, so there is no zero-frame formula for it, and its bypassed branch
  * says in prose that its cutoff is a starting point.)
  *
+ * ## The mod matrix is a THIRD state, not an absence
+ *
+ * `env2` reaches the sound through the mod matrix and nothing else. For a long
+ * time this module could not see that matrix, so `filter-envelope-depth` hedged
+ * in prose — "if the route does not exist then env2.decay is inert" — and moved
+ * `env2.decay` anyway. That is the bypassed-switch bug in its third costume: a
+ * move that cannot reach the sound, re-proposed identically every round.
+ *
+ * `AdviseOptions.mods` closes it. The matrix is TRI-STATE for exactly the reason
+ * `switchState` is:
+ *
+ * - `undefined` — the caller did not pass one. "I have not looked" must never be
+ *   reported as "there is no route", so this keeps the hedged probe.
+ * - `[]` or a matrix with no matching route — READ, and the route is genuinely
+ *   absent. `env2.decay` is then inert and no `suggested` is emitted at all;
+ *   the finding names `set_modulation` with the concrete source, destination
+ *   and depth to create.
+ * - a live route — its DEPTH IS SIGNED, and the sign inverts the whole
+ *   recommendation. With positive depth the cutoff follows env2, so a candidate
+ *   that darkens too fast wants a LONGER decay; with negative depth the cutoff
+ *   moves against env2, the sweep runs dark-to-bright, and the same error wants
+ *   a SHORTER one. Reading the polarity and asserting the usual wiring are not
+ *   the same thing, and only one of them is safe.
+ *
+ * Mod slots still carry no `PARAMS` id, so `set_modulation` can never be a
+ * `suggested` move; it is named in the finding, in the vocabulary
+ * `set_modulation` and `apply_patch`'s `modulations` block both take.
+ *
  * ## Probe steps versus computed corrections
  *
  * Some rules can compute their correction exactly (`pitch-error`, `loudness`,
  * `attack-time`). Others cannot, because the parameter reaches the measurement
- * through something this module cannot see: `env2.decay` only changes a
- * brightness trajectory if an `env2 -> filter1.cutoff` mod slot exists, and mod
- * slots carry no `PARAMS` id and are absent from `PatchValues` entirely.
+ * through a chain this module can see only part of: even with the
+ * `env2 -> filter1.cutoff` route in hand, inverting "octaves of brightness
+ * drift" into "seconds of env2.decay" needs the envelope curve and the filter
+ * slope as well.
  *
  * Those rules emit a PROBE, and say so. A probe is multiplicative and DAMPED —
  * `dampedFactor` scales it by how large the error is relative to the rule's own
@@ -92,9 +121,42 @@
  * correct; it makes the sequence contract instead of ring. The findings say
  * "probe", the confidence stays below `high`, and neither claims a fit.
  *
+ * ## Clamping is a fact about the correction, not a detail of the move
+ *
+ * `legalValue` keeps every `suggested` inside its parameter's range. The bug is
+ * never the clamp; it is the finding being phrased from the UNCLAMPED number
+ * while the move carries the clamped one — the reviewer read prose recommending
+ * `dist.drive` at `2.095` next to a structured suggestion of `1`, which is the
+ * maximum. That is the octave bug again: two derivations of one quantity.
+ *
+ * So there is ONE derivation. `planMove` computes the value, legalizes it, and
+ * KEEPS the fact that it had to, and `clampNote` is the only thing that writes
+ * about it: the computed value, the limit it hit, and where the remainder has
+ * to come from. Every quantitative rule routes through the pair, so a rule
+ * cannot describe a correction larger than the one it applies without saying by
+ * how much and what covers the difference.
+ *
+ * ## Atomic groups
+ *
+ * The enable/move pairs above are not merely adjacent, they are ATOMIC: the
+ * distortion switch without the drive is an uncontrolled timbre change, and the
+ * drive without the switch is nothing at all. The findings said "apply both or
+ * neither" in prose while the list handed a caller two independent rows that a
+ * `maxActions` cut could split down the middle.
+ *
+ * Both halves now carry the same `group` id, and the driver's truncation is
+ * group-aware: a group is taken whole or not at all, and a group that does not
+ * fit in the remaining slots is skipped so a smaller action can use them. A
+ * caller can hand one group's `suggested` moves straight to `apply_patch`.
+ *
+ * The pitch pair is deliberately NOT a group. Its two halves are companions
+ * rather than an atom — the transpose alone leaves half a semitone that the next
+ * round finishes on `osc1.fine`, which is one extra iteration and never a loop —
+ * and grouping them would let a `maxActions` of 1 return no pitch move at all.
+ *
  * ## `estimatedGain`, honestly
  *
- * `estimatedGain = weight * min(1, |error| / scale)`.
+ * `estimatedGain = weight * min(1, |error| / scale) * CONFIDENCE_FACTOR[confidence]`.
  *
  * - `weight` is a HAND-SET PRIOR for how much of the overall similarity score
  *   this dimension can move. The weights are relative to each other and do NOT
@@ -105,6 +167,26 @@
  * - `scale` is the error magnitude, in that rule's own unit, at which the
  *   dimension is treated as maximally wrong. Beyond it the gain saturates, so a
  *   catastrophically wrong dimension cannot swamp the list with one entry.
+ * - `CONFIDENCE_FACTOR` turns the first two into an EXPECTED value. Ranking on
+ *   gain alone put a low-confidence `filter-envelope-depth` action — for a route
+ *   that did not exist — above several medium-confidence moves that would have
+ *   worked. A gain the advisor does not believe in is not worth a gain it does,
+ *   and the ladder already carries the belief: `high`/`medium`/`low`.
+ *
+ * The factor is one 0.6 discount per step DOWN that ladder — `1`, `0.6`, `0.36`
+ * — rather than a fitted weight, because there is nothing here to fit it
+ * against. What it buys is a stated exchange rate: a `low` action has to promise
+ * about 2.8x the raw gain of a `medium` one to outrank it, and a `medium` about
+ * 1.7x a `high` one. Ordering by raw gain is the special case where every action
+ * is equally trustworthy, which is exactly the assumption that was wrong.
+ *
+ * The gain is computed once per rule FIRING, not per action, and every outcome
+ * of that firing carries it. Outcomes of one firing describe halves of ONE
+ * correction, so they must rank together or the list can interleave someone
+ * else's action between them; and an atomic group is only as trustworthy as its
+ * least confident member, so the firing takes the MINIMUM factor across its
+ * outcomes. Each action still reports its own `confidence`, which is why an
+ * action can read `high` and be priced at a `medium` rate.
  *
  * So the number is an ORDERING device with a plausible magnitude, not a
  * prediction. Two actions with gains 0.31 and 0.29 should be read as "these two
@@ -114,11 +196,10 @@
  *
  * ## What is NOT mapped
  *
- * - The mod-matrix depth of `env -> filter1.cutoff` is the correct fix for
- *   "brightness falls too fast", but a mod slot has no `PARAMS` id (it is a
- *   `{source, dest, depth}` slot, set with `set_modulation`). `paramIds` can
- *   therefore only carry the envelope's own parameters; the finding names the
- *   route in prose.
+ * - A mod slot has no `PARAMS` id (it is a `{source, destination, depth}` slot,
+ *   set with `set_modulation`), so it can never be a `suggested` move however
+ *   well this module can read it. `paramIds` carries the envelope's own
+ *   parameters and the finding names the route.
  * - There is no global master tune parameter. `master.bend_range` is a bend
  *   range, not a tuning offset, so pitch corrections steer `osc1.transpose` and
  *   `osc1.fine`.
@@ -138,11 +219,39 @@ export type AdviceCategory = 'timbre' | 'envelope' | 'level' | 'space'
 /** Live parameter values, raw units, choice params optionally as their label. Matches `PresetData.params` in raw form. */
 export type PatchValues = Readonly<Record<string, number | string>>
 
+/**
+ * One live mod-matrix route, in the vocabulary `set_modulation` and
+ * `apply_patch`'s `modulations` block already speak: `source` a `MOD_SOURCES`
+ * id, `destination` a `PARAMS` id, `depth` SIGNED in -1..1 normalized
+ * destination units.
+ *
+ * `webmcp/tools.ts` already builds exactly this shape (`routeValue`), so the
+ * call site is `engine.modSlots.flatMap((route, slot) => route ? [routeValue(slot, route)] : [])`
+ * and nothing has to be converted. `PresetData.mods` spells the same field
+ * `dest`, so a caller coming from `engine.toPreset()` has to rename it.
+ */
+export interface ModRoute {
+  source: string
+  destination: string
+  depth: number
+  /** Absent reads as enabled: `set_modulation` defaults it on, and so does this. */
+  enabled?: boolean
+}
+
 export interface AdviseOptions {
   /** Cap on returned actions. Default 5. */
   maxActions?: number
   /** Keep only rules in this category. */
   focus?: AdviceCategory
+  /**
+   * The live mod matrix, if the caller can read it.
+   *
+   * TRI-STATE, and the distinction is load-bearing: OMITTING this is "I have not
+   * looked", an empty array is "I looked and there are no routes". A rule that
+   * treats the first as the second tells an agent to create a route that already
+   * exists, or inverts a recommendation off a polarity it never read.
+   */
+  mods?: readonly ModRoute[]
 }
 
 /**
@@ -163,11 +272,24 @@ export interface RuleOutcome {
   suggested?: MatchAction['suggested']
   /** Narrow the advertised ids for this firing (must be a subset of `paramIds`). */
   paramIds?: readonly string[]
+  /**
+   * Outcomes of one firing sharing this key are ATOMIC: applying some of them
+   * and not the rest leaves the patch somewhere neither the rule nor the caller
+   * asked for. The driver namespaces it with the rule id, keeps members
+   * adjacent, and never lets a `maxActions` cut land inside one.
+   *
+   * Only for outcomes that really are inseparable. Companion moves that each do
+   * their own share of the work — the two halves of a pitch correction — must
+   * NOT set it, or a tight `maxActions` returns neither.
+   */
+  group?: string
 }
 
 export interface AdviceContext {
   diff: MatchDiff
   patch: PatchValues
+  /** The live mod matrix, or `undefined` for "the caller could not read one". */
+  mods?: readonly ModRoute[]
 }
 
 export interface AdviceRule {
@@ -272,19 +394,102 @@ function unitOf(def: ParamDef): string {
 }
 
 /**
+ * A quantitative move with the CLAMP still attached to it.
+ *
+ * `legalValue` used to be the end of the story: it returned the legal value and
+ * the fact that it had had to pull one in was gone, so a rule wanting to say so
+ * had to recompute the correction alongside the move. Two derivations of one
+ * quantity is how `dist.drive` came to be described at `2.095` and suggested at
+ * `1`. `clamped` is that fact, carried, so `clampNote` can write from the same
+ * arithmetic the move was built from.
+ */
+interface MovePlan {
+  suggested?: MatchAction['suggested']
+  /** Present only when the computed value fell outside the parameter's range. */
+  clamped?: {
+    id: string
+    /** What the rule's own arithmetic asked for, before any legalization. */
+    computed: number
+    /** The endpoint it hit. */
+    limit: number
+    bound: 'maximum' | 'minimum'
+    unit: string
+  }
+}
+
+/**
+ * Compute a move for `id` ONCE: the raw correction, the legal value, and
+ * whether the two differ because the range got in the way.
+ *
+ * `suggested` is absent when the patch does not carry the parameter or the move
+ * rounds away to nothing. `clamped` is independent of that — a correction that
+ * lands past an endpoint the knob is ALREADY sitting on produces no move and
+ * still has to be reported, or the finding silently drops the whole error.
+ */
+function planMove(patch: PatchValues, id: string, compute: (from: number) => number): MovePlan {
+  const def = PARAM_BY_ID.get(id)
+  if (!def) return {}
+  const from = patchRaw(patch, id)
+  if (from === undefined) return {}
+  const computed = compute(from)
+  if (!Number.isFinite(computed)) return {}
+  const to = legalValue(def, computed)
+  // Choice params have no meaningful "past the maximum": `legalValue` snaps them
+  // to an index and there is no remainder to account for.
+  const clamped = def.choices || (computed >= def.min && computed <= def.max)
+    ? undefined
+    : {
+      id,
+      computed: round(computed, 3),
+      limit: computed > def.max ? def.max : def.min,
+      bound: computed > def.max ? ('maximum' as const) : ('minimum' as const),
+      unit: unitOf(def)
+    }
+  if (Math.abs(to - legalValue(def, from)) < 1e-9) return clamped ? { clamped } : {}
+  return { suggested: { id, from: round(from), to, unit: unitOf(def) }, ...(clamped ? { clamped } : {}) }
+}
+
+/**
  * Build a quantitative suggestion for `id`, or `undefined` when the patch does
  * not carry that parameter or the move rounds away to nothing.
  */
 function suggest(patch: PatchValues, id: string, compute: (from: number) => number): MatchAction['suggested'] {
+  return planMove(patch, id, compute).suggested
+}
+
+/** `raw`/`choice` are placeholders for "no unit", so they are not printed as one. */
+function unitSuffix(unit: string): string {
+  return unit === 'raw' || unit === 'choice' ? '' : ` ${unit}`
+}
+
+/**
+ * `legalValue` addressed by id, for the ZERO-FRAME findings.
+ *
+ * A gated rule's second half names its landing value in prose ("dist.drive to
+ * X") because the whole point of that sentence is the value, not the delta. It
+ * used to name the raw product while `suggest` applied the legalized one, which
+ * is the `2.095`-versus-`1` split in miniature. Routing the sentence through the
+ * SAME `legalValue` the move is built from makes disagreeing impossible.
+ */
+function legalFor(id: string, v: number): number {
   const def = PARAM_BY_ID.get(id)
-  if (!def) return undefined
-  const from = patchRaw(patch, id)
-  if (from === undefined) return undefined
-  const wanted = compute(from)
-  if (!Number.isFinite(wanted)) return undefined
-  const to = legalValue(def, wanted)
-  if (Math.abs(to - legalValue(def, from)) < 1e-9) return undefined
-  return { id, from: round(from), to, unit: unitOf(def) }
+  return def ? legalValue(def, v) : round(v, 3)
+}
+
+/**
+ * The one place a clamp is described. Empty string when nothing was clamped, so
+ * a finding can interpolate it unconditionally.
+ *
+ * `remainder` is the rule's own answer to "then where does the rest come from",
+ * which is the part that makes the note actionable rather than an apology.
+ * `extra` carries a rule-specific quantification of the shortfall in the unit
+ * the ERROR was measured in, which the parameter's own unit cannot express.
+ */
+function clampNote(plan: MovePlan, remainder: string, extra = ''): string {
+  const c = plan.clamped
+  if (!c) return ''
+  const u = unitSuffix(c.unit)
+  return ` ${c.id} cannot travel that far: the correction computes ${c.computed}${u}, past its ${c.bound} of ${c.limit}${u}, so the suggested value is clamped to ${c.limit}${u}${extra}. ${remainder}`
 }
 
 /** Mean of the non-null entries of `deltaDb` over `[lo, hi]` inclusive, or `null`. */
@@ -317,6 +522,33 @@ function mean(values: number[]): number {
 function bandMean(bands: MatchDiff['bands'], minHz: number): number | null {
   const vals = bands.filter(b => b.centerHz >= minHz).map(b => b.deltaDb)
   return vals.length === 0 ? null : mean(vals)
+}
+
+/**
+ * The brightness rows that describe a brightness disagreement.
+ *
+ * `match-diff.ts` marks a row `belowNoiseFloor` when the reference slice, the
+ * candidate slice or both sat under the analyzer's noise gate. Its `octaveDelta`
+ * is still a finite number - deliberately, so the arithmetic here never meets a
+ * `null` - but it is the distance between a sound and a noise floor rather than
+ * between two sounds. `compareAudioMetrics` leaves exactly these rows out of the
+ * score, so a rule that means, spreads or trends them steers against the number
+ * it is trying to move: a -55 dB tail reading a 4,978 Hz centroid manufactures a
+ * five-octave "swing" out of hiss, and this rule table put an `env2.decay` move
+ * at the top of the list because of it.
+ *
+ * Every consumer of `diff.brightness` in this file goes through here.
+ */
+function measuredBrightness(brightness: MatchDiff['brightness']): MatchDiff['brightness'] {
+  return brightness.filter(w => !w.belowNoiseFloor)
+}
+
+/** `` — or a clause naming the rows that were left out, so the count is explicable. */
+function gatedWindowNote(brightness: MatchDiff['brightness'], used: number): string {
+  const gated = brightness.length - used
+  return gated > 0
+    ? ` (${gated} of the ${brightness.length} windows sat below the analyzer's noise gate on one side or the other and are left out: their centroids describe the noise the sound decayed into, and the similarity score leaves them out too)`
+    : ''
 }
 
 const SEMITONE_CENTS = 100
@@ -490,6 +722,69 @@ function isBitcrush(patch: PatchValues): boolean {
   return t !== undefined && Math.round(t) === BITCRUSH_DIST_TYPE
 }
 
+// ------------------------------------------------------------ the mod matrix
+
+/**
+ * Below this |depth| a route is on the books and inaudible.
+ *
+ * Depth is normalized destination units, and `filter1.cutoff` spans 20 Hz to
+ * 20 kHz on an exponential curve, so 1.0 of depth is about 9.97 octaves of
+ * cutoff travel and 0.01 is about 0.1 — a third of `filter-envelope-depth`'s own
+ * 0.3-octave silence threshold. A route that quiet cannot be the thing shaping a
+ * trend this rule is willing to talk about, so it is treated as no route: the
+ * advice is to set a real depth, not to lengthen a decay hanging off a hair.
+ */
+const MIN_MOD_DEPTH = 0.01
+
+/**
+ * Tri-state, for the same reason `switchState` is.
+ *
+ * `seen: false` is "the caller passed no matrix", and it is NOT "there is no
+ * route". Collapsing the two tells an agent to create a route it already has,
+ * or asserts a polarity nobody read.
+ */
+type RouteState =
+  | { seen: false }
+  | { seen: true; route: ModRoute | undefined }
+
+function routeState(
+  mods: readonly ModRoute[] | undefined,
+  source: string,
+  destination: string
+): RouteState {
+  if (!mods) return { seen: false }
+  return { seen: true, route: mods.find(m => m.source === source && m.destination === destination) }
+}
+
+/**
+ * Does this route actually carry the source to the destination?
+ *
+ * Three ways it does not, and all three read the same from the sound's side:
+ * absent, present but `enabled: false`, present and enabled at a depth too small
+ * to hear. `enabled` missing counts as ON, matching `set_modulation`'s default.
+ */
+// Deliberately NOT a `route is ModRoute` predicate: the caller's negative branch
+// still needs to tell "no route" from "a route that is off or too shallow" so it
+// can say which, and narrowing to `undefined` there throws that away.
+function routeIsLive(route: ModRoute | undefined): boolean {
+  return route !== undefined && route.enabled !== false && Math.abs(route.depth) >= MIN_MOD_DEPTH
+}
+
+/**
+ * Octaves of destination travel per 1.0 of normalized mod depth.
+ *
+ * Only meaningful for an exponentially-curved parameter, where normalized
+ * position IS log-frequency: `normToValue` computes `min * (max/min) ** n`, so
+ * the full 0..1 sweep is exactly `log2(max/min)` octaves and any fraction of it
+ * scales linearly in octaves. Read off the definition rather than written as a
+ * literal, so re-ranging `filter1.cutoff` cannot leave a stale constant behind.
+ */
+function octavesPerUnitDepth(id: string): number | undefined {
+  const def = PARAM_BY_ID.get(id)
+  if (!def || def.curve !== 'exp' || !(def.min > 0) || !(def.max > def.min)) return undefined
+  return Math.log2(def.max / def.min)
+}
+
 /**
  * A multiplicative probe factor that SHRINKS with the error.
  *
@@ -636,13 +931,27 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const borrowNote = semitones !== ideal.semitones && currentFine !== undefined
         ? ` osc1.fine is at ${n1(currentFine)} ct and cannot reach that from there, so a semitone of the move rides on osc1.transpose.`
         : ''
+      // Both moves are computed BEFORE the sentences that describe them, so the
+      // clamp notes below are written from the same arithmetic that produced the
+      // values. `fitToFineRange` already keeps `osc1.fine` reachable, so its
+      // note is a backstop; `osc1.transpose` really can run out at +-48.
+      const transposePlan = onTranspose ? planMove(patch, 'osc1.transpose', from => from + semitones) : {}
+      const finePlan = onFine ? planMove(patch, 'osc1.fine', from => from + residualCents) : {}
+      const transposeClamp = clampNote(
+        transposePlan,
+        'osc1.transpose spans 4 octaves in each direction and nothing here reaches further, so a correction past it is far more likely an octave the detector guessed wrong than a tuning error - check the reference pitch before chasing the remainder, or split it across osc2/osc3 transpose and sub.octave.'
+      )
+      const fineClamp = clampNote(
+        finePlan,
+        'osc1.fine spans one semitone each way; the leftover belongs on osc1.transpose.'
+      )
       const finding = octaves !== 0
         // "Octave" is deliberate: a model acts on it far more reliably than on
         // "1200 cents sharp", which reads like any other detune.
-        ? `Octave error: the candidate is ${Math.abs(octaves)} octave${Math.abs(octaves) === 1 ? '' : 's'} ${octaves < 0 ? 'above' : 'below'} the reference (${n1(cents)} cents). Transpose by ${signedUnits(semitones, 'semitone')}${fineNote}; do not chase the octave itself with fine tuning.${borrowNote}`
+        ? `Octave error: the candidate is ${Math.abs(octaves)} octave${Math.abs(octaves) === 1 ? '' : 's'} ${octaves < 0 ? 'above' : 'below'} the reference (${n1(cents)} cents). Transpose by ${signedUnits(semitones, 'semitone')}${fineNote}; do not chase the octave itself with fine tuning.${borrowNote}${transposeClamp}`
         : onTranspose
-          ? `Candidate is ${n1(Math.abs(cents))} cents ${sharp ? 'sharp' : 'flat'}${hzNote}. Transpose by ${signedUnits(semitones, 'semitone')}${fineNote}.${borrowNote}`
-          : `Candidate is ${n1(Math.abs(cents))} cents ${sharp ? 'sharp' : 'flat'}${hzNote}. Half a semitone or less, so this is osc1.fine (${signedUnits(residualCents, 'cent')}), not osc1.transpose.`
+          ? `Candidate is ${n1(Math.abs(cents))} cents ${sharp ? 'sharp' : 'flat'}${hzNote}. Transpose by ${signedUnits(semitones, 'semitone')}${fineNote}.${borrowNote}${transposeClamp}`
+          : `Candidate is ${n1(Math.abs(cents))} cents ${sharp ? 'sharp' : 'flat'}${hzNote}. Half a semitone or less, so this is osc1.fine (${signedUnits(residualCents, 'cent')}), not osc1.transpose.${fineClamp}`
 
       // Two moves, two actions. `MatchAction.suggested` holds ONE move and
       // lives in the shared `match-types.ts`, so the alternative to a second
@@ -656,7 +965,7 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       // alone. One extra iteration, never a loop. (After a borrow the leftover
       // is bigger than the error it replaced; it still lands on the next round,
       // because fine can reach the target once the semitone is in place.)
-      const fineMove = onFine ? suggest(patch, 'osc1.fine', from => from + residualCents) : undefined
+      const fineMove = finePlan.suggested
       const outcomes: RuleOutcome[] = []
       if (onTranspose) {
         outcomes.push({
@@ -665,7 +974,7 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
           direction: semitones < 0 ? 'decrease' : 'increase',
           // Pitch to transpose is one-to-one and exact.
           confidence: 'high',
-          suggested: suggest(patch, 'osc1.transpose', from => from + semitones),
+          suggested: transposePlan.suggested,
           paramIds: ['osc1.transpose', 'osc1.fine']
         })
       }
@@ -673,7 +982,7 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
         outcomes.push({
           error: cents,
           finding: onTranspose
-            ? `Second half of the same pitch move: ${signedUnits(residualCents, 'cent')} on osc1.fine. The ${signedUnits(semitones, 'semitone')} transpose on its own lands ${n1(Math.abs(residualCents))} cents ${residualCents < 0 ? 'sharp' : 'flat'}; apply both and the pitch is exact.`
+            ? `Second half of the same pitch move: ${signedUnits(residualCents, 'cent')} on osc1.fine. The ${signedUnits(semitones, 'semitone')} transpose on its own lands ${n1(Math.abs(residualCents))} cents ${residualCents < 0 ? 'sharp' : 'flat'}; apply both and the pitch is exact.${fineClamp}`
             : finding,
           direction: residualCents < 0 ? 'decrease' : 'increase',
           // Sub-semitone errors can also come out of unison detune, so a fine
@@ -741,7 +1050,13 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       // Coarse: 0.05 of drive per dB/octave of tilt error. Drive is the only
       // monotone harmonic-content knob here; morph is table-dependent. Linear
       // in the error, so it contracts on its own once drive actually applies.
-      const driveMove = suggest(patch, 'dist.drive', from => from - tilt * 0.05)
+      //
+      // `dist.drive` is 0..1, and 0.05 per dB/octave runs out of range at 20
+      // dB/octave of error from rest - which is well inside what this rule
+      // fires on. That is the reviewer's `2.095`: a finding phrased from the
+      // raw product next to a suggestion of `1`. Both come off `drivePlan` now.
+      const drivePlan = planMove(patch, 'dist.drive', from => from - tilt * 0.05)
+      const driveRemainder = 'Drive alone cannot carry the rest of the tilt: take it at the oscillator (osc1.wavetable / osc1.morph), or with a harder dist.type, or with eq.high_gain once eq.enabled is on.'
       const dist = switchState(patch, 'dist.enabled')
 
       // `dist.enabled` is not the only thing that can make `dist.drive` inert.
@@ -779,6 +1094,11 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
         }
         const enable = enableMove(patch, 'dist.enabled')
         if (enable) {
+          // From an effective ZERO, not from where the knob rests: a bypassed
+          // drive put no harmonic content in the buffer, so `from - tilt * 0.05`
+          // would charge the render for drive it never heard and land at nearly
+          // double the amount.
+          const zeroFramePlan = planMove(patch, 'dist.drive', () => -tilt * 0.05)
           return [
             {
               error: tilt,
@@ -786,29 +1106,27 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
               direction: 'increase',
               confidence: 'medium',
               suggested: enable,
-              paramIds: ['dist.enabled', 'dist.drive']
+              paramIds: ['dist.enabled', 'dist.drive'],
+              group: 'engage-dist'
             },
             {
               error: tilt,
-              // From an effective ZERO, not from where the knob rests: a
-              // bypassed drive put no harmonic content in the buffer, so
-              // `from - tilt * 0.05` would charge the render for drive it never
-              // heard and land at nearly double the amount.
-              finding: `Second half of the same move: dist.drive to ${round(-tilt * 0.05, 3)}, which is the whole ${n1(Math.abs(tilt))} dB/octave measured from zero - the bypassed section contributed none of the drive it is currently showing. It does nothing until dist.enabled is on, so apply both or neither.`,
+              finding: `Second half of the same move: dist.drive to ${legalFor('dist.drive', -tilt * 0.05)}, which is the whole ${n1(Math.abs(tilt))} dB/octave measured from zero - the bypassed section contributed none of the drive it is currently showing. It does nothing until dist.enabled is on, so apply both or neither.${clampNote(zeroFramePlan, driveRemainder)}`,
               direction: 'increase',
               confidence: 'medium',
-              suggested: suggest(patch, 'dist.drive', () => -tilt * 0.05),
-              paramIds: ['dist.drive', 'dist.enabled']
+              suggested: zeroFramePlan.suggested,
+              paramIds: ['dist.drive', 'dist.enabled'],
+              group: 'engage-dist'
             }
           ]
         }
       }
       return {
         error: tilt,
-        finding: `${headline} ${darker ? 'Add' : 'Remove'} harmonic content at the source.`,
+        finding: `${headline} ${darker ? 'Add' : 'Remove'} harmonic content at the source.${clampNote(drivePlan, driveRemainder)}`,
         direction: darker ? 'increase' : 'decrease',
         confidence: 'medium',
-        suggested: driveMove
+        suggested: drivePlan.suggested
       }
     }
   },
@@ -823,7 +1141,7 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
     minError: 0.2,
     errorUnit: 'octaves',
     evaluate({ diff, patch }) {
-      const windows = diff.brightness
+      const windows = measuredBrightness(diff.brightness)
       if (windows.length < 2) return null
       const deltas = windows.map(w => w.octaveDelta)
       if (!deltas.every(Number.isFinite)) return null
@@ -843,8 +1161,13 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
         upper !== null ? `bands >=4 kHz ${n1(upper)} dB` : null,
         highPartials !== null ? `partials 7-12 ${n1(highPartials)} dB` : null
       ].filter(Boolean).join(', ')
-      const headline = `Brightness is ${dark ? 'down' : 'up'} ${n1(Math.abs(m))} octaves in every one of the ${windows.length} analysis windows (spread only ${n1(spread)} octaves), so this is a STATIC cutoff offset, not an envelope shape${extra ? ` (${extra})` : ''}.`
-      const cutoffMove = suggest(patch, 'filter1.cutoff', from => from * 2 ** -m)
+      const headline = `Brightness is ${dark ? 'down' : 'up'} ${n1(Math.abs(m))} octaves in every one of the ${windows.length} analysis windows (spread only ${n1(spread)} octaves), so this is a STATIC cutoff offset, not an envelope shape${extra ? ` (${extra})` : ''}.${gatedWindowNote(diff.brightness, windows.length)}`
+      const cutoffPlan = planMove(patch, 'filter1.cutoff', from => from * 2 ** -m)
+      const cutoffRemainder = dark
+        // A cutoff already at 20 kHz is above everything the oscillator makes,
+        // so the missing brightness was never the filter's to give back.
+        ? 'filter1.cutoff tops out above the audible band, so a correction past it means the high content is not in the source at all: add it upstream at osc1.wavetable / osc1.morph, or with dist.drive (dist.enabled on), before touching the filter again.'
+        : 'filter1.cutoff bottoms out below the fundamental, so a correction past it asks the filter to remove brightness that is not the filter\'s to remove: take it upstream at osc1.wavetable / osc1.morph, at dist.drive, or with eq.high_gain once eq.enabled is on.'
 
       // `filter1.enabled` defaults to 1, so this is the uncommon patch — but
       // `voice.ts` skips the whole filter on `enabled < 0.5`, and then every
@@ -898,7 +1221,8 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
             direction: dark ? 'increase' : 'decrease',
             confidence: 'medium',
             suggested: enable,
-            paramIds: ['filter1.enabled', 'filter1.cutoff', 'filter1.type']
+            paramIds: ['filter1.enabled', 'filter1.cutoff', 'filter1.type'],
+            group: 'engage-filter1'
           },
           {
             error: m,
@@ -906,22 +1230,23 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
             // ATTENUATES rather than adds, so the brightness measured with it
             // bypassed is the source's, and engaging it at cutoff F does not
             // land at `source * 2 ** -m`. A starting point, and it says so.
-            finding: `Second half of the same move: filter1.cutoff ${dark ? 'up' : 'down'} ${n1(Math.abs(m))} octaves, inert until filter1.enabled is on. This one is a STARTING POINT rather than a landing: the ${n1(Math.abs(m))} octaves were measured with the filter out of circuit, and a filter subtracts from the source rather than setting the centroid, so expect to re-measure and move again.`,
+            finding: `Second half of the same move: filter1.cutoff ${dark ? 'up' : 'down'} ${n1(Math.abs(m))} octaves, inert until filter1.enabled is on. This one is a STARTING POINT rather than a landing: the ${n1(Math.abs(m))} octaves were measured with the filter out of circuit, and a filter subtracts from the source rather than setting the centroid, so expect to re-measure and move again.${clampNote(cutoffPlan, cutoffRemainder)}`,
             direction: dark ? 'increase' : 'decrease',
             confidence: 'low',
-            suggested: cutoffMove,
-            paramIds: ['filter1.cutoff', 'filter1.enabled']
+            suggested: cutoffPlan.suggested,
+            paramIds: ['filter1.cutoff', 'filter1.enabled'],
+            group: 'engage-filter1'
           }
         ]
       }
       return {
         error: m,
-        finding: headline,
+        finding: `${headline}${clampNote(cutoffPlan, cutoffRemainder)}`,
         direction: dark ? 'increase' : 'decrease',
         // Centroid octaves to cutoff octaves is about as direct as this gets,
         // but only once the windows agree that nothing is moving over time.
         confidence: corroborated ? 'high' : 'medium',
-        suggested: cutoffMove
+        suggested: cutoffPlan.suggested
       }
     }
   },
@@ -937,34 +1262,114 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
     weight: 0.15,
     minError: 0.3,
     errorUnit: 'octaves',
-    evaluate({ diff, patch }) {
-      const windows = diff.brightness
+    evaluate({ diff, patch, mods }) {
+      // Gated rows dropped BEFORE first and last are read: a trend is the most
+      // fragile thing you can compute off this array, since one hiss-derived
+      // endpoint sets the whole slope. The `env2.decay` action that ranked first
+      // off a five-octave phantom swing was exactly this.
+      const windows = measuredBrightness(diff.brightness)
       if (windows.length < 2) return null
       const first = windows[0].octaveDelta
       const last = windows[windows.length - 1].octaveDelta
       if (!Number.isFinite(first) || !Number.isFinite(last)) return null
       const trend = last - first
       const tooFast = trend < 0
-      // A DAMPED probe, not a fit. Inverting "octaves of brightness drift" into
-      // "seconds of env2.decay" needs the mod-slot depth, the envelope curve and
-      // the filter slope, and this module can see none of them - `PatchValues`
-      // carries `PARAMS` ids only, and a mod slot is not one. So the honest step
-      // is a guess, and the only thing worth engineering about a guess is that
-      // it CONTRACTS: the old fixed 1.5x/÷1.5 pair is its own inverse, so a step
+      // A DAMPED probe, not a fit. Even with the route in hand, inverting
+      // "octaves of brightness drift" into "seconds of env2.decay" needs the
+      // envelope curve and the filter slope too. So the honest step is a guess,
+      // and the only thing worth engineering about a guess is that it
+      // CONTRACTS: the old fixed 1.5x/÷1.5 pair is its own inverse, so a step
       // that overshoots is undone in full on the next round and the sequence
       // rings around the target forever. Scaling by the error relative to
       // `scale` gives 1.5x at the saturation point and 1.075x at the 0.3-octave
       // silence threshold, so successive overshoots shrink geometrically.
       const factor = dampedFactor(trend, BRIGHTNESS_TREND_SCALE, 0.5)
+      const drift = `Brightness error drifts ${n1(Math.abs(trend))} octaves across the buffer (${n1(first)} in the first window, ${n1(last)} in the last), so the candidate ${tooFast ? 'darkens too fast' : 'holds its brightness too long'}${gatedWindowNote(diff.brightness, windows.length)}. This is envelope shape, not static cutoff`
+      const state = routeState(mods, 'env2', 'filter1.cutoff')
+
+      // No matrix was passed. Unchanged from before it could be: hedge in prose,
+      // stay `low`, and do NOT report "there is no route" - nobody looked.
+      if (!state.seen) {
+        return {
+          error: trend,
+          finding: `${drift}: ${tooFast ? 'lengthen env2.decay / raise env2.sustain, or reduce' : 'shorten env2.decay / lower env2.sustain, or increase'} the depth of the env2 -> filter1.cutoff mod slot (set_modulation). That mod slot is the REAL fix and has no parameter id, so it can never appear as a suggested move; env2 reaches the sound through it and nothing else, and if the route does not exist in this patch then env2.decay is inert and set_modulation is the whole job. The direction above assumes that slot has POSITIVE depth, the usual wiring: this call passed no modulation matrix, so its sign is as unreadable from here as its existence, and with an inverted slot the same move lengthens the wrong stage. The suggested ${tooFast ? 'x' : '÷'}${round(factor, 2)} on env2.decay is a PROBE sized from the error, not a computed correction - apply it, re-measure, expect several rounds.`,
+          direction: tooFast ? 'increase' : 'decrease',
+          // The route may not exist, the step is a probe rather than a fit, and
+          // the trend can also come from an amplitude decay that reweights the
+          // windows. Three reasons for `low`.
+          confidence: 'low',
+          suggested: suggest(patch, 'env2.decay', from => (tooFast ? from * factor : from / factor))
+        }
+      }
+
+      // The matrix was READ and env2 does not reach the cutoff. Every env2
+      // parameter is inert, exactly the way `noise.level` is behind a bypassed
+      // switch, so there is no move to make - the route is the whole job.
+      if (!routeIsLive(state.route)) {
+        const span = octavesPerUnitDepth('filter1.cutoff')
+        const sustainDef = PARAM_BY_ID.get('env2.sustain')
+        const sustain = patchRaw(patch, 'env2.sustain') ?? sustainDef?.def ?? 0.5
+        // env2 falls from its peak to `sustain` across the decay, so a route of
+        // signed depth D moves the cutoff by `D * (sustain - 1)` in normalized
+        // units, i.e. `-D * swing * span` octaves. Setting that equal to the
+        // `-trend` octaves the candidate is missing gives D directly, and the
+        // sign falls out rather than being assumed: a candidate that needs to
+        // BRIGHTEN over time wants a NEGATIVE depth, because env2 only ever
+        // falls.
+        const swing = 1 - sustain
+        const wanted = span && swing > 0.02 ? round(trend / (swing * span), 3) : 0
+        const depth = Math.min(1, Math.max(-1, wanted))
+        const depthNote = depth !== wanted
+          ? ` The arithmetic actually asks for depth ${wanted}, past the -1..1 a mod slot allows, so ${depth} is what a slot can hold and the remainder has to come from filter1.cutoff itself or a second route.`
+          : ''
+        const sustainNote = swing <= 0.02
+          ? ` env2.sustain is ${round(sustain, 3)}, so env2 barely falls at all and no depth would produce a sweep: lower env2.sustain first, then set the route.`
+          : ''
+        const why = state.route === undefined
+          ? 'this patch carries no env2 -> filter1.cutoff route at all'
+          : state.route.enabled === false
+            ? `this patch's env2 -> filter1.cutoff route is switched OFF (depth ${round(state.route.depth, 3)})`
+            : `this patch's env2 -> filter1.cutoff route sits at depth ${round(state.route.depth, 3)}, under the ${MIN_MOD_DEPTH} it takes to move the cutoff even a tenth of an octave`
+        return {
+          error: trend,
+          finding: `${drift}, and it is not env2.decay either: ${why}, so env2 reaches nothing and env2.decay / env2.sustain are INERT in this patch. The whole job is the route - set_modulation source=env2 destination=filter1.cutoff depth=${depth}${depth < 0 ? ' (NEGATIVE on purpose: env2 only falls, so a negative depth is what makes the cutoff RISE across the note, which is what this trend asks for)' : ' (positive, the usual downward filter sweep)'}.${depthNote}${sustainNote} A mod slot has no parameter id, so this can never be a suggested move and no move is offered here. The depth is a STARTING POINT sized from the ${n1(Math.abs(trend))} octaves measured and env2.sustain at ${round(sustain, 3)}: a cutoff and a spectral centroid do not move octave for octave, so create the route, re-measure, and shape env2.decay after that.`,
+          // Which env2 stage to move is not decidable until the route exists,
+          // and the action being recommended is not a parameter move at all.
+          direction: 'either',
+          // The diagnosis is READ off the matrix rather than guessed; only the
+          // depth is a starting point.
+          confidence: 'medium',
+          paramIds: ['env2.decay', 'env2.sustain', 'filter1.cutoff']
+        }
+      }
+
+      // A live route, and its SIGN decides the recommendation.
+      //
+      // With positive depth the cutoff follows env2 and sweeps DOWN as the
+      // envelope falls, so a candidate that darkens too fast wants a longer
+      // decay. With negative depth the cutoff runs AGAINST env2 and sweeps UP,
+      // and the very same error wants a shorter one. The old prose assumed the
+      // first and said so; reading the sign is cheap once the matrix is here.
+      // `routeIsLive` already established this is a route; it is not a type
+      // predicate (see its comment), so the depth is read defensively.
+      const depth = state.route?.depth ?? 0
+      const positive = depth > 0
+      const lengthen = tooFast === positive
+      // The signed-depth advice needs no such case split. The route contributes
+      // `-D * swing * span` octaves of drift, monotonically DECREASING in D, so
+      // "darkening too fast wants a smaller signed depth" holds for either sign
+      // - going from +0.4 to +0.2, or from -0.2 to -0.4, are the same move.
+      const depthDirection = tooFast ? 'DOWN' : 'UP'
+      const move = planMove(patch, 'env2.decay', from => (lengthen ? from * factor : from / factor))
       return {
         error: trend,
-        finding: `Brightness error drifts ${n1(Math.abs(trend))} octaves across the buffer (${n1(first)} in the first window, ${n1(last)} in the last), so the candidate ${tooFast ? 'darkens too fast' : 'holds its brightness too long'}. This is envelope shape, not static cutoff: ${tooFast ? 'lengthen env2.decay / raise env2.sustain, or reduce' : 'shorten env2.decay / lower env2.sustain, or increase'} the depth of the env2 -> filter1.cutoff mod slot (set_modulation). That mod slot is the REAL fix and has no parameter id, so it can never appear as a suggested move; env2 reaches the sound through it and nothing else, and if the route does not exist in this patch then env2.decay is inert and set_modulation is the whole job. The direction above assumes that slot has POSITIVE depth, the usual wiring: a mod slot carries no parameter id, so its sign is as unreadable from here as its existence, and with an inverted slot the same move lengthens the wrong stage. The suggested ${round(factor, 2)}x on env2.decay is a PROBE sized from the error, not a computed correction - apply it, re-measure, expect several rounds.`,
-        direction: tooFast ? 'increase' : 'decrease',
-        // The env -> cutoff route may not even exist in the patch, the step is
-        // a probe rather than a fit, and the trend can also come from an
-        // amplitude decay that reweights the windows. Three reasons for `low`.
-        confidence: 'low',
-        suggested: suggest(patch, 'env2.decay', from => (tooFast ? from * factor : from / factor))
+        finding: `${drift}. The env2 -> filter1.cutoff route is live at depth ${round(depth, 3)}${positive ? '' : ' - NEGATIVE'}, so the cutoff ${positive ? 'follows env2 and sweeps DOWN as the envelope falls' : 'runs AGAINST env2 and sweeps UP as the envelope falls'}: ${lengthen ? 'LENGTHEN env2.decay / raise env2.sustain' : 'SHORTEN env2.decay / lower env2.sustain'}. ${positive ? '' : 'That is the opposite of the usual advice for this error, and it is the polarity of the route that makes it so. '}The other lever is the route itself: move its signed depth ${depthDirection} from ${round(depth, 3)} with set_modulation (source=env2, destination=filter1.cutoff) - ${depthDirection.toLowerCase()} is right for this error whichever sign the depth carries, since the depth scales a sweep that only ever runs one way. The suggested ${lengthen ? 'x' : '÷'}${round(factor, 2)} on env2.decay is a PROBE sized from the error, not a computed correction: the envelope curve and the filter slope are still unread, so apply it, re-measure, expect several rounds.${clampNote(move, `Take the rest from the route depth, or from env2.sustain.`)}`,
+        direction: lengthen ? 'increase' : 'decrease',
+        // The route and its polarity are now read rather than assumed, but the
+        // step is still a probe and the trend can also come from an amplitude
+        // decay reweighting the windows.
+        confidence: 'medium',
+        suggested: move.suggested
       }
     }
   },
@@ -980,13 +1385,21 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
     errorUnit: 'dB',
     evaluate({ diff, patch }) {
       // Only the fallback when per-window brightness is unusable; otherwise
-      // `filter-cutoff-static` owns this territory with better evidence.
-      if (diff.brightness.length >= 2) return null
+      // `filter-cutoff-static` owns this territory with better evidence. Counted
+      // over the MEASURED rows: a trajectory whose windows all sat under the
+      // noise gate is exactly the "unusable" this fallback exists for, and
+      // counting the gated rows too would hand the territory to a rule that has
+      // just refused it.
+      if (measuredBrightness(diff.brightness).length >= 2) return null
       const upper = bandMean(diff.bands, 4000)
       if (upper === null) return null
       const quiet = upper < 0
       const headline = `Octave bands at and above 4 kHz are ${n1(Math.abs(upper))} dB ${quiet ? 'quiet' : 'loud'} against the reference, with no usable per-window brightness to say whether that is static or swept.`
-      const gainMove = suggest(patch, 'eq.high_gain', from => from - upper)
+      // `eq.high_gain` is +-18 dB and this rule fires from 3 dB up, so a shelf
+      // asked to cover 25 dB of band error is an ordinary occurrence, not an
+      // edge case.
+      const gainPlan = planMove(patch, 'eq.high_gain', from => from - upper)
+      const gainRemainder = `A single 4 kHz shelf spans 36 dB in total and this asks for more than is left: move filter1.cutoff ${quiet ? 'up' : 'down'} for the rest, or change the source at osc1.wavetable / osc1.morph.`
 
       // `eq.enabled` defaults to 0 and `processor.ts` skips the EQ entirely
       // below 0.5, so on a factory patch the only move this rule made was a
@@ -999,6 +1412,7 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       // the same 4 kHz this rule measures from), so the direction it can deliver
       // is not a function of the error's direction.
       const enable = switchState(patch, 'eq.enabled') === 'off' ? enableMove(patch, 'eq.enabled') : undefined
+      const zeroFrameGain = planMove(patch, 'eq.high_gain', () => -upper)
       if (enable) {
         return [
           {
@@ -1007,26 +1421,28 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
             direction: 'increase',
             confidence: 'high',
             suggested: enable,
-            paramIds: ['eq.enabled', 'eq.high_gain', 'filter1.cutoff']
+            paramIds: ['eq.enabled', 'eq.high_gain', 'filter1.cutoff'],
+            group: 'engage-eq'
           },
           {
             error: upper,
             // From an effective ZERO dB, not from where the knob rests: a
             // bypassed EQ applied none of the gain it is currently showing.
-            finding: `Second half of the same move: eq.high_gain to ${signedNumber(-upper)} dB, the whole error measured from a flat 0 dB - the bypassed EQ applied none of the gain it is currently showing. It takes effect only once eq.enabled is on. Filter cutoff is the other lever: a wide shelf and a cutoff move sound different even at the same band energy.`,
+            finding: `Second half of the same move: eq.high_gain to ${signedNumber(legalFor('eq.high_gain', -upper))} dB, the whole error measured from a flat 0 dB - the bypassed EQ applied none of the gain it is currently showing. It takes effect only once eq.enabled is on. Filter cutoff is the other lever: a wide shelf and a cutoff move sound different even at the same band energy.${clampNote(zeroFrameGain, gainRemainder)}`,
             direction: quiet ? 'increase' : 'decrease',
             confidence: 'medium',
-            suggested: suggest(patch, 'eq.high_gain', () => -upper),
-            paramIds: ['eq.high_gain', 'eq.enabled', 'filter1.cutoff']
+            suggested: zeroFrameGain.suggested,
+            paramIds: ['eq.high_gain', 'eq.enabled', 'filter1.cutoff'],
+            group: 'engage-eq'
           }
         ]
       }
       return {
         error: upper,
-        finding: headline,
+        finding: `${headline}${clampNote(gainPlan, gainRemainder)}`,
         direction: quiet ? 'increase' : 'decrease',
         confidence: 'medium',
-        suggested: gainMove
+        suggested: gainPlan.suggested
       }
     }
   },
@@ -1086,17 +1502,18 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       // error (up to 2x at saturation, 1.05x at the silence threshold) keeps the
       // same coarse search while making every overshoot smaller than the last.
       const factor = dampedFactor(d, INHARMONICITY_SCALE, 1)
+      const detunePlan = detuned
+        ? planMove(patch, 'osc1.detune', from =>
+          moreStretched ? from / factor : Math.max(from * factor, MIN_DETUNE_PROBE_CENTS))
+        : {}
       return {
         error: d,
-        finding: `Partial series is ${moreStretched ? 'more' : 'less'} stretched than the reference (B delta ${d.toExponential(1)}). Two causes read alike here: unison detune smearing each partial into a band, and a genuinely inharmonic series. ${detuned ? `osc1.unison is ${unison}, so ${moreStretched ? `narrow osc1.detune first (the suggested ÷${round(factor, 2)} is a PROBE sized from the error, not a computed correction)` : `widen osc1.detune first (the suggested x${round(factor, 2)} is a PROBE sized from the error, not a computed correction)`} and re-measure; expect several rounds` : unisonNote}.`,
+        finding: `Partial series is ${moreStretched ? 'more' : 'less'} stretched than the reference (B delta ${d.toExponential(1)}). Two causes read alike here: unison detune smearing each partial into a band, and a genuinely inharmonic series. ${detuned ? `osc1.unison is ${unison}, so ${moreStretched ? `narrow osc1.detune first (the suggested ÷${round(factor, 2)} is a PROBE sized from the error, not a computed correction)` : `widen osc1.detune first (the suggested x${round(factor, 2)} is a PROBE sized from the error, not a computed correction)`} and re-measure; expect several rounds` : unisonNote}.${clampNote(detunePlan, 'osc1.detune is 0..100 cents; past that the smear has to come from more osc1.unison voices, or the stretch is genuinely in the partial series and wants a different osc1.wavetable.')}`,
         direction: moreStretched ? 'decrease' : 'increase',
         // The measurement cannot separate the two causes, and the step is a
         // probe. Never above medium.
         confidence: detuned ? 'medium' : 'low',
-        suggested: detuned
-          ? suggest(patch, 'osc1.detune', from =>
-            moreStretched ? from / factor : Math.max(from * factor, MIN_DETUNE_PROBE_CENTS))
-          : undefined,
+        suggested: detunePlan.suggested,
         paramIds: detuned ? ['osc1.detune', 'osc1.spread', 'osc1.unison'] : ['osc1.unison', 'osc1.detune', 'osc1.spread']
       }
     }
@@ -1115,14 +1532,15 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const d = diff.envelope.attackMsDelta
       if (!Number.isFinite(d)) return null
       const tooFast = d < 0
+      // env1.attack is in SECONDS (min 0.001, max 10); the delta is in ms.
+      const plan = planMove(patch, 'env1.attack', from => from - d / 1000)
       return {
         error: d,
-        finding: `Attack is ${n1(Math.abs(d))} ms too ${tooFast ? 'fast' : 'slow'}. env1 is the VCA, so this is its attack directly.`,
+        finding: `Attack is ${n1(Math.abs(d))} ms too ${tooFast ? 'fast' : 'slow'}. env1 is the VCA, so this is its attack directly.${clampNote(plan, tooFast ? 'env1.attack tops out at 10 s; a longer rise wants env1.delay or env1.hold in front of it.' : 'env1.attack bottoms out at 1 ms, which is already effectively instant, so the remaining time-to-peak is env1.delay / env1.hold or the attack CURVE (env1.atk_curve), not the attack length.')}`,
         direction: tooFast ? 'increase' : 'decrease',
         // Measured attack time to env1.attack is one-to-one by definition.
         confidence: 'high',
-        // env1.attack is in SECONDS (min 0.001, max 10); the delta is in ms.
-        suggested: suggest(patch, 'env1.attack', from => from - d / 1000)
+        suggested: plan.suggested
       }
     }
   },
@@ -1140,15 +1558,16 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const d = diff.envelope.decayT60MsDelta
       if (d === null || !Number.isFinite(d)) return null
       const tooShort = d < 0
+      // env1.decay is in SECONDS; the delta is in ms.
+      const plan = planMove(patch, 'env1.decay', from => from - d / 1000)
       return {
         error: d,
-        finding: `-60 dB decay time is ${n1(Math.abs(d))} ms too ${tooShort ? 'short' : 'long'}. Move env1.decay first; if the note is held past the decay stage, env1.release carries the tail instead.`,
+        finding: `-60 dB decay time is ${n1(Math.abs(d))} ms too ${tooShort ? 'short' : 'long'}. Move env1.decay first; if the note is held past the decay stage, env1.release carries the tail instead.${clampNote(plan, tooShort ? 'env1.decay stops at 10 s, so the rest of the tail belongs to env1.release (up to 15 s) or a higher env1.sustain.' : 'env1.decay stops at 1 ms, so a still-too-long T60 is coming from env1.sustain holding the level up or env1.release carrying the tail, not from the decay stage.')}`,
         direction: tooShort ? 'increase' : 'decrease',
         // T60 is shared between decay, sustain level and release, so applying
         // the whole delta to decay is an upper bound rather than a fit.
         confidence: 'medium',
-        // env1.decay is in SECONDS; the delta is in ms.
-        suggested: suggest(patch, 'env1.decay', from => from - d / 1000)
+        suggested: plan.suggested
       }
     }
   },
@@ -1166,22 +1585,20 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const d = diff.envelope.sustainDbDelta
       if (!Number.isFinite(d)) return null
       const tooLow = d < 0
-      // A ratio has no purchase on zero: `0 * 10 ** x` is 0, `suggest` drops the
+      // A ratio has no purchase on zero: `0 * 10 ** x` is 0, `planMove` drops the
       // move as no change, and the finding was then describing a correction with
       // nothing attached to it. The delta is relative to each side's own peak,
       // so it cannot say what the level should BE — only that scaling cannot get
       // there from zero.
       const from = patchRaw(patch, 'env1.sustain')
-      const def = PARAM_BY_ID.get('env1.sustain')
-      const wanted = from === undefined ? undefined : from * 10 ** (-d / 20)
+      // env1.sustain is a LINEAR 0..1 level; convert the dB delta to a ratio.
+      const plan = planMove(patch, 'env1.sustain', v => v * 10 ** (-d / 20))
       const zeroNote = tooLow && from !== undefined && from <= 0
         ? ' env1.sustain is at 0 and this correction is a RATIO, which cannot lift a level off zero - set env1.sustain directly from the reference (its decay clearly settles onto a sustain, this one does not) rather than scaling the current value.'
         // A sustain pinned at 1 with the reference still higher means the two
         // envelopes differ in DECAY, not in sustain: there is no headroom left
         // and the rest of the finding is not this parameter's to fix.
-        : wanted !== undefined && def !== undefined && (wanted > def.max || wanted < def.min)
-          ? ` env1.sustain cannot travel that far (range ${def.min}..${def.max}); it stops at ${round(Math.min(def.max, Math.max(def.min, wanted)), 3)}, and the rest is a decay difference rather than a sustain one - look at env1.decay and env1.dec_curve.`
-          : ''
+        : clampNote(plan, 'The rest is a decay difference rather than a sustain one - look at env1.decay and env1.dec_curve.')
       return {
         error: d,
         finding: `Sustain level is ${n1(Math.abs(d))} dB too ${tooLow ? 'low' : 'high'} relative to the peak.${zeroNote}`,
@@ -1189,8 +1606,7 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
         // sustainDb is sampled at 80% of the buffer, so a long decay still
         // colours it; the link is direct but not clean.
         confidence: 'medium',
-        // env1.sustain is a LINEAR 0..1 level; convert the dB delta to a ratio.
-        suggested: suggest(patch, 'env1.sustain', v => v * 10 ** (-d / 20))
+        suggested: plan.suggested
       }
     }
   },
@@ -1211,7 +1627,10 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const noise = switchState(patch, 'noise.enabled')
       const headline = `Spectral flatness is ${d.toFixed(3)} ${tooNoisy ? 'higher' : 'lower'} than the reference (0 tonal, 1 noise), so the candidate is too ${tooNoisy ? 'noisy' : 'clean'}.`
       // 1:1 flatness-to-level is a placeholder mapping, not a calibration.
-      const levelMove = suggest(patch, 'noise.level', from => from - d)
+      const levelPlan = planMove(patch, 'noise.level', from => from - d)
+      const levelRemainder = tooNoisy
+        ? 'noise.level bottoms out at 0, so the flatness left over is not the noise generator: look at dist.drive, dist.type Bitcrush, and filter1.resonance self-noise.'
+        : 'noise.level tops out at 1, so the rest of the flatness has to come from elsewhere: a noisier noise.type, dist.drive with dist.enabled on, or a brighter osc1.wavetable region.'
       const distNote = switchState(patch, 'dist.enabled') === 'off' ? ' (itself inert while dist.enabled is off)' : ''
 
       if (tooNoisy) {
@@ -1230,12 +1649,12 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
         }
         return {
           error: d,
-          finding: headline,
+          finding: `${headline}${clampNote(levelPlan, levelRemainder)}`,
           direction: 'decrease',
           // Flatness lumps together the noise generator, distortion and any
           // inharmonic partials. Directionally right, quantitatively crude.
           confidence: 'low',
-          suggested: levelMove,
+          suggested: levelPlan.suggested,
           paramIds: ['noise.level', 'noise.enabled']
         }
       }
@@ -1248,6 +1667,10 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       if (noise === 'off') {
         const enable = enableMove(patch, 'noise.enabled')
         if (enable) {
+          // From an effective ZERO, not from where the knob rests: the bypassed
+          // generator put no noise in the buffer at all, so `from - d` would
+          // charge the render for a level it never heard.
+          const zeroFrameLevel = planMove(patch, 'noise.level', () => -d)
           return [
             {
               error: d,
@@ -1255,28 +1678,27 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
               direction: 'increase',
               confidence: 'medium',
               suggested: enable,
-              paramIds: ['noise.enabled', 'noise.level', 'noise.type']
+              paramIds: ['noise.enabled', 'noise.level', 'noise.type'],
+              group: 'engage-noise'
             },
             {
               error: d,
-              // From an effective ZERO, not from where the knob rests: the
-              // bypassed generator put no noise in the buffer at all, so
-              // `from - d` would charge the render for a level it never heard.
-              finding: `Second half of the same move: noise.level to ${round(-d, 3)}, the whole flatness gap measured from zero - the bypassed generator contributed none of the level it is currently showing. It is inert until noise.enabled is on. The 1:1 flatness-to-level mapping is a placeholder, so treat the amount as a starting point and re-measure. Also try a different noise.type: Pink sits under a tone where White sits on top of it.`,
+              finding: `Second half of the same move: noise.level to ${legalFor('noise.level', -d)}, the whole flatness gap measured from zero - the bypassed generator contributed none of the level it is currently showing. It is inert until noise.enabled is on. The 1:1 flatness-to-level mapping is a placeholder, so treat the amount as a starting point and re-measure. Also try a different noise.type: Pink sits under a tone where White sits on top of it.${clampNote(zeroFrameLevel, levelRemainder)}`,
               direction: 'increase',
               confidence: 'low',
-              suggested: suggest(patch, 'noise.level', () => -d),
-              paramIds: ['noise.level', 'noise.type', 'noise.enabled']
+              suggested: zeroFrameLevel.suggested,
+              paramIds: ['noise.level', 'noise.type', 'noise.enabled'],
+              group: 'engage-noise'
             }
           ]
         }
       }
       return {
         error: d,
-        finding: `${headline}${noise === 'on' ? ' Also try a different noise.type: Pink sits under a tone where White sits on top of it.' : ''}`,
+        finding: `${headline}${noise === 'on' ? ' Also try a different noise.type: Pink sits under a tone where White sits on top of it.' : ''}${clampNote(levelPlan, levelRemainder)}`,
         direction: 'increase',
         confidence: 'low',
-        suggested: levelMove,
+        suggested: levelPlan.suggested,
         paramIds: ['noise.level', 'noise.enabled', 'noise.type']
       }
     }
@@ -1296,7 +1718,10 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       if (!Number.isFinite(d)) return null
       const tooNarrow = d < 0
       const headline = `Stereo width is ${d.toFixed(3)} ${tooNarrow ? 'narrower' : 'wider'} than the reference (0 is mono).`
-      const spreadMove = suggest(patch, 'osc1.spread', from => from - d)
+      const spreadPlan = planMove(patch, 'osc1.spread', from => from - d)
+      const spreadRemainder = tooNarrow
+        ? 'osc1.spread tops out at 1, so the rest of the width has to come from more osc1.unison voices, more osc1.detune, or chorus.mix / reverb.width downstream.'
+        : 'osc1.spread bottoms out at 0, which is fully mono at the oscillator, so the remaining width is downstream: chorus.mix, reverb.width, or an off-centre osc1.pan.'
       // Not an `enabled` switch, but exactly the same gate: `voice.ts` computes
       // the per-voice offset as `unison === 1 ? 0 : ...` and multiplies both
       // osc1.spread and osc1.detune by it, so on a single voice both are
@@ -1321,34 +1746,37 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
         }
         const unisonMove = suggest(patch, 'osc1.unison', () => MIN_SPREADING_UNISON)
         if (unisonMove) {
+          // From an effective ZERO, not from where the knob rests: with one
+          // voice the spread was multiplied by zero, so the render carried none
+          // of the width the knob is currently showing.
+          const zeroFrameSpread = planMove(patch, 'osc1.spread', () => -d)
           return [
             {
               error: d,
               finding: `${headline} osc1.unison is 1, and a single voice multiplies both osc1.spread and osc1.detune by zero - they do nothing at all until this action raises unison to ${MIN_SPREADING_UNISON}. Unison is audible in its own right, not just in the stereo field: ${MIN_SPREADING_UNISON} voices at osc1.detune thickens the tone as well as widening it. The companion action then sets the spread.`,
               direction: 'increase',
               confidence: 'medium',
-              suggested: unisonMove
+              suggested: unisonMove,
+              group: 'engage-unison'
             },
             {
               error: d,
-              // From an effective ZERO, not from where the knob rests: with one
-              // voice the spread was multiplied by zero, so the render carried
-              // none of the width the knob is currently showing.
-              finding: `Second half of the same move: osc1.spread to ${round(-d, 3)}, the whole width gap measured from zero - a single voice multiplied the spread it is currently showing by zero. Inert until osc1.unison is above 1. Widen at the source like this before reaching for chorus.mix or reverb.width, which also change the timbre.`,
+              finding: `Second half of the same move: osc1.spread to ${legalFor('osc1.spread', -d)}, the whole width gap measured from zero - a single voice multiplied the spread it is currently showing by zero. Inert until osc1.unison is above 1. Widen at the source like this before reaching for chorus.mix or reverb.width, which also change the timbre.${clampNote(zeroFrameSpread, spreadRemainder)}`,
               direction: 'increase',
               confidence: 'medium',
-              suggested: suggest(patch, 'osc1.spread', () => -d),
-              paramIds: ['osc1.spread', 'osc1.detune', 'osc1.unison']
+              suggested: zeroFrameSpread.suggested,
+              paramIds: ['osc1.spread', 'osc1.detune', 'osc1.unison'],
+              group: 'engage-unison'
             }
           ]
         }
       }
       return {
         error: d,
-        finding: `${headline} ${tooNarrow ? 'Widen at the source first - osc1.unison above 1 with osc1.detune and osc1.spread - before reaching for chorus.mix or reverb.width, which also change the timbre' : 'Narrow osc1.spread and osc1.detune first; pulling chorus.mix or reverb.width down also removes body'}.`,
+        finding: `${headline} ${tooNarrow ? 'Widen at the source first - osc1.unison above 1 with osc1.detune and osc1.spread - before reaching for chorus.mix or reverb.width, which also change the timbre' : 'Narrow osc1.spread and osc1.detune first; pulling chorus.mix or reverb.width down also removes body'}.${clampNote(spreadPlan, spreadRemainder)}`,
         direction: tooNarrow ? 'increase' : 'decrease',
         confidence: 'medium',
-        suggested: spreadMove
+        suggested: spreadPlan.suggested
       }
     }
   },
@@ -1366,34 +1794,27 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const d = diff.loudnessDbDelta
       if (!Number.isFinite(d)) return null
       const quiet = d < 0
-      const from = patchRaw(patch, 'master.volume')
-      const def = PARAM_BY_ID.get('master.volume')
       // One gain, used by both the clip note and the suggestion. Spelling the
       // formula out twice is how the finding and the value drift apart.
       const gain = 10 ** (-d / 20)
-      const wanted = from === undefined ? undefined : from * gain
+      const plan = planMove(patch, 'master.volume', v => v * gain)
       // Clamping is not the live-lock the enable-gated rules had — the clamped
       // move still shifts loudness the right way, it just stops short — but the
       // finding used to describe a correction bigger than the move without
-      // saying by how much. Quoting the shortfall in dB is what makes the two
-      // agree: an agent knows exactly what is left for the other levers.
-      const reachable = wanted !== undefined && def !== undefined
-        ? Math.min(def.max, Math.max(def.min, wanted))
-        : undefined
-      const shortfallDb = wanted !== undefined && reachable !== undefined && wanted > 0 && reachable > 0
-        ? 20 * Math.log10(wanted / reachable)
-        : undefined
-      const clipNote = wanted !== undefined && def !== undefined && (wanted > def.max || wanted < def.min)
-        ? ` master.volume cannot travel that far (range ${def.min}..${def.max}): it stops at ${round(reachable ?? def.max, 3)}${shortfallDb === undefined ? '' : `, ${n1(Math.abs(shortfallDb))} dB short`}. Take the rest from oscillator levels or comp.makeup (itself inert unless comp.enabled is on).`
+      // saying by how much. `clampNote` names the computed gain and the limit;
+      // this adds the one thing a linear amplitude cannot show, which is how
+      // many dB of the error the clamped move fails to deliver.
+      const shortfall = plan.clamped && plan.clamped.computed > 0 && plan.clamped.limit > 0
+        ? `, ${n1(Math.abs(20 * Math.log10(plan.clamped.computed / plan.clamped.limit)))} dB short of the ${n1(Math.abs(d))} dB asked for`
         : ''
       return {
         error: d,
-        finding: `Gated loudness is ${n1(Math.abs(d))} dB ${quiet ? 'below' : 'above'} the reference.${clipNote}`,
+        finding: `Gated loudness is ${n1(Math.abs(d))} dB ${quiet ? 'below' : 'above'} the reference.${clampNote(plan, 'Take the rest from oscillator levels or comp.makeup (itself inert unless comp.enabled is on).', shortfall)}`,
         direction: quiet ? 'increase' : 'decrease',
         // A gain change moves gated loudness by exactly that gain (R128's
         // relative gate), so this one really is one-to-one.
         confidence: 'high',
-        suggested: suggest(patch, 'master.volume', v => v * gain)
+        suggested: plan.suggested
       }
     }
   }
@@ -1416,23 +1837,73 @@ export function assertRuleParamsExist(rules: readonly AdviceRule[] = ADVICE_RULE
 assertRuleParamsExist()
 
 /**
+ * How much of a stated gain the advisor is prepared to bank on, per confidence
+ * step. One 0.6 discount per step DOWN the `high`/`medium`/`low` ladder.
+ *
+ * These are priors, not measurements — nothing here is calibrated against
+ * `compareAudioMetrics` — and 0.6 was chosen for the exchange rate it implies
+ * rather than fitted: a `low` action must promise about 2.8x the raw gain of a
+ * `medium` one to outrank it, and a `medium` about 1.7x a `high` one. The
+ * previous rule, "rank on raw gain", is the special case where every confidence
+ * step is worth 1.0, which is how a low-confidence Env 2 recommendation for a
+ * route that did not exist came to sit above several usable moves.
+ */
+const CONFIDENCE_FACTOR: Readonly<Record<MatchAction['confidence'], number>> = {
+  high: 1,
+  medium: 0.6,
+  low: 0.36
+}
+
+/**
+ * Two values this close are the same value.
+ *
+ * Every `suggested` has already been through `round(_, 6)`, so anything below
+ * the sixth decimal is rounding residue rather than a move.
+ */
+const NO_OP_EPSILON = 1e-9
+
+/**
+ * `MatchAction` plus the atomicity marker.
+ *
+ * `MatchAction` lives in `match-types.ts`, a shared contract this module only
+ * consumes, so `group` is added by EXTENSION here rather than by widening that
+ * type. A `GroupedMatchAction[]` is a `MatchAction[]`, so every existing caller
+ * and every existing field keeps working and the marker survives serialization
+ * — a caller that knows about groups can read it, one that does not is
+ * unaffected. Promoting `group?: string` into `MatchAction` itself is the
+ * one-line change that would make it first-class in the contract.
+ */
+export interface GroupedMatchAction extends MatchAction {
+  /**
+   * Actions sharing this id are ATOMIC: apply all of them or none. The ranked
+   * list keeps them adjacent and a `maxActions` cut never lands inside one, so
+   * a group can be handed to `apply_patch` as a single change.
+   */
+  group?: string
+}
+
+/**
  * Turn a measured diff into ranked parameter moves.
  *
  * Returns `[]` when nothing crosses its rule's `minError` - an empty list means
  * "no dimension is measurably wrong", and is more useful than five padded
  * actions about noise-floor differences.
+ *
+ * Ordering is by `estimatedGain`, which is expected value: the raw gain
+ * discounted by confidence. See the module header for what that buys and what
+ * it is not.
  */
 export function adviseFromDiff(
   diff: MatchDiff,
   currentPatch: PatchValues,
   options?: AdviseOptions
-): MatchAction[] {
+): GroupedMatchAction[] {
   const maxActions = Math.max(0, Math.trunc(options?.maxActions ?? 5))
   if (maxActions === 0) return []
   const focus = options?.focus
-  const ctx: AdviceContext = { diff, patch: currentPatch ?? {} }
+  const ctx: AdviceContext = { diff, patch: currentPatch ?? {}, ...(options?.mods ? { mods: options.mods } : {}) }
 
-  const actions: MatchAction[] = []
+  const actions: GroupedMatchAction[] = []
   for (const rule of ADVICE_RULES) {
     if (focus && rule.category !== focus) continue
     let outcome: RuleOutcome | RuleOutcome[] | null
@@ -1443,24 +1914,84 @@ export function adviseFromDiff(
       continue
     }
     if (!outcome) continue
-    // A rule that needs two parameters to land one correction returns two
-    // outcomes; equal `error` gives them equal gain, and the stable sort below
-    // keeps them next to each other in the ranked list.
-    for (const one of Array.isArray(outcome) ? outcome : [outcome]) {
-      const magnitude = Math.abs(one.error)
-      if (!Number.isFinite(magnitude) || magnitude < rule.minError) continue
+    const firing = (Array.isArray(outcome) ? outcome : [outcome])
+      .filter(one => Number.isFinite(Math.abs(one.error)) && Math.abs(one.error) >= rule.minError)
+    if (firing.length === 0) continue
+    // ONE gain for the whole firing. Its outcomes are halves of one correction,
+    // so ranking them apart lets an unrelated action land between them; and an
+    // atomic pair is only as trustworthy as its least confident half, which is
+    // why the factor is the MINIMUM rather than the mean. Each action still
+    // reports its own `confidence`.
+    const magnitude = Math.max(...firing.map(one => Math.abs(one.error)))
+    const factor = Math.min(...firing.map(one => CONFIDENCE_FACTOR[one.confidence]))
+    const estimatedGain = round(rule.weight * Math.min(1, magnitude / rule.scale) * factor, 4)
+    for (const one of firing) {
+      // A `suggested` whose `to` is its `from` renders identical audio, earns
+      // identical advice next round, and costs a ranked slot to say nothing.
+      // `planMove` already drops those, so this is the invariant rather than the
+      // fix: it holds for a rule that builds a `suggested` by hand, or that
+      // grows a path around `planMove` later. The finding SURVIVES - an
+      // advisory with no move is legitimate, and several rules exist only to
+      // give one - it is the empty move that goes.
+      const move = one.suggested
+      const noop = move !== undefined && Math.abs(move.to - move.from) < NO_OP_EPSILON
       actions.push({
         finding: one.finding,
         paramIds: [...(one.paramIds ?? rule.paramIds)],
         direction: one.direction,
-        ...(one.suggested ? { suggested: one.suggested } : {}),
-        estimatedGain: round(rule.weight * Math.min(1, magnitude / rule.scale), 4),
-        confidence: one.confidence
+        ...(move && !noop ? { suggested: move } : {}),
+        estimatedGain,
+        confidence: one.confidence,
+        ...(one.group ? { group: `${rule.id}:${one.group}` } : {})
       })
     }
   }
 
-  // Array.prototype.sort is stable, so equal gains keep table order.
+  // Array.prototype.sort is stable, so equal gains keep table order — which is
+  // what keeps a firing's outcomes adjacent, since they share a gain.
   actions.sort((a, b) => b.estimatedGain - a.estimatedGain)
-  return actions.slice(0, maxActions)
+  return takeWholeGroups(actions, maxActions)
+}
+
+/**
+ * Cut the ranked list to `limit` without ever splitting a group.
+ *
+ * A group that does not fit in what is left is SKIPPED rather than truncated,
+ * and the walk continues, so a smaller action behind it can use the slots. Half
+ * a group is worse than none of it: `dist.enabled` on its own is an uncontrolled
+ * timbre change, and `dist.drive` on its own is nothing at all — which is why
+ * the findings have always said "apply both or neither" and why saying it in
+ * prose was not enough.
+ */
+function takeWholeGroups(actions: readonly GroupedMatchAction[], limit: number): GroupedMatchAction[] {
+  const sizes = new Map<string, number>()
+  for (const action of actions) {
+    if (action.group) sizes.set(action.group, (sizes.get(action.group) ?? 0) + 1)
+  }
+  const out: GroupedMatchAction[] = []
+  // The FIRST member met decides for the whole group, and the decision is then
+  // remembered. Re-asking per member is what splits one: the first member has
+  // already spent a slot by the time the second is tested, so a pair that fit
+  // when it was admitted no longer "fits" on the way in behind itself.
+  const admitted = new Set<string>()
+  const skipped = new Set<string>()
+  for (const action of actions) {
+    if (action.group && admitted.has(action.group)) {
+      out.push(action)
+      continue
+    }
+    if (out.length >= limit) break
+    if (!action.group) {
+      out.push(action)
+      continue
+    }
+    if (skipped.has(action.group)) continue
+    if ((sizes.get(action.group) ?? 1) > limit - out.length) {
+      skipped.add(action.group)
+      continue
+    }
+    admitted.add(action.group)
+    out.push(action)
+  }
+  return out
 }

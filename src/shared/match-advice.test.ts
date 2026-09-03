@@ -1477,3 +1477,524 @@ describe('findings that outrun their own move', () => {
     expect(action.finding).toContain('env1.decay')
   })
 })
+
+describe('the env2 -> filter1.cutoff route', () => {
+  /**
+   * The reviewer's top finding: the top action asked for `env2.decay` while the
+   * patch carried no `env2 -> filter1.cutoff` route, so the move could not reach
+   * the sound at all. The finding hedged about it in prose - "if the route does
+   * not exist then env2.decay is inert" - because the rule could not see the
+   * matrix. It can now, and the three states have to stay three.
+   */
+  const darkensTooFast = () => {
+    const diff = zeroDiff()
+    diff.brightness = withBrightness([0.05, -0.3, -0.85, -1.5])
+    return diff
+  }
+  const holdsTooLong = () => {
+    const diff = zeroDiff()
+    diff.brightness = withBrightness([-1.5, -0.85, -0.3, 0.05])
+    return diff
+  }
+  const routed = (depth: number, extra: Record<string, unknown> = {}) => [
+    { source: 'env2', destination: 'filter1.cutoff', depth, ...extra }
+  ]
+  const envAction = (diff: MatchDiff, options: Parameters<typeof adviseFromDiff>[2] = {}) =>
+    adviseFromDiff(diff, defaultPatch(), { maxActions: 20, ...options })
+      .find(a => a.paramIds.includes('env2.decay'))
+
+  it('recommends set_modulation instead of an inert env2.decay when the route is absent', () => {
+    const action = envAction(darkensTooFast(), { mods: [] })!
+    expect(action).toBeDefined()
+    // The whole defect: no move at all, because there is nothing for a move to
+    // reach. A finding with no `suggested` is legitimate; a `suggested` that
+    // changes nothing is the live-lock.
+    expect(action.suggested).toBeUndefined()
+    expect(action.finding).toContain('set_modulation source=env2 destination=filter1.cutoff depth=')
+    expect(action.finding).toContain('INERT')
+    // And nothing else in the list quietly moves env2 either.
+    const all = adviseFromDiff(darkensTooFast(), defaultPatch(), { maxActions: 20, mods: [] })
+    expect(all.some(a => a.suggested?.id.startsWith('env2.'))).toBe(false)
+  })
+
+  /** The depth the finding tells an agent to create, read back out of its prose. */
+  function recommendedDepth(finding: string): number {
+    const m = /depth=(-?[\d.]+)/.exec(finding)
+    expect(m, `no depth in: ${finding}`).not.toBeNull()
+    return Number(m![1])
+  }
+
+  it('signs the recommended depth from the trend rather than assuming the usual wiring', () => {
+    // env2 only ever FALLS, so a candidate that has to brighten across the note
+    // needs a NEGATIVE depth. Assuming the usual positive wiring here would hand
+    // back a route that makes the error worse.
+    const brighten = recommendedDepth(envAction(darkensTooFast(), { mods: [] })!.finding)
+    expect(brighten).toBeLessThan(0)
+    expect(brighten).toBeGreaterThanOrEqual(-1)
+    const darken = recommendedDepth(envAction(holdsTooLong(), { mods: [] })!.finding)
+    expect(darken).toBeGreaterThan(0)
+    expect(darken).toBeLessThanOrEqual(1)
+  })
+
+  it('reads a disabled or negligible route as no route', () => {
+    for (const mods of [routed(0.45, { enabled: false }), routed(0.001), routed(-0.001)]) {
+      const action = envAction(darkensTooFast(), { mods })!
+      expect(action.suggested, JSON.stringify(mods)).toBeUndefined()
+      expect(action.finding).toContain('set_modulation')
+    }
+  })
+
+  it('behaves as it always did on a routed patch with positive depth', () => {
+    const withRoute = envAction(darkensTooFast(), { mods: routed(0.45) })!
+    const noMatrix = envAction(darkensTooFast())!
+    expect(withRoute.suggested?.id).toBe('env2.decay')
+    // Same probe, same landing: reading a positive route confirms the wiring the
+    // unread case had to assume.
+    expect(withRoute.suggested!.to).toBe(noMatrix.suggested!.to)
+    expect(withRoute.suggested!.to).toBeGreaterThan(withRoute.suggested!.from)
+    expect(withRoute.direction).toBe('increase')
+  })
+
+  it('inverts the recommendation on a negative route instead of lengthening the wrong stage', () => {
+    const positive = envAction(darkensTooFast(), { mods: routed(0.45) })!
+    const negative = envAction(darkensTooFast(), { mods: routed(-0.45) })!
+    // With the cutoff running against env2 the sweep is dark-to-bright, so the
+    // very same error wants the decay SHORTENED.
+    expect(negative.suggested!.to).toBeLessThan(negative.suggested!.from)
+    expect(negative.direction).toBe('decrease')
+    expect(positive.direction).toBe('increase')
+    expect(negative.finding).toContain('NEGATIVE')
+    expect(negative.finding).toContain('SHORTEN env2.decay')
+    expect(negative.finding).not.toContain('LENGTHEN env2.decay')
+    // Mirror case: the other error direction flips with it.
+    const heldNegative = envAction(holdsTooLong(), { mods: routed(-0.45) })!
+    expect(heldNegative.suggested!.to).toBeGreaterThan(heldNegative.suggested!.from)
+  })
+
+  it('never reports a route as missing when no matrix was passed', () => {
+    // Same tri-state discipline as the bypass switches: "I have not looked" is
+    // not "there is none".
+    for (const diff of [darkensTooFast(), holdsTooLong()]) {
+      const action = envAction(diff)!
+      expect(action.finding).not.toMatch(/carries no env2 -> filter1\.cutoff route|is switched OFF/)
+      expect(action.finding).toContain('PROBE')
+      expect(action.suggested?.id).toBe('env2.decay')
+      expect(action.confidence).toBe('low')
+    }
+  })
+
+  it('reads the polarity rather than the source name, so an unrelated route is not one', () => {
+    const wrongDest = envAction(darkensTooFast(), { mods: [{ source: 'env2', destination: 'osc1.morph', depth: 0.5 }] })!
+    const wrongSource = envAction(darkensTooFast(), { mods: [{ source: 'lfo1', destination: 'filter1.cutoff', depth: 0.5 }] })!
+    for (const action of [wrongDest, wrongSource]) {
+      expect(action.suggested).toBeUndefined()
+      expect(action.finding).toContain('set_modulation')
+    }
+  })
+})
+
+describe('a finding never describes a bigger move than it applies', () => {
+  /** The clamp claim a finding makes, read back out of its own prose. */
+  function clampClaim(finding: string): { id: string; computed: number; bound: string; limit: number } | null {
+    const m = /([\w.]+) cannot travel that far: the correction computes (-?[\d.]+(?:e[+-]?\d+)?)(?: [^,]*)?, past its (maximum|minimum) of (-?[\d.]+(?:e[+-]?\d+)?)/.exec(finding)
+    return m ? { id: m[1], computed: Number(m[2]), bound: m[3], limit: Number(m[4]) } : null
+  }
+
+  it('reproduces the reviewer dist.drive case with the clamp stated', () => {
+    // 0.3 - (-35.9 * 0.05) is 2.095, and dist.drive's maximum is 1. The
+    // structured suggestion was already right; the prose quoted 2.095.
+    const diff = zeroDiff()
+    diff.harmonics = {
+      deltaDb: Array.from({ length: 12 }, () => 0),
+      tiltDeltaDbPerOctave: -35.9,
+      oddEvenDeltaDb: 0,
+      inharmonicityDelta: 0
+    }
+    const patch = defaultPatch({ 'dist.enabled': 1, 'dist.drive': 0.3 })
+    const action = adviseFromDiff(diff, patch, { maxActions: 20 }).find(a => a.suggested?.id === 'dist.drive')!
+    expect(action.suggested!.to).toBe(1)
+    const claim = clampClaim(action.finding)
+    expect(claim, action.finding).not.toBeNull()
+    expect(claim!.id).toBe('dist.drive')
+    expect(claim!.computed).toBeCloseTo(2.095, 6)
+    expect(claim!.bound).toBe('maximum')
+    expect(claim!.limit).toBe(1)
+    // And it says where the missing tilt has to come from.
+    expect(action.finding).toContain('osc1.wavetable')
+  })
+
+  it('agrees with the move it emitted, on every rule that clamps', () => {
+    // Driven from the emitted action, the way the other consistency tests are:
+    // the finding is only allowed to claim what the suggestion actually did.
+    const magnitudes = [-9000, -3000, -1200, -240, -48, -6, 6, 48, 240, 1200, 3000, 9000]
+    const patches = [
+      defaultPatch(),
+      defaultPatch({ 'master.volume': 1.4, 'env1.sustain': 0.9, 'dist.enabled': 1, 'dist.drive': 0.9, 'eq.enabled': 1, 'eq.high_gain': 16 }),
+      defaultPatch({ 'master.volume': 0.05, 'env1.sustain': 0.05, 'dist.enabled': 1, 'dist.drive': 0.05, 'eq.enabled': 1, 'eq.high_gain': -16, 'osc1.unison': 7, 'osc1.detune': 95, 'noise.enabled': 1, 'noise.level': 0.95 })
+    ]
+    let claims = 0
+    for (const patch of patches) {
+      for (const m of magnitudes) {
+        const diff = zeroDiff()
+        diff.pitch.centsError = m
+        diff.harmonics = {
+          deltaDb: Array.from({ length: 12 }, (_, i) => (m / 50) * (i % 3 === 0 ? 1 : -1)),
+          tiltDeltaDbPerOctave: m / 30,
+          oddEvenDeltaDb: -m / 100,
+          inharmonicityDelta: m * 1e-5
+        }
+        diff.bands = BAND_CENTERS.map((centerHz, i) => ({ centerHz, deltaDb: (m / 40) * (i > 6 ? 1 : -1) }))
+        diff.envelope = { attackMsDelta: m, timeToPeakMsDelta: m, decayT60MsDelta: m * 4, sustainDbDelta: m / 10 }
+        diff.brightness = withBrightness([m / 400, m / 300, m / 200, m / 100])
+        diff.flatnessDelta = m / 2000
+        diff.stereoWidthDelta = m / 2000
+        diff.loudnessDbDelta = m / 40
+        for (const mods of [undefined, [], [{ source: 'env2', destination: 'filter1.cutoff', depth: 0.5 }]]) {
+          for (const action of adviseFromDiff(diff, patch, { maxActions: 50, ...(mods ? { mods } : {}) })) {
+            const claim = clampClaim(action.finding)
+            if (!claim) {
+              // The other half of the contract: a suggestion sitting exactly on
+              // an endpoint is fine, but only a CLAMPED one is allowed to be
+              // silent about it, and those all carry a claim.
+              continue
+            }
+            claims++
+            const def = PARAM_BY_ID.get(claim.id)
+            expect(def, `clamp claim names unknown param ${claim.id}`).toBeDefined()
+            const label = `${claim.id} @ m=${m}: ${action.finding}`
+            // The limit is a real endpoint of that parameter.
+            expect(claim.limit, label).toBe(claim.bound === 'maximum' ? def!.max : def!.min)
+            // The computed value really is past it, on the side claimed.
+            if (claim.bound === 'maximum') expect(claim.computed, label).toBeGreaterThan(def!.max)
+            else expect(claim.computed, label).toBeLessThan(def!.min)
+            // And the move, when there is one, landed on the limit rather than
+            // on the number the prose quoted.
+            if (action.suggested?.id === claim.id) {
+              expect(action.suggested.to, label).toBe(claim.limit)
+              expect(action.suggested.to, label).not.toBe(claim.computed)
+            }
+          }
+        }
+      }
+    }
+    expect(claims, 'the sweep never exercised a clamp').toBeGreaterThan(10)
+  })
+})
+
+describe('no emitted move is a no-op', () => {
+  it('never suggests a value equal to the one already there', () => {
+    // The eval case: `env1.sustain 0.0 -> 0.0` printed as a ranked action. A
+    // suggestion that lands where the patch already is renders identical audio
+    // and earns the identical advice next round.
+    const magnitudes = [-9000, -1200, -150, -50, -12, -3, -0.5, 0.5, 3, 12, 50, 150, 1200, 9000]
+    const knobs = [0, 1e-6, 0.05, 0.5, 0.95, 1]
+    let suggestions = 0
+    for (const m of magnitudes) {
+      for (const k of knobs) {
+        const patch = defaultPatch({
+          'env1.sustain': k,
+          'env1.attack': Math.max(0.001, k * 10),
+          'env1.decay': Math.max(0.001, k * 10),
+          'env2.decay': Math.max(0.001, k * 10),
+          'master.volume': k * 1.5,
+          'noise.level': k,
+          'noise.enabled': k > 0.5 ? 1 : 0,
+          'dist.drive': k,
+          'dist.enabled': k > 0.5 ? 1 : 0,
+          'eq.high_gain': (k - 0.5) * 36,
+          'eq.enabled': k > 0.5 ? 1 : 0,
+          'osc1.spread': k,
+          'osc1.detune': k * 100,
+          'osc1.unison': k > 0.5 ? 7 : 1,
+          'osc1.fine': (k - 0.5) * 200,
+          'filter1.cutoff': 20 + k * 19980
+        })
+        const diff = zeroDiff()
+        diff.pitch.centsError = m
+        diff.harmonics = {
+          deltaDb: Array.from({ length: 12 }, (_, i) => (m / 60) * (i % 2 === 0 ? 1 : -1)),
+          tiltDeltaDbPerOctave: m / 40,
+          oddEvenDeltaDb: m / 80,
+          inharmonicityDelta: m * 2e-5
+        }
+        diff.bands = BAND_CENTERS.map((centerHz, i) => ({ centerHz, deltaDb: (m / 60) * (i > 6 ? 1 : -1) }))
+        diff.envelope = { attackMsDelta: m, timeToPeakMsDelta: m, decayT60MsDelta: m * 3, sustainDbDelta: m / 20 }
+        diff.flatnessDelta = m / 3000
+        diff.stereoWidthDelta = m / 3000
+        diff.loudnessDbDelta = m / 60
+        for (const brightness of [[], [m / 500, m / 400, m / 300, m / 200], [m / 300, m / 300, m / 300, m / 300]]) {
+          diff.brightness = withBrightness(brightness)
+          for (const mods of [undefined, [], [{ source: 'env2', destination: 'filter1.cutoff', depth: -0.4 }]]) {
+            for (const action of adviseFromDiff(diff, patch, { maxActions: 50, ...(mods ? { mods } : {}) })) {
+              if (!action.suggested) continue
+              suggestions++
+              expect(
+                action.suggested.to,
+                `no-op move ${action.suggested.id} ${action.suggested.from} -> ${action.suggested.to}`
+              ).not.toBe(action.suggested.from)
+            }
+          }
+        }
+      }
+    }
+    expect(suggestions, 'the sweep never exercised a suggestion').toBeGreaterThan(500)
+  })
+})
+
+describe('atomic groups', () => {
+  /** Everything switched off, so every enable/move pair in the table fires. */
+  const allBypassed = () =>
+    defaultPatch({
+      'noise.enabled': 0,
+      'noise.level': 0.8,
+      'eq.enabled': 0,
+      'eq.high_gain': 12,
+      'dist.enabled': 0,
+      'dist.drive': 0.6,
+      'filter1.enabled': 0,
+      'filter1.type': 'HP 24',
+      'osc1.unison': 1
+    })
+
+  const everythingWrong = () => {
+    const diff = zeroDiff()
+    diff.pitch.centsError = 700
+    diff.harmonics = {
+      deltaDb: [0, -9, -7, -5, 0, 0, -6, -6, -6, -6, -6, -6],
+      tiltDeltaDbPerOctave: -5,
+      oddEvenDeltaDb: 6,
+      inharmonicityDelta: 8e-4
+    }
+    diff.bands = BAND_CENTERS.map(centerHz => ({ centerHz, deltaDb: centerHz >= 4000 ? -7 : 0 }))
+    diff.brightness = withBrightness([-0.9, -0.92, -0.9, -0.91])
+    diff.envelope = { attackMsDelta: 90, timeToPeakMsDelta: 90, decayT60MsDelta: -700, sustainDbDelta: -5 }
+    diff.flatnessDelta = -0.25
+    diff.stereoWidthDelta = -0.35
+    diff.loudnessDbDelta = -6
+    return diff
+  }
+
+  function groupSizes(actions: readonly { group?: string }[]): Map<string, number> {
+    const sizes = new Map<string, number>()
+    for (const a of actions) if (a.group) sizes.set(a.group, (sizes.get(a.group) ?? 0) + 1)
+    return sizes
+  }
+
+  it('marks each enable/move pair as one group and keeps its members adjacent', () => {
+    const all = adviseFromDiff(everythingWrong(), allBypassed(), { maxActions: 50 })
+    const sizes = groupSizes(all)
+    // dist, filter1, unison and (with no per-window brightness) eq or noise.
+    expect(sizes.size).toBeGreaterThanOrEqual(3)
+    for (const [id, size] of sizes) expect(size, id).toBe(2)
+    // Adjacent, and the enable comes first: an agent applies the list in order.
+    for (const [id] of sizes) {
+      const at = all.map((a, i) => (a.group === id ? i : -1)).filter(i => i >= 0)
+      expect(at[1] - at[0], id).toBe(1)
+      expect(all[at[0]].suggested?.id, id).toMatch(/\.enabled$|osc1\.unison/)
+    }
+    // Members of one group are ranked as one thing, so nothing can wedge in.
+    for (const [id] of sizes) {
+      const members = all.filter(a => a.group === id)
+      expect(new Set(members.map(a => a.estimatedGain)).size, id).toBe(1)
+    }
+  })
+
+  it('never lets a maxActions cut split a group', () => {
+    for (const brightness of [[] as number[], [-0.9, -0.92, -0.9, -0.91], [0, -0.4, -0.9, -1.6]]) {
+      const diff = everythingWrong()
+      diff.brightness = withBrightness(brightness)
+      const all = adviseFromDiff(diff, allBypassed(), { maxActions: 50 })
+      const full = groupSizes(all)
+      expect(full.size, `no group to cut at brightness ${brightness.length}`).toBeGreaterThan(0)
+      for (let limit = 1; limit <= all.length + 2; limit++) {
+        const capped = adviseFromDiff(diff, allBypassed(), { maxActions: limit })
+        expect(capped.length).toBeLessThanOrEqual(limit)
+        for (const [id, size] of groupSizes(capped)) {
+          expect(size, `group ${id} split at maxActions=${limit}`).toBe(full.get(id))
+        }
+      }
+    }
+  })
+
+  it('spends a slot a group cannot use on the next action instead of leaving it empty', () => {
+    const diff = everythingWrong()
+    diff.brightness = withBrightness([])
+    const all = adviseFromDiff(diff, allBypassed(), { maxActions: 50 })
+    // Somewhere in this list a two-action group straddles a cut; at that limit
+    // the group is dropped whole and the list still fills up behind it.
+    const lengths = Array.from({ length: all.length }, (_, i) => adviseFromDiff(diff, allBypassed(), { maxActions: i + 1 }).length)
+    // Never over the cap, never gratuitously short: at worst one slot goes
+    // unused, and only when the group that wanted it needed two.
+    lengths.forEach((len, i) => {
+      expect(len).toBeLessThanOrEqual(i + 1)
+      expect(len).toBeGreaterThanOrEqual(i)
+    })
+  })
+})
+
+describe('confidence in the ranking', () => {
+  it('ranks a low-confidence action below a comparable higher-confidence one', () => {
+    // The reviewer's case, in the small: `filter-envelope-depth` carries the
+    // larger weight and both dimensions are saturated, so ranking on raw gain
+    // alone put its low-confidence action above a medium-confidence one that
+    // would actually have worked.
+    const weightOf = (id: string) => ADVICE_RULES.find(r => r.id === id)!.weight
+    expect(weightOf('filter-envelope-depth')).toBeGreaterThan(weightOf('decay-t60'))
+
+    const diff = zeroDiff()
+    diff.brightness = withBrightness([0, -0.8, -1.6, -2.4]) // saturated trend, low
+    diff.envelope.decayT60MsDelta = -1500                   // saturated T60, medium
+    const actions = adviseFromDiff(diff, defaultPatch(), { maxActions: 20 })
+    const env = actions.findIndex(a => a.paramIds.includes('env2.decay'))
+    const decay = actions.findIndex(a => a.paramIds.includes('env1.decay'))
+    expect(env, 'no envelope-depth action').toBeGreaterThanOrEqual(0)
+    expect(decay, 'no T60 action').toBeGreaterThanOrEqual(0)
+    expect(actions[env].confidence).toBe('low')
+    expect(actions[decay].confidence).toBe('medium')
+    expect(decay).toBeLessThan(env)
+  })
+
+  it('leaves the order alone between two actions of equal confidence', () => {
+    // The discount is a factor, not a reshuffle: within one confidence step the
+    // ranking is exactly the raw gain ordering it always was.
+    const diff = zeroDiff()
+    diff.envelope.attackMsDelta = 200   // attack-time, high, weight 0.12
+    diff.loudnessDbDelta = -12          // loudness, high, weight 0.10
+    const actions = adviseFromDiff(diff, defaultPatch(), { maxActions: 20 })
+    expect(actions.map(a => a.confidence)).toEqual(['high', 'high'])
+    expect(actions[0].paramIds).toContain('env1.attack')
+    expect(actions[1].paramIds).toContain('master.volume')
+  })
+
+  it('discounts a gain by one step per confidence step down', () => {
+    // Read off the emitted numbers rather than restated: the same saturated
+    // dimension, priced at its own confidence.
+    const gainOf = (diff: MatchDiff, id: string) =>
+      adviseFromDiff(diff, defaultPatch(), { maxActions: 20 }).find(a => a.paramIds.includes(id))!
+    const attack = zeroDiff()
+    attack.envelope.attackMsDelta = 400 // saturated, high
+    const t60 = zeroDiff()
+    t60.envelope.decayT60MsDelta = -3000 // saturated, medium
+    const high = gainOf(attack, 'env1.attack')
+    const medium = gainOf(t60, 'env1.decay')
+    expect(high.estimatedGain).toBeCloseTo(0.12, 6)
+    expect(medium.estimatedGain).toBeCloseTo(0.13 * 0.6, 6)
+  })
+
+  it('prices an atomic group at its least confident member', () => {
+    // You cannot apply half a group, so the pair is worth what its weakest step
+    // is worth - and both rows quote the same number, which is what keeps the
+    // ranked list monotone in `estimatedGain`.
+    const diff = zeroDiff()
+    diff.flatnessDelta = -0.25
+    const patch = defaultPatch({ 'noise.enabled': 0, 'noise.level': 0.5 })
+    const actions = adviseFromDiff(diff, patch, { maxActions: 20 })
+    expect(actions.map(a => a.confidence)).toEqual(['medium', 'low'])
+    expect(actions[0].estimatedGain).toBe(actions[1].estimatedGain)
+    expect(actions[0].estimatedGain).toBeCloseTo(0.08 * (0.25 / 0.5) * 0.36, 6)
+  })
+
+  it('keeps the returned list sorted by the number it reports', () => {
+    const diff = zeroDiff()
+    diff.pitch.centsError = 1200
+    diff.envelope = { attackMsDelta: 300, timeToPeakMsDelta: 300, decayT60MsDelta: -900, sustainDbDelta: -8 }
+    diff.loudnessDbDelta = -9
+    diff.stereoWidthDelta = -0.4
+    diff.flatnessDelta = -0.3
+    diff.brightness = withBrightness([0, -0.5, -1.1, -1.9])
+    for (const patch of [defaultPatch(), defaultPatch({ 'osc1.unison': 1, 'noise.enabled': 0, 'eq.enabled': 0 })]) {
+      const gains = adviseFromDiff(diff, patch, { maxActions: 50 }).map(a => a.estimatedGain)
+      expect([...gains].sort((a, b) => b - a)).toEqual(gains)
+    }
+  })
+})
+
+describe('brightness rows below the noise gate', () => {
+  /**
+   * `match-diff.ts` keeps a gated row in the array with a finite `octaveDelta`
+   * and marks it, precisely so the arithmetic here never meets a `null` - and
+   * says in its own contract that every consumer that means, spreads or trends
+   * the trajectory drops the marked rows first. `compareAudioMetrics` leaves
+   * them out of the score, so a rule that reads them steers against the number
+   * it is trying to move.
+   */
+  const gated = (octaveDelta: number) => ({ startMs: 0, endMs: 0, octaveDelta, belowNoiseFloor: true as const })
+
+  function brightness(rows: { octaveDelta: number; belowNoiseFloor?: true }[]): MatchDiff['brightness'] {
+    return rows.map((row, i) => ({ ...row, startMs: i * 250, endMs: (i + 1) * 250 }))
+  }
+
+  it('ignores a phantom swing manufactured by a decayed tail', () => {
+    // The real shape: three honest windows agreeing on a flat offset, and a
+    // near-silent fourth whose centroid was picked out of hiss. Read raw, the
+    // +4.9-octave last row is a huge trend and `env2.decay` ranks first.
+    const diff = zeroDiff()
+    diff.brightness = brightness([
+      { octaveDelta: -0.9 },
+      { octaveDelta: -0.92 },
+      { octaveDelta: -0.9 },
+      gated(4.9)
+    ])
+    const actions = adviseFromDiff(diff, defaultPatch(), { maxActions: 20 })
+    expect(actions.some(a => a.paramIds.includes('env2.decay'))).toBe(false)
+    const cutoff = actions.find(a => a.suggested?.id === 'filter1.cutoff')!
+    expect(cutoff, 'the three measured windows still read as a static offset').toBeDefined()
+    expect(cutoff.finding).toContain('every one of the 3 analysis windows')
+    expect(cutoff.finding).toContain("below the analyzer's noise gate")
+  })
+
+  it('reads the same trend whether the gated rows are there or not', () => {
+    const measured = [{ octaveDelta: 0.05 }, { octaveDelta: -0.3 }, { octaveDelta: -0.85 }, { octaveDelta: -1.5 }]
+    const clean = zeroDiff()
+    clean.brightness = brightness(measured)
+    const padded = zeroDiff()
+    padded.brightness = brightness([...measured, gated(6), gated(-6)])
+    const of = (d: MatchDiff) => adviseFromDiff(d, defaultPatch(), { maxActions: 20 }).find(a => a.suggested?.id === 'env2.decay')!
+    expect(of(padded).suggested).toEqual(of(clean).suggested)
+  })
+
+  it('hands the territory to the octave-band fallback when every window is gated', () => {
+    const diff = zeroDiff()
+    diff.brightness = brightness([gated(-3), gated(-3.2), gated(-3.1), gated(-3)])
+    diff.bands = BAND_CENTERS.map(centerHz => ({ centerHz, deltaDb: centerHz >= 4000 ? -8 : 0 }))
+    const actions = adviseFromDiff(diff, defaultPatch(), { maxActions: 20 })
+    expect(actions.some(a => a.paramIds.includes('env2.decay'))).toBe(false)
+    // `upper-bands-quiet`, which exists for exactly this "no usable per-window
+    // brightness" case, has to fire rather than defer to a rule that just
+    // refused the same evidence.
+    const [action] = actions
+    expect(action.finding).toContain('4 kHz')
+    expect(action.paramIds).toContain('eq.high_gain')
+  })
+
+  it('stays silent rather than trending a single measured window', () => {
+    const diff = zeroDiff()
+    diff.brightness = brightness([{ octaveDelta: -1.4 }, gated(3), gated(-3), gated(2)])
+    const actions = adviseFromDiff(diff, defaultPatch(), { maxActions: 20 })
+    expect(actions.some(a => a.paramIds.includes('env2.decay'))).toBe(false)
+    expect(actions.some(a => a.suggested?.id === 'filter1.cutoff')).toBe(false)
+  })
+
+  it('turns on the flag alone, and nothing else', () => {
+    // The end-to-end shape of the original failure, and its own control. ONE
+    // field differs between the two runs, so the filter is what decides the
+    // outcome: without it both trajectories read the same -1.6-octave drift and
+    // both rank an `env2.decay` move first, which is the bug. Neither half of
+    // this pair can pass vacuously - one asserts the action is absent, the other
+    // that the very same numbers still produce it.
+    const rows = [{ octaveDelta: 0.05 }, { octaveDelta: 0.02 }, { octaveDelta: 0 }, { octaveDelta: -1.6 }]
+    const envOf = (last: { octaveDelta: number; belowNoiseFloor?: true }) => {
+      const diff = zeroDiff()
+      diff.brightness = brightness([...rows.slice(0, 3), last])
+      return adviseFromDiff(diff, defaultPatch(), { maxActions: 20 }).find(a => a.paramIds.includes('env2.decay'))
+    }
+    const measured = envOf(rows[3])!
+    expect(measured, 'the control must fire, or the negative case proves nothing').toBeDefined()
+    expect(measured.finding).toContain('darkens too fast')
+    expect(measured.suggested?.id).toBe('env2.decay')
+
+    // Same trajectory, last window measured off the noise the sound decayed
+    // into. There is no measurable drift left, so there is no action.
+    expect(envOf({ ...rows[3], belowNoiseFloor: true })).toBeUndefined()
+  })
+})

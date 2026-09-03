@@ -88,7 +88,34 @@ export interface MatchDiff {
   }
 
   /** Per-window signed brightness error in octaves, earliest window first. */
-  brightness: { startMs: number; endMs: number; octaveDelta: number }[]
+  brightness: {
+    startMs: number
+    endMs: number
+    /**
+     * `candidate - reference` in octaves for this row's pair of slices.
+     *
+     * Always a finite number, including on a `belowNoiseFloor` row, where it is the
+     * difference that was measured rather than a difference that means anything. Read the
+     * flag first; a nullable field here would push `null` into the arithmetic of every
+     * `match-advice.ts` rule that means, spreads or trends this trajectory, and each of
+     * those has to drop the row anyway.
+     */
+    octaveDelta: number
+    /**
+     * `true` - and never `false` - when the reference slice, the candidate slice, or both
+     * sat below `SPECTRAL_WINDOW_NOISE_GATE_DB` after resampling. One of the two centroids
+     * then describes the noise the sound decayed into, so the row's `octaveDelta` is not a
+     * brightness disagreement: it is the distance between a sound and a noise floor.
+     *
+     * `compareAudioMetrics` leaves exactly these rows out of `details.brightness`, both its
+     * error and its reported means, so anything that means, spreads or trends this array
+     * must drop them too or it will disagree with the score it is steering.
+     *
+     * Absent means the pair was measured. The row itself is kept so the window count stays
+     * predictable and `startMs`/`endMs` still tile the reference buffer.
+     */
+    belowNoiseFloor?: true
+  }[]
 
   /** From `spectralFlatness`: 0 tonal, 1 noise. A dedicated harmonic-residual ratio comes later. */
   flatnessDelta: number

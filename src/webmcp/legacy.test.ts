@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import { SynthEngine } from '../audio/engine'
+import { createWebMcpTools } from './tools'
 import { loadLegacyWebMcp, registerLegacyWebMcpTools, resolveModelContext, type LegacyWebMcp } from './legacy'
+
+/**
+ * How many tools the adapter is handed, from the factory that builds them. The
+ * literal count used to be typed out four times in this file and went stale on
+ * every addition; what these tests are about is which of them the widget
+ * accepted, not how many there are.
+ */
+const TOOL_COUNT = createWebMcpTools(new SynthEngine(), new AbortController().signal).length
 
 describe('registerLegacyWebMcpTools', () => {
   it('adapts tool descriptors to the webmcp.dev widget and disconnects on disposal', async () => {
@@ -12,7 +21,7 @@ describe('registerLegacyWebMcpTools', () => {
     }
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
-    expect(calls).toHaveLength(15)
+    expect(calls).toHaveLength(TOOL_COUNT)
     expect(calls.map(call => call.name)).toContain('get_synth_state')
     await expect(calls.find(call => call.name === 'update_parameters')!.execute({ updates: [{ id: 'missing', value: 1 }] }))
       .resolves.toMatchObject({ ok: false, error: { code: 'tool_error', message: expect.stringContaining("Unknown parameter 'missing'") } })
@@ -25,7 +34,7 @@ describe('registerLegacyWebMcpTools', () => {
     const legacy: LegacyWebMcp = { registerTool() {} }
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
-    expect(registration.registeredCount).toBe(15)
+    expect(registration.registeredCount).toBe(TOOL_COUNT)
     expect(registration.errors).toEqual([])
   })
 
@@ -39,7 +48,7 @@ describe('registerLegacyWebMcpTools', () => {
     }
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
-    expect(registration.registeredCount).toBe(14)
+    expect(registration.registeredCount).toBe(TOOL_COUNT - 1)
     expect(registration.errors).toEqual([{ tool: 'get_synth_state', message: 'widget refused the tool' }])
   })
 
@@ -55,7 +64,7 @@ describe('registerLegacyWebMcpTools', () => {
     }
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
-    expect(registration.registeredCount).toBe(14)
+    expect(registration.registeredCount).toBe(TOOL_COUNT - 1)
     expect(registration.errors).toHaveLength(1)
     expect(registration.errors[0].tool).toBe('update_parameters')
     expect(registration.errors[0].message).toContain('update_parameters')
@@ -75,7 +84,7 @@ describe('registerLegacyWebMcpTools', () => {
     }
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
-    expect(registration.registeredCount).toBe(14)
+    expect(registration.registeredCount).toBe(TOOL_COUNT - 1)
     expect(registration.errors).toEqual([{ tool: 'get_synth_state', message: 'widget refused the tool' }])
   })
 
@@ -89,7 +98,7 @@ describe('registerLegacyWebMcpTools', () => {
     const registration = registerLegacyWebMcpTools(new SynthEngine(), legacy)
     await registration.ready
     expect(registration.errors).toEqual([])
-    expect(registration.registeredCount).toBe(15)
+    expect(registration.registeredCount).toBe(TOOL_COUNT)
   })
 })
 

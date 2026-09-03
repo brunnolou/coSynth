@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
-  analyzeAudio, compareAudioMetrics,
-  type AudioMetrics, type ComparedMetricKey, type SpectralWindow
+  analyzeAudio, compareAudioMetrics, isSpectralWindowBelowNoiseFloor, SPECTRAL_WINDOW_NOISE_GATE_DB,
+  type AudioMetrics, type AudioMetricsComparison, type ComparedMetricKey, type SpectralWindow
 } from './audio-analysis'
 
 function sine(frequency: number, sampleRate: number, seconds: number, amplitude = 1, phase = 0): Float32Array {
@@ -120,6 +120,39 @@ function fasterUpperPartialDecay(
     let value = 0
     for (let n = 1; n <= 12; n++) value += Math.exp(-base * n * t) * Math.sin(2 * Math.PI * f0 * n * t) / n
     return 0.3 * Math.min(1, t / 0.005) * value
+  })
+}
+
+/** Deterministic broadband noise, so a "noise floor" fixture reads the same on every run. */
+function whiteNoise(length: number, amplitude: number): Float32Array {
+  let seed = 12345
+  return Float32Array.from({ length }, () => {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return amplitude * (seed / 1073741824 - 1)
+  })
+}
+
+/**
+ * A plucked sawtooth sitting on a constant broadband noise floor - what every real render
+ * is, and what a mathematically exact fixture is not. Once the note has decayed past the
+ * noise, the slice's spectrum is the noise's: broadband, roughly even, centroid near the
+ * middle of the analysed band whatever the note had been doing.
+ */
+function pluckedSawOverNoise(
+  sampleRate: number,
+  seconds: number,
+  t60Seconds: number,
+  { f0 = 220, noiseAmplitude = 3e-4 } = {}
+): Float32Array {
+  const decay = Math.log(1000) / t60Seconds
+  const partials = Math.floor(sampleRate / 2 / f0)
+  const length = Math.round(sampleRate * seconds)
+  const noise = whiteNoise(length, noiseAmplitude)
+  return Float32Array.from({ length }, (_, i) => {
+    const t = i / sampleRate
+    let value = 0
+    for (let n = 1; n <= partials; n++) value += Math.sin(2 * Math.PI * f0 * n * t) / n
+    return 0.5 * Math.min(1, t / 0.005) * Math.exp(-decay * t) * value * 2 / Math.PI + noise[i]
   })
 }
 
@@ -795,7 +828,11 @@ describe('analyzeAudio', () => {
     expect(Object.values(scalars).every(Number.isFinite)).toBe(true)
     expect(envelopeDb.every(Number.isFinite)).toBe(true)
     expect(bandsDb.every(Number.isFinite)).toBe(true)
-    expect(spectralWindows.every(window => Object.values(window).every(Number.isFinite))).toBe(true)
+    // `belowNoiseFloor` is the one non-numeric field a window carries, and it is only ever
+    // present as `true` - never `false`, never `null`.
+    expect(spectralWindows.every(({ belowNoiseFloor, ...window }) =>
+      (belowNoiseFloor === undefined || belowNoiseFloor === true) &&
+      Object.values(window).every(Number.isFinite))).toBe(true)
     expect(harmonics).toBeUndefined()
     expect(decayT60Ms).toBeGreaterThan(0)
     // `pitch` joins `decayT60Ms` as a metric whose null is a real answer, so it is the one
@@ -815,6 +852,67 @@ describe('analyzeAudio', () => {
     const pitched = analyzeAudio([sine(440, 48000, 1, 0.25)], 48000)
     expect(pitched.pitch!.f0Hz).toBeCloseTo(440, 0)
     expect(JSON.stringify(pitched).match(/null/g)).toHaveLength(1)
+  })
+
+  it('marks the spectral windows a decayed tail leaves below the noise floor', () => {
+    const sampleRate = 44100
+    const metrics = analyzeAudio([pluckedSawOverNoise(sampleRate, 1, 0.5)], sampleRate, { f0Hz: 220 })
+    const windows = metrics.spectralWindows
+    expect(windows).toHaveLength(4)
+
+    // The note is audible for the first half of the buffer and gone for the second.
+    expect(windows[0].levelDb).toBe(0)
+    expect(windows[1].levelDb).toBeGreaterThan(SPECTRAL_WINDOW_NOISE_GATE_DB)
+    expect(windows[2].levelDb).toBeLessThan(SPECTRAL_WINDOW_NOISE_GATE_DB)
+    expect(windows[3].levelDb).toBeLessThan(SPECTRAL_WINDOW_NOISE_GATE_DB)
+
+    expect(windows[0].belowNoiseFloor).toBeUndefined()
+    expect(windows[1].belowNoiseFloor).toBeUndefined()
+    expect(windows[2].belowNoiseFloor).toBe(true)
+    expect(windows[3].belowNoiseFloor).toBe(true)
+    // The window is marked, never dropped: the count stays predictable and the bounds
+    // still tile the buffer, so a formatter can print `n/a` in the row's place.
+    expect(windows.map(window => [window.startMs, window.endMs])).toEqual([
+      [0, 250], [250, 500], [500, 750], [750, 1000]
+    ])
+
+    // This is what the flag is protecting readers from. The note's real centroid is near
+    // 700 Hz; the gated slices report the noise floor's, most of an octave-decade above it.
+    expect(windows[1].spectralCentroidHz).toBeLessThan(1000)
+    expect(windows[3].spectralCentroidHz).toBeGreaterThan(5000)
+
+    // The flag is a report of `levelDb`, so the shared predicate agrees with it exactly.
+    for (const window of windows) {
+      expect(isSpectralWindowBelowNoiseFloor(window)).toBe(window.belowNoiseFloor === true)
+    }
+  })
+
+  it('leaves a real decaying tail measurable rather than gating it', () => {
+    const sampleRate = 44100
+    // T60 longer than the buffer: the final quarter is around -30 dB, quiet but real.
+    const metrics = analyzeAudio([pluckedSawOverNoise(sampleRate, 1, 1.5)], sampleRate, { f0Hz: 220 })
+    expect(metrics.spectralWindows.every(window => window.belowNoiseFloor === undefined)).toBe(true)
+    const last = metrics.spectralWindows[metrics.spectralWindows.length - 1]
+    expect(last.levelDb).toBeLessThan(-20)
+    expect(last.levelDb).toBeGreaterThan(SPECTRAL_WINDOW_NOISE_GATE_DB)
+    expect(last.spectralCentroidHz).toBeLessThan(1500)
+  })
+
+  it('gates no window of a steady tone, and none of digital silence', () => {
+    const steady = analyzeAudio([sine(440, 44100, 1, 0.5)], 44100, { f0Hz: 440 })
+    expect(steady.spectralWindows.every(window => window.belowNoiseFloor === undefined)).toBe(true)
+
+    // Every slice of an all-zero buffer is equally silent, so none is below the *others*:
+    // `levelDb` is relative, and silence is uniform rather than decayed.
+    const silence = analyzeAudio([new Float32Array(44100)], 44100, { detectPitch: false })
+    expect(silence.spectralWindows.every(window => window.levelDb === 0)).toBe(true)
+    expect(silence.spectralWindows.every(window => window.belowNoiseFloor === undefined)).toBe(true)
+    expect(silence.spectralWindows.every(window => window.spectralCentroidHz === 0)).toBe(true)
+    // The whole-buffer figures need no gate of their own: with no peak there is no spectral
+    // pass at all, and a quiet-but-real buffer must analyse the same as a loud one, which
+    // is why this gate is relative to the loudest slice and never to an absolute level.
+    expect(silence.spectralCentroidHz).toBe(0)
+    expect(silence.spectralRolloffHz).toBe(0)
   })
 })
 
@@ -843,14 +941,21 @@ const SAW_PARTIALS_REL_F0 = Array.from({ length: 12 }, (_, index) => Math.round(
 const rampEnvelope = (start: number, end: number): number[] =>
   Array.from({ length: 64 }, (_, i) => Math.round((start + (end - start) * i / 63) * 10) / 10)
 
-/** Four 250 ms windows carrying the given centroid trajectory. */
-const windowTrajectory = (centroids: readonly number[]): SpectralWindow[] =>
+/**
+ * Four 250 ms windows carrying the given centroid trajectory, all of them well above the
+ * noise gate unless `levelsDb` says otherwise.
+ *
+ * `belowNoiseFloor` is deliberately never set here: `compareAudioMetrics` must reach the
+ * gate from `levelDb` alone, so that metrics serialized by an older build - or by any other
+ * producer - are scored the same way as ones the current analyzer flagged.
+ */
+const windowTrajectory = (centroids: readonly number[], levelsDb?: readonly number[]): SpectralWindow[] =>
   centroids.map((spectralCentroidHz, index) => ({
     startMs: index * 250,
     endMs: (index + 1) * 250,
     spectralCentroidHz,
     spectralRolloffHz: spectralCentroidHz * 2,
-    levelDb: index === 0 ? 0 : -3 * index
+    levelDb: levelsDb ? levelsDb[index] : (index === 0 ? 0 : -3 * index)
   }))
 
 const referenceMetrics: AudioMetrics = {
@@ -1138,18 +1243,22 @@ describe('compareAudioMetrics', () => {
     expect(() => compareAudioMetrics(referenceMetrics, { ...referenceMetrics, clippingCount: 1.5 })).toThrow(/clippingCount.*nonnegative integer/i)
   })
 
-  it('excludes the harmonic terms from the mean when only one side has a fundamental', () => {
+  it('excludes the harmonic terms from the mean when only the REFERENCE lacks a fundamental', () => {
     const withHarmonics = { ...referenceMetrics, ...harmonicBlock(SAW_PARTIALS_REL_F0) }
-    const result = compareAudioMetrics(withHarmonics, referenceMetrics)
+    const result = compareAudioMetrics(referenceMetrics, withHarmonics)
 
-    // "Not measurable on one side", never "as wrong as it gets": an uploaded reference that
-    // yielded a pitch must not penalise a candidate that did not, or the reverse.
+    // "Not measurable", never "as wrong as it gets". This direction is absence of evidence
+    // about the TARGET: `detectPitch` failing on an uploaded recording says nothing about
+    // what the candidate should sound like, so a candidate that did find its own pitch must
+    // not be charged for it. A candidate cannot reach this case by changing itself, so
+    // excluding here is not a lever it can pull - unlike the reverse direction, which the
+    // "cannot improve by losing a dimension" test below covers.
     for (const key of harmonicDetailKeys) {
       expect(result.details[key].similarity).toBeNull()
       expect(result.details[key].delta).toBeNull()
     }
-    expect(result.details.harmonics.candidate).toBeNull()
-    expect(result.details.inharmonicity.reference).toBe(0)
+    expect(result.details.harmonics.reference).toBeNull()
+    expect(result.details.inharmonicity.candidate).toBe(0)
 
     // The overall score is exactly the mean of the terms that *were* measurable.
     const contributing = detailKeys
@@ -1167,6 +1276,133 @@ describe('compareAudioMetrics', () => {
     const both = compareAudioMetrics(withHarmonics, { ...withHarmonics })
     for (const key of harmonicDetailKeys) expect(both.details[key].similarity).toBe(1)
     expect(both.similarity).toBe(1)
+  })
+
+  it('never lets a candidate raise its score by losing a dimension the reference has', () => {
+    // The eval failure this exists to stop: a high shelf pushed a candidate past the pitch
+    // detector, `harmonics` (0.08) and `tilt` (0.00) both went `n/a`, and the overall
+    // similarity reached a new best - an unweighted mean rises when the terms a candidate
+    // was failing drop out of it, so destroying the sound was the winning move.
+    const reference = { ...referenceMetrics, ...harmonicBlock(SAW_PARTIALS_REL_F0) }
+    const squarePartials = SAW_PARTIALS_REL_F0.map((value, index) => index % 2 === 0 ? value : -120)
+    // Identical to the reference in every non-harmonic metric, and badly wrong in all three
+    // harmonic ones, so "all else equal" holds and only the harmonic terms move.
+    const keepsItsPitch = {
+      ...reference,
+      ...harmonicBlock(squarePartials, 5e-3),
+      harmonicShape: { amplitudesDbRelF0: squarePartials, tiltDbPerOctave: -18, oddEvenDb: 60 }
+    }
+    const { harmonics: _harmonics, harmonicShape: _harmonicShape, ...losesItsPitch } = keepsItsPitch
+
+    const kept = compareAudioMetrics(reference, keepsItsPitch)
+    const lost = compareAudioMetrics(reference, losesItsPitch)
+
+    // The invariant. Before this fix `lost.similarity` was 1 - a perfect score - because
+    // the ten remaining terms all matched and the three it was failing had been excluded.
+    expect(lost.similarity).toBeLessThan(kept.similarity)
+    for (const key of harmonicDetailKeys) {
+      expect(kept.details[key].similarity as number).toBeLessThan(0.7)
+      // A measured failure of the candidate, not an unmeasurable pair: the reference
+      // established that this dimension exists and what its value is.
+      expect(lost.details[key].similarity).toBe(0)
+      expect(lost.details[key].candidate).toBeNull()
+    }
+
+    // Still in the mean rather than excluded from it: thirteen terms both times.
+    const counted = (result: AudioMetricsComparison) => detailKeys
+      .filter(key => key !== 'clippingCount')
+      .map(key => result.details[key].similarity)
+      .filter((value): value is number => value !== null)
+    expect(counted(lost)).toHaveLength(counted(kept).length)
+    expect(lost.similarity).toBeCloseTo(
+      counted(lost).reduce((sum, value) => sum + value, 0) / counted(lost).length, 12
+    )
+  })
+
+  it('scores an unpitched pair normally on the terms that do apply', () => {
+    // Neither side has a fundamental - a drum loop matched by a noise patch. The three
+    // harmonic terms agree at 1, and the ten that apply still separate the pair.
+    const darker = { ...referenceMetrics, spectralWindows: windowTrajectory([1000, 700, 500, 350]) }
+    const result = compareAudioMetrics(referenceMetrics, darker)
+    for (const key of harmonicDetailKeys) {
+      expect(result.details[key].similarity).toBe(1)
+      expect(result.details[key].reference).toBeNull()
+      expect(result.details[key].candidate).toBeNull()
+    }
+    expect(result.details.brightness.similarity).toBeLessThan(0.2)
+    expect(result.similarity).toBeLessThan(1)
+    expect(result.similarity).toBeGreaterThan(0)
+  })
+
+  it('keeps decayT60Ms symmetric: an unmeasurable decay is not a failure', () => {
+    // The asymmetry above is deliberately confined to the harmonic terms. A null T60 is a
+    // property of the MEASUREMENT - the fit is refused for curvature, for decays faster
+    // than one hop per 10 dB, and for buffers that end before -25 dB - so it is null for
+    // most reference material and for many perfectly good candidates. A null pitch is a
+    // property of the SOUND: nothing periodic was found in it.
+    const steadyCandidate = compareAudioMetrics(referenceMetrics, { ...referenceMetrics, decayT60Ms: null })
+    expect(steadyCandidate.details.decayT60Ms.similarity).toBeNull()
+    expect(steadyCandidate.details.decayT60Ms.delta).toBeNull()
+
+    const steadyReference = compareAudioMetrics({ ...referenceMetrics, decayT60Ms: null }, referenceMetrics)
+    expect(steadyReference.details.decayT60Ms.similarity).toBeNull()
+
+    const neither = compareAudioMetrics(
+      { ...referenceMetrics, decayT60Ms: null },
+      { ...referenceMetrics, decayT60Ms: null }
+    )
+    expect(neither.details.decayT60Ms.similarity).toBe(1)
+    expect(neither.similarity).toBe(1)
+  })
+
+  it('leaves windows below the noise floor out of the brightness score', () => {
+    // The reviewer's case: the candidate's last two slices are the noise the note decayed
+    // into, so their centroids are the noise floor's - most of an octave-decade above the
+    // note's real 700 Hz - and reading them as brightness invents a +4 octave swing.
+    const reference = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([700, 735, 700, 700], [0, -29.6, -59.6, -89.6])
+    }
+    const noisyTail = {
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([700, 735, 8887, 11121], [0, -29.6, -54.2, -55.6])
+    }
+    const gated = compareAudioMetrics(reference, noisyTail).details.brightness
+    expect(gated.similarity).toBeGreaterThan(0.9)
+
+    // What the same pair scores when the gated slices are read as real brightness: the two
+    // sounds are identical wherever either of them was audible, and this calls them
+    // unrelated. That number is what ranked "the filter darkens too fast" first.
+    const ungated = compareAudioMetrics(
+      { ...reference, spectralWindows: windowTrajectory([700, 735, 700, 700]) },
+      { ...noisyTail, spectralWindows: windowTrajectory([700, 735, 8887, 11121]) }
+    ).details.brightness
+    expect(ungated.similarity).toBeLessThan(0.05)
+
+    // The reported means count the same windows the score did, so the printed table and
+    // the number cannot disagree about which windows were read.
+    expect(gated.candidate).toBeCloseTo((700 + 735) / 2, 5)
+    expect(gated.reference).toBeCloseTo((700 + 735) / 2, 5)
+    expect(gated.delta).toBe(0)
+  })
+
+  it('gates a window below the threshold and keeps one exactly on it', () => {
+    const reference = { ...referenceMetrics, spectralWindows: windowTrajectory([700, 700, 700, 700], [0, 0, 0, 0]) }
+    const wrongLastWindow = (levelDb: number) => ({
+      ...referenceMetrics,
+      spectralWindows: windowTrajectory([700, 700, 700, 11200], [0, 0, 0, levelDb])
+    })
+
+    // Strictly below: -40.0 dB exactly is still a measurement, and a wrong centroid there
+    // is a wrong centroid.
+    const onTheLine = compareAudioMetrics(reference, wrongLastWindow(SPECTRAL_WINDOW_NOISE_GATE_DB))
+    expect(onTheLine.details.brightness.similarity).toBeLessThan(0.2)
+    const justAbove = compareAudioMetrics(reference, wrongLastWindow(SPECTRAL_WINDOW_NOISE_GATE_DB + 0.1))
+    expect(justAbove.details.brightness.similarity).toBe(onTheLine.details.brightness.similarity)
+
+    // A tenth of a dB below it, and the slice stops being read at all.
+    const justBelow = compareAudioMetrics(reference, wrongLastWindow(SPECTRAL_WINDOW_NOISE_GATE_DB - 0.1))
+    expect(justBelow.details.brightness.similarity).toBe(1)
   })
 
   it('scores partial levels, tilt and inharmonicity, so timbre reaches the overall score', () => {

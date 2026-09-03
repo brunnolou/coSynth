@@ -7,7 +7,8 @@
  * - The sign convention is stated once per block header, `(you - ref)`, so no reader ever
  *   has to infer it from a value that happens to be negative.
  * - Precision stops where the measurement does: one decimal for dB, integers for ms and
- *   cents. More digits than that invite false convergence on noise.
+ *   cents. More digits than that invite false convergence on noise. A SUGGESTED parameter
+ *   value is the one exception and is rendered by its own rule - see `moveValue`.
  * - An unmeasurable figure renders `n/a` followed by the reason, never `null`, never
  *   `undefined`, and never a bare `0` - the eval's complaint about a null `decayT60Ms`
  *   generalised to every field.
@@ -16,6 +17,7 @@
  */
 
 import type { AudioMetrics } from './audio-analysis'
+import { isSpectralWindowBelowNoiseFloor } from './audio-analysis'
 import type { MatchAction, MatchDiff } from './match-types'
 import { hzToNearestMidi, noteName } from './notes'
 
@@ -31,6 +33,20 @@ const SPARK_DELTA_DB = 3
 const PITCH_OK_CENTS = 5
 /** `formatDiff` renders at most this many actions, in the order given. */
 const MAX_ACTIONS = 5
+
+/**
+ * Why a brightness cell reads `n/a`. Both blocks print this only when a window is actually
+ * gated, so a run where every slice was measured is byte-identical to what it printed
+ * before the gate existed - the common path stays as short as it was.
+ *
+ * The reason lives on its own line rather than in the cell because the brightness rows are
+ * a timeline: `495-660ms n/a (below the noise floor)` in the middle of four pipe-separated
+ * windows costs more width than the whole rest of the row and buries the times.
+ */
+const GATED_WINDOW_NOTE = {
+  absolute: '  n/a in a window means it fell below the noise floor, so its centroid measured the noise rather than the sound.',
+  diff: '  n/a in a window means one side or both fell below the noise floor there, so nothing was compared - the score leaves those windows out too.'
+} as const
 
 const pad = (text: string, width = COLUMN): string => text.padStart(width)
 
@@ -61,6 +77,65 @@ const signedRatio2 = (value: number | null | undefined): string => {
   return `${value > 0 ? '+' : '-'}${Math.abs(value).toFixed(2)}`
 }
 const sci = (value: number | null | undefined): string => (finite(value) ? value.toExponential(1) : 'n/a')
+
+/**
+ * The producer, `match-advice.ts`, puts every `suggested` value through `round(v, 6)`, so
+ * six decimals is the FULL precision of the datum rather than a cap chosen here. Rendering
+ * at or below it always round-trips to the number that was computed and never invents a
+ * digit. One decimal is the floor so the common move - `filter1.cutoff 8000.0 -> 12278.5` -
+ * prints exactly as it always has.
+ */
+const MOVE_DECIMALS_MAX = 6
+const MOVE_DECIMALS_MIN = 1
+
+/**
+ * A SUGGESTED parameter value: as many decimals as it actually carries, at least one.
+ *
+ * This deliberately does NOT follow the fixed one-decimal rule the rest of the file uses.
+ * That rule is about MEASUREMENTS - deltas, dB, centroids - where printing more digits than
+ * the instrument supports invites false convergence on noise. A suggested value is not a
+ * measurement. It is an exact number the agent will hand to `update_parameters` verbatim,
+ * and shortening it does not suppress noise: it destroys the datum. A real eval run ranked
+ * `env1.sustain 0.000001 -> 0.001` and `toFixed(1)` printed it as `0.0 -> 0.0`, advice that
+ * reads as a no-op and gets skipped - the formatter silently discarding a useful move is
+ * worse than a blemish. 80 of 395 probed moves rendered as `X -> X` that way.
+ *
+ * Precision is chosen per VALUE rather than per unit, because the requirement is that the
+ * reader can see the change and a fixed per-unit rule still collapses a small move inside a
+ * wide-ranging unit: `s` covers both `delay.time 0.35` and `comp.attack 0.0005`.
+ */
+const moveValue = (value: number | null | undefined): string => {
+  if (!finite(value)) return 'n/a'
+  if (value === 0) return '0.0'
+  const exact = Number(value.toFixed(MOVE_DECIMALS_MAX))
+  // Smaller than the last decimal place. `0.000000` would show a real setting as none, the
+  // same sin as a fake `0.0`; exponential keeps it honest and short.
+  if (exact === 0) return value.toExponential(1)
+  for (let decimals = MOVE_DECIMALS_MIN; decimals < MOVE_DECIMALS_MAX; decimals++) {
+    const text = exact.toFixed(decimals)
+    if (Number(text) === exact) return text
+  }
+  return exact.toFixed(MOVE_DECIMALS_MAX)
+}
+
+/**
+ * One ranked move. `from -> to` whenever the two ends differ at the precision above.
+ *
+ * They should always differ - `match-advice.ts` drops a move whose legal landing value
+ * equals its start - but a move that survives that guard and still cannot be told apart
+ * here is stated as a sentence rather than as `X -> X`. Advice that argues against itself
+ * costs the reader the finding above it, so the one thing this line must never print is a
+ * change that looks like none.
+ */
+const formatMove = (suggested: NonNullable<MatchAction['suggested']>): string => {
+  const from = moveValue(suggested.from)
+  const to = moveValue(suggested.to)
+  if (from !== to) return `${suggested.id} ${from} -> ${to} ${suggested.unit}`
+  return (
+    `${suggested.id} stays at ${from} ${suggested.unit}` +
+    ' (the correction is smaller than the six decimals a suggested value carries, so there is nothing to apply)'
+  )
+}
 
 /** `31`, `1k`, `16k` - the band centres as an agent would say them aloud. */
 const bandLabel = (hz: number): string => {
@@ -125,6 +200,18 @@ export function formatMetrics(metrics: AudioMetrics): string {
   )
 
   lines.push('')
+  // No noise gate here, deliberately. This block renders `harmonicShape.amplitudesDbRelF0`,
+  // fitted once over the WHOLE buffer and therefore dominated by the loud part of it; it is
+  // not a per-slice reading and there is no window to gate it against. Marking it would say
+  // something false about a measurement that is fine.
+  //
+  // The reading that does need the gate is `SpectralWindow.harmonicsDb`, which no formatter
+  // prints today. It is the more dangerous of the two: on a gated slice it does not collapse
+  // to the -120 dB floor but reads a flat fake spectrum - roughly [-80, -82, -82, -80, -83,
+  // -81] - whose fitted tilt is about 0 dB/octave, so it renders as a bright, perfectly even
+  // partial series rather than as an obviously dead one. Whoever adds a per-window partials
+  // row must print `n/a` on a `belowNoiseFloor` slice; a caveat under a plausible-looking
+  // spectrum will not undo it.
   const shape = metrics.harmonicShape
   if (shape && metrics.harmonics) {
     lines.push('PARTIALS  dB relative to the fundamental')
@@ -156,11 +243,23 @@ export function formatMetrics(metrics: AudioMetrics): string {
 
   lines.push('')
   lines.push('BRIGHTNESS  centroid Hz, per window')
+  // A gated slice still carries a centroid - the analyzer keeps the measured number rather
+  // than zeroing it - and that number is the one that misleads: a -55 dB tail read 4,978 Hz,
+  // brighter than the note that produced it. Printing it with a caveat would still put a
+  // plausible figure in front of a reader who reads the row and not the footnote.
   lines.push(
     `  ${metrics.spectralWindows
-      .map((window) => `${int(window.startMs)}-${int(window.endMs)}ms ${int(window.spectralCentroidHz)}`)
+      .map(
+        (window) =>
+          `${int(window.startMs)}-${int(window.endMs)}ms ${
+            isSpectralWindowBelowNoiseFloor(window) ? 'n/a' : int(window.spectralCentroidHz)
+          }`
+      )
       .join(' | ')}`
   )
+  if (metrics.spectralWindows.some((window) => isSpectralWindowBelowNoiseFloor(window))) {
+    lines.push(GATED_WINDOW_NOTE.absolute)
+  }
 
   return lines.join('\n')
 }
@@ -170,7 +269,7 @@ function formatActions(actions: readonly MatchAction[]): string[] {
   actions.slice(0, MAX_ACTIONS).forEach((action, index) => {
     lines.push(` ${index + 1}. ${action.finding}`)
     const move = action.suggested
-      ? `${action.suggested.id} ${db1(action.suggested.from)} -> ${db1(action.suggested.to)} ${action.suggested.unit}`
+      ? formatMove(action.suggested)
       : `${action.direction} ${action.paramIds.join(', ') || 'n/a (no parameter mapped)'}`
     lines.push(`    -> ${move}  [${action.confidence}]`)
   })
@@ -248,11 +347,22 @@ export function formatDiff(
   lines.push('')
   if (diff.brightness.length > 0) {
     lines.push('BRIGHTNESS  centroid, octaves (you - ref), per window')
+    // `belowNoiseFloor` rather than a re-derived threshold: `diffBrightness` set it from the
+    // two slices this row actually differenced, after resampling, and those are not
+    // recoverable from the row. A gated row's `octaveDelta` is finite and often large - it
+    // is the distance from a sound to a noise floor - so printing it and adding a caveat
+    // would hand a model a number to steer by that no pair of slices supports.
     lines.push(
       `  ${diff.brightness
-        .map((window) => `${int(window.startMs)}-${int(window.endMs)}ms ${signedRatio2(window.octaveDelta)}`)
+        .map(
+          (window) =>
+            `${int(window.startMs)}-${int(window.endMs)}ms ${
+              window.belowNoiseFloor ? 'n/a' : signedRatio2(window.octaveDelta)
+            }`
+        )
         .join(' | ')}`
     )
+    if (diff.brightness.some((window) => window.belowNoiseFloor)) lines.push(GATED_WINDOW_NOTE.diff)
   } else {
     lines.push('BRIGHTNESS  n/a (no spectral windows on one side)')
   }

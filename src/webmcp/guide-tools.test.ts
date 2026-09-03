@@ -84,8 +84,13 @@ describe('teaching tool descriptors', () => {
     expect(descriptionOf('show_ui_guide')).not.toMatch(/activates tabs/)
     // The sound guarantee is the one that has to survive intact.
     expect(descriptionOf('show_ui_guide')).toMatch(/[Nn]ever changes sound/)
-    // Availability is now two facts, not one, in the format an agent reads first.
-    expect(schemaOf('get_ui_targets').properties.format.description).toMatch(/revealable/)
+    // Availability is now three facts, not one, in the format an agent reads
+    // first: on screen, mounted but hidden, and not built by its tab yet. All
+    // three are ordinary rows, so the only empty answer left is a wrong ID.
+    const format = schemaOf('get_ui_targets').properties.format.description
+    expect(format).toMatch(/revealable/)
+    expect(format).toMatch(/hidden/)
+    expect(format).toMatch(/not mounted/)
   })
 
   it('passes the format through to the controller unchanged', async () => {

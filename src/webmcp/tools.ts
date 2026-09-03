@@ -1,4 +1,4 @@
-import type { RecordedAudio, SynthEngine } from '../audio/engine'
+import { RECENT_AUDIO_SECONDS, type PresetData, type RecentAudio, type RecordedAudio, type SynthEngine } from '../audio/engine'
 import { agentActivityFor } from './activity'
 import {
   PARAMS, PARAM_GROUP_NOTES, defaultNorm, formatValue, normToValue, paramIndex, valueToNorm,
@@ -10,10 +10,13 @@ import { midiToHz } from '../shared/notes'
 import { FACTORY_PRESETS, getFactoryPreset, listFactoryPresetNames } from '../shared/factory-presets'
 import { analyzeAudio, compareAudioMetrics, type AnalyzeAudioOptions, type AudioMetrics, type AudioMetricsComparison } from '../shared/audio-analysis'
 import { diffAudioMetrics } from '../shared/match-diff'
-import { adviseFromDiff, type AdviceCategory, type PatchValues } from '../shared/match-advice'
+import { adviseFromDiff, type AdviceCategory, type ModRoute, type PatchValues } from '../shared/match-advice'
 import { formatDiff, formatMetrics } from '../shared/metrics-format'
 import type { MatchDiff } from '../shared/match-types'
-import { listPresets, loadPreset, savePreset, validatePresetName } from '../shared/preset-store'
+import {
+  currentPresetState, deletePreset, factoryDeleteRefusal, listPresets, loadPreset, markPresetLoaded,
+  presetFileName, savePreset, serializePreset, validatePresetName, type PresetSource
+} from '../shared/preset-store'
 import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
 import { analyzeAudioAbortably } from './audio-analysis-task'
 import { BASE64_MAX_SECONDS, monoWavBase64, offlineRenderAvailable, renderOffline, type OfflineRenderer } from './offline-render'
@@ -103,6 +106,18 @@ interface LastComparisonState {
   diff: MatchDiff
   referenceName?: string
   comparisonNumber: number
+  /**
+   * The sound-history entry the compared candidate was made from, as
+   * `apply_patch` records it for `rollbackId`. Every patch edit commits a new
+   * entry, so `suggest_patch` comparing this against the current id is asking
+   * exactly "is the diff still about the sound that is loaded?" — and an undo
+   * back to the compared sound restores its own id, so returning to it counts
+   * as unchanged rather than as another change.
+   *
+   * Absent when the page runs without history services (`currentSoundEntryId`
+   * is optional), in which case staleness is unknowable and is not claimed.
+   */
+  soundEntryId?: string
 }
 
 interface WebMcpSessionState {
@@ -523,7 +538,68 @@ const SCOPE_NOTE =
   `The live scope holds only the most recent ${SCOPE_SAMPLES} samples (~21 ms at 48 kHz). ` +
   'Level, spectrum and pitch on that slice are real; `attackMs`, `timeToPeakMs`, `envelopeDb`, ' +
   '`decayT60Ms`, `sustainDb` and the per-window brightness trajectory are not — they describe ' +
-  '21 ms of a sound, not its shape. Use render_audio (offline, no user gesture needed) for those.'
+  '21 ms of a sound, not its shape. For those use `source: "recent"`, which reads the rolling ' +
+  `${RECENT_AUDIO_SECONDS} s capture of the same live output, or render_audio (offline, no user gesture needed).`
+
+/**
+ * Said out loud on every result read from the rolling capture. Two things an
+ * agent gets wrong otherwise: that it is a recording of the LIVE graph only —
+ * an offline render never passes through it — and that it is a fixed-length
+ * window ending now, so a note played six seconds ago has already been
+ * overwritten by the silence that followed it.
+ */
+const RECENT_NOTE =
+  `The rolling capture holds the last ${RECENT_AUDIO_SECONDS} s of LIVE output, fed from the same worklet ` +
+  'frames as the scope but kept rather than overwritten, so every envelope and brightness ' +
+  'figure here describes a real span of sound. It records only what the live graph played: ' +
+  'play_notes and a human at the keyboard land in it, render_audio\'s offline renders never do. ' +
+  'The window always ends at the present moment, so silence since the note ends up in it too.'
+
+/** `analyze_audio({source:'recent'})` and `capture_audio` with nothing captured yet. */
+const NO_RECENT_AUDIO =
+  'The rolling capture is empty: this page has produced no live output yet, so there is nothing to listen back to. ' +
+  'It fills only while audio is running — a human clicks CLICK TO START AUDIO, then plays, or play_notes plays for you. ' +
+  'render_audio renders offline and never reaches it; call render_audio and read its metrics instead if no human is playing.'
+
+/**
+ * Peak above which `capture_audio`'s `waitForSignal` calls it a sound rather
+ * than a noise floor. -60 dBFS (0.001 of full scale) is far below anything a
+ * played note reaches and far above the residue a running-but-idle graph leaves,
+ * so onset detection neither misses a quiet pad nor fires on nothing.
+ */
+const SIGNAL_ONSET_DB = -60
+const SIGNAL_ONSET_AMPLITUDE = 10 ** (SIGNAL_ONSET_DB / 20)
+
+/**
+ * How long `waitForSignal` may hold the invocation open. The reviewer asked for
+ * ten and ten is the cap: a WebMCP call that sits waiting is a call the client
+ * is timing out against, and the buffer is rolling anyway — an agent that waits
+ * in vain can simply call again.
+ */
+const MAX_WAIT_SECONDS = 10
+const DEFAULT_WAIT_SECONDS = 5
+/** Onset poll interval. One scope frame is ~21 ms, so this misses no frame by much. */
+const SIGNAL_POLL_MS = 50
+/** Slice of the ring inspected per poll: long enough to span a scope frame. */
+const SIGNAL_POLL_SECONDS = 0.05
+
+const DEFAULT_CAPTURE_SECONDS = 3
+
+/**
+ * The honest answer to "return actual audio content".
+ *
+ * A WebMCP tool result is a plain JSON value — `ModelContextTool.execute`
+ * returns `MaybePromise<unknown>` and the browser serialises it. The API has no
+ * content-block channel at all, so an MCP `audio` content block that a client
+ * would auto-render is not expressible over this transport, by us or by anyone.
+ * Base64 inside the JSON is the whole of what can be sent, exactly as
+ * `render_audio({format:"base64"})` already sends it.
+ */
+const AUDIO_TRANSPORT_NOTE =
+  'A WebMCP tool result is a JSON value: this API has no audio content block, so the WAV arrives as ' +
+  'Base64 here rather than as playable content your client renders on its own. Decode it if you can ' +
+  'listen; a text-only model gains nothing from the samples and should read `metrics`, which is this ' +
+  'very buffer already measured.'
 
 /** `f0Hz` as the analyzer takes it: a positive, finite frequency or nothing at all. */
 function assertF0Hz(value: unknown): number | undefined {
@@ -583,6 +659,89 @@ function assertPayloadFormat(value: unknown, fallback: PayloadFormat): PayloadFo
     throw new Error(`format must be one of ${PAYLOAD_FORMATS.join(', ')}`)
   }
   return value as PayloadFormat
+}
+
+/**
+ * What TEXT mode drops from `reference.metrics` and `candidate.metrics`.
+ *
+ * `compare_audio({format:"text"})` used to return the compact table *on top of*
+ * both complete metrics objects, so every band, every envelope point and every
+ * spectral window was paid for twice — once as prose an agent reads and once as
+ * an array it does not. These three fields are where the weight is: `envelopeDb`
+ * is 64 points per side, `spectralWindows` carries 12 partials per window per
+ * side, `bandsDb` ten more. The table already states each of them as a signed
+ * error (its BANDS, ENVELOPE and BRIGHTNESS blocks), and `comparison` — which
+ * nothing here touches — still scores them.
+ *
+ * Deliberately narrow. Everything else on both sides survives, so the numbers a
+ * text-mode agent might want and the table lacks (`peakDb`, `loudnessDb`,
+ * `pitch`, `harmonicShape`, `stereoWidth`, `decayT60Ms`) are still there.
+ */
+const TEXT_MODE_OMITTED_METRICS = ['envelopeDb', 'bandsDb', 'spectralWindows'] as const
+
+/**
+ * Dropped with them: the candidate's `metricNotes`, a kilobyte of prose that
+ * explains how to read fields the table has just restated and two of which are
+ * no longer in the object. It is the single largest remaining duplicate in a
+ * text-mode response, and `format: "json"` brings it back with everything else.
+ */
+const TEXT_MODE_OMITTED_FIELDS = [...TEXT_MODE_OMITTED_METRICS, 'metricNotes'] as const
+
+type SummarizedMetrics = Omit<AudioMetrics, (typeof TEXT_MODE_OMITTED_METRICS)[number]>
+
+function summarizeAnalysis<T extends { metrics: AudioMetrics }>(analysis: T) {
+  const { envelopeDb: _envelope, bandsDb: _bands, spectralWindows: _windows, ...metrics } = analysis.metrics
+  const { metricNotes: _notes, ...rest } = analysis as T & { metricNotes?: unknown }
+  return { ...rest, metrics: metrics satisfies SummarizedMetrics }
+}
+
+const METRICS_OMITTED_NOTE =
+  'TEXT mode: the table above already states these numbers, as the signed errors under BANDS, ENVELOPE ' +
+  'and BRIGHTNESS, so the arrays holding them are gone from reference.metrics and candidate.metrics. ' +
+  '`comparison` is untouched and byte-identical in both modes, and still scores all of them. ' +
+  'format: "json" returns everything, and is the mode in which candidate matches analyze_audio exactly.'
+
+const CAPTURE_FORMATS = ['metrics', 'base64'] as const
+type CaptureFormat = (typeof CAPTURE_FORMATS)[number]
+
+function assertCaptureFormat(value: unknown): CaptureFormat {
+  if (value === undefined) return 'metrics'
+  if (typeof value !== 'string' || !CAPTURE_FORMATS.includes(value as CaptureFormat)) {
+    throw new Error(`format must be one of ${CAPTURE_FORMATS.join(', ')}`)
+  }
+  return value as CaptureFormat
+}
+
+/** `setTimeout` that rejects the moment the composed signal aborts. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError())
+      return
+    }
+    let timer: ReturnType<typeof setTimeout>
+    const aborted = () => {
+      clearTimeout(timer)
+      reject(abortError())
+    }
+    timer = setTimeout(() => {
+      signal.removeEventListener('abort', aborted)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', aborted, { once: true })
+  })
+}
+
+/** Loudest absolute sample across every channel; 0 for an empty window. */
+function peakAmplitude(channels: readonly Float32Array[]): number {
+  let peak = 0
+  for (const channel of channels) {
+    for (let index = 0; index < channel.length; index++) {
+      const value = Math.abs(channel[index])
+      if (value > peak) peak = value
+    }
+  }
+  return peak
 }
 
 const ADVICE_CATEGORIES = ['timbre', 'envelope', 'level', 'space'] as const
@@ -662,6 +821,29 @@ function routeValue(slot: number, route: ModSlotState) {
     depth: route.depth,
     enabled: route.enabled
   }
+}
+
+/**
+ * The live mod matrix in the vocabulary `adviseFromDiff` reads, or `undefined`
+ * when this engine cannot report one.
+ *
+ * `currentPatchValues` walks `PARAMS`, and a mod slot has no `PARAMS` id, so
+ * without this the advisor cannot see the matrix at all — which is how it came
+ * to recommend `env2.decay` on patches where no `env2 -> filter1.cutoff` route
+ * exists and that parameter therefore reaches nothing.
+ *
+ * `undefined` and `[]` are DIFFERENT answers downstream: an absent `mods` means
+ * "nobody looked" and keeps the hedged probe, while an empty array means "I
+ * looked and the route is gone" and turns the advice into a `set_modulation`
+ * instruction. An engine with no readable matrix has not told us the route is
+ * gone, so it gets the first, never the second. Same tolerance, same reason, as
+ * `currentPatchValues` returning `{}` for an engine with no `values`: a patch
+ * this module cannot read must never cost the caller the render it paid for.
+ */
+function currentModRoutes(engine: SynthEngine): ModRoute[] | undefined {
+  const slots = engine.modSlots as readonly (ModSlotState | null)[] | undefined
+  if (!Array.isArray(slots)) return undefined
+  return slots.flatMap((route, slot) => (route ? [routeValue(slot, route)] : []))
 }
 
 function runtimeSnapshot(engine: SynthEngine) {
@@ -800,8 +982,21 @@ const noteSchema = {
   additionalProperties: false
 } as const
 
-const PRESET_SOURCES = ['factory', 'user'] as const
-type PresetSource = (typeof PRESET_SOURCES)[number]
+/**
+ * The two preset spaces, named once.
+ *
+ * `PresetSource` is the store's own union, and this object is keyed by it, so a
+ * space added, removed or renamed in `preset-store.ts` breaks this declaration
+ * rather than quietly leaving a schema `enum` and an error message a member
+ * short. The values are the phrase each space is described by in `presetNotFound`,
+ * which is why the vocabulary lives in one object instead of a bare array: the
+ * list and the prose that reads it cannot drift apart if they are the same thing.
+ */
+const PRESET_SPACES: Record<PresetSource, string> = {
+  factory: 'the factory presets',
+  user: "this browser's user presets"
+}
+const PRESET_SOURCES = Object.keys(PRESET_SPACES) as PresetSource[]
 
 /** Factory names as a set, built once: every save and load asks whether one collides. */
 const factoryNames = new Set(listFactoryPresetNames())
@@ -819,6 +1014,29 @@ function userPresetNames(): Set<string> {
   return new Set(listPresets().map(preset => preset.name))
 }
 
+/** What an export of the live patch is called when no preset is currently loaded. */
+const LIVE_PATCH_EXPORT_NAME = 'coSynth Patch'
+
+/**
+ * A preset as the JSON an import takes back, plus the name to save it under.
+ *
+ * `serializePreset` validates on the way out, so this cannot emit a file the app
+ * would reject, and it carries `version: PRESET_VERSION` - not decoration, since
+ * a format 1 file has its LFO divisions rescaled on load and a format 2 file does
+ * not, and nothing but that tag separates them.
+ */
+function exportedPreset(name: string, preset: PresetData, source: PresetSource | 'live') {
+  return {
+    name,
+    source,
+    filename: presetFileName(name),
+    json: serializePreset(preset),
+    // Same honesty as `save_preset`'s `where`, for the same reason: an agent that
+    // reports "exported to a file" has told the human to look somewhere empty.
+    where: 'Nothing was written to disk - this page cannot save a file on its own. `json` above IS the export: hand it over, or paste it back into an import.'
+  }
+}
+
 /**
  * "Not found" that says which space was searched and names the near misses in it.
  * A bare `Preset not found: X` sent an agent to `list_presets` to find out whether
@@ -828,9 +1046,7 @@ function presetNotFound(name: string, source: PresetSource | undefined): string 
   const factory = listFactoryPresetNames()
   const user = [...userPresetNames()]
   const candidates = source === 'factory' ? factory : source === 'user' ? user : [...factory, ...user]
-  const where = source === 'factory' ? 'among the factory presets'
-    : source === 'user' ? 'among this browser\'s user presets'
-    : 'in either the factory presets or this browser\'s user presets'
+  const where = source ? `among ${PRESET_SPACES[source]}` : `in either ${PRESET_SPACES.factory} or ${PRESET_SPACES.user}`
   return `Preset not found ${where}: ${name}.${didYouMean(name, candidates)} list_presets returns every name with its source.`
 }
 
@@ -1082,6 +1298,42 @@ export function createWebMcpTools(
     }
   }
 
+  /**
+   * The newest `seconds` of the rolling capture, or the refusal that names what
+   * fills it. Separate from the analysis below so one read of the ring can serve
+   * both the metrics and the WAV `capture_audio` hands back.
+   */
+  function requireRecentAudio(seconds: number): RecentAudio {
+    const recent = engine.recentAudio(seconds)
+    if (!recent) throw new Error(NO_RECENT_AUDIO)
+    return recent
+  }
+
+  /**
+   * That window, analysed. The counterpart to `scopeCandidate`: the same live
+   * output, read from the engine's ring instead of from the 1024-sample scope,
+   * so the envelope and brightness figures describe a note.
+   *
+   * Analysed off-thread like every other multi-second buffer — the ring holds up
+   * to 192 000 frames per channel, which is a real FFT workload, not the 1024
+   * samples `scopeCandidate` can afford to analyse inline.
+   */
+  async function recentCandidate(recent: RecentAudio, signal: AbortSignal, options: AnalyzeAudioOptions = {}) {
+    const metrics = await analyzeAudioAsync(recent.channelData, recent.sampleRate, signal, options)
+    return {
+      source: 'recent' as const,
+      sampleRate: recent.sampleRate,
+      channels: recent.channelData.length,
+      duration: clean(recent.duration),
+      /** What the ring holds right now; `duration` is capped by it. */
+      heldSeconds: clean(recent.heldSeconds),
+      bufferSeconds: RECENT_AUDIO_SECONDS,
+      metrics,
+      metricNotes: METRIC_NOTES,
+      recentNote: RECENT_NOTE
+    }
+  }
+
   function currentCandidate() {
     if (session.lastRender) return {
       source: 'last-render' as const,
@@ -1178,7 +1430,7 @@ export function createWebMcpTools(
   return [
     {
       name: 'get_synth_state',
-      description: 'Get live synth state: runtime, FX order, and the modulation routes. One call with `format: "compact"` also returns every parameter that differs from its default as `id=formatted` lines — the cheapest way to verify a patch. Routes ship by default in `patch.modulations` (with `total`, and `nextOffset` when more exist — raise `modulationLimit`). `lfo: 1` returns one shape as `patch.lfoShape`.',
+      description: 'Get live synth state: runtime, FX order, modulation routes, and preset identity. One call with `format: "compact"` also returns every parameter that differs from its default as `id=formatted` lines — the cheapest way to verify a patch. `patch.preset` is `{name, source, dirty}`; `dirty: true` means the patch was edited since that preset was loaded or saved, so read it before deciding whether to save. Routes ship by default in `patch.modulations` (with `total`, and `nextOffset` when more exist — raise `modulationLimit`). `lfo: 1` returns one shape as `patch.lfoShape`.',
       inputSchema: {
         type: 'object', properties: {
           format: { type: 'string', enum: ['full', 'compact'] },
@@ -1234,7 +1486,7 @@ export function createWebMcpTools(
           throw new Error('Request a detailed parameter page or one LFO shape in separate calls')
         }
         if (includeLfo && value.lfo === undefined) throw new Error('lfo is required when paging LFO points')
-        const modulations = engine.modSlots.flatMap((route, slot) => route ? [routeValue(slot, route)] : [])
+        const modulations = currentModRoutes(engine) ?? []
         const modulationOffset = boundedInteger(value.modulationOffset, 'modulationOffset', 0, 0, MAX_MOD_SLOTS)
         const modulationLimit = boundedInteger(value.modulationLimit, 'modulationLimit', 5, 1, MAX_PAGE_SIZE)
         const modulationPage = modulations.slice(modulationOffset, modulationOffset + modulationLimit)
@@ -1252,6 +1504,13 @@ export function createWebMcpTools(
           runtime: runtimeSnapshot(engine),
           patch: {
             ...fxOrder(engine),
+            // Three short fields, in every format, because this is the question
+            // asked BEFORE deciding whether a save is needed - and a tool of its
+            // own would have to be discovered first, then called as a second
+            // round trip by an agent that is already reading the patch here.
+            // `name: null` is the honest answer before anything has been loaded;
+            // `dirty` is then false, because there is nothing to differ from.
+            preset: currentPresetState(engine),
             modulationCount: modulations.length,
             // Returned by default: an agent verifying a patch it just wrote
             // needs the routes, and the default page keeps a saturated matrix
@@ -1721,6 +1980,7 @@ export function createWebMcpTools(
         if (presetName !== undefined) {
           try {
             savePreset(engine.toPreset(presetName))
+            markPresetLoaded(presetName, 'user', engine)
             preset = {
               name: presetName, saved: true, storage: 'localStorage',
               ...(factoryNames.has(presetName) ? { shadowsFactoryPreset: true } : {})
@@ -1883,14 +2143,18 @@ export function createWebMcpTools(
     },
     {
       name: 'analyze_audio',
-      description: 'Re-analyze the last render (default), the live output (`source: "scope"`), or the uploaded reference. `source: "reference"` re-analyzes the retained reference PCM, so a corrected `f0Hz` or a higher `windows` count costs no re-upload and replaces the active reference. `render_audio` already returns these metrics, so call this only for a fresh look without re-rendering.',
+      description: `Re-analyze the last render (default), the live output, or the uploaded reference. \`source: "recent"\` reads the rolling ${RECENT_AUDIO_SECONDS} s capture — what a human just played, still there after they released the key — where \`source: "scope"\` holds 21 ms and reports silence for a note that has ended. \`source: "reference"\` re-analyzes the retained reference PCM, so a corrected \`f0Hz\` or a higher \`windows\` count costs no re-upload and replaces the active reference. render_audio already returns these metrics, so call this only for a fresh look without re-rendering.`,
       inputSchema: {
         type: 'object',
         properties: {
-          source: { type: 'string', enum: ['scope', 'last-render', 'reference'] },
+          source: { type: 'string', enum: ['scope', 'recent', 'last-render', 'reference'] },
+          seconds: {
+            type: 'number', exclusiveMinimum: 0, maximum: RECENT_AUDIO_SECONDS,
+            description: `Only for "recent": seconds of capture to analyze, ending now. Default and max ${RECENT_AUDIO_SECONDS}.`
+          },
           f0Hz: {
             type: 'number', exclusiveMinimum: 0, maximum: 20000,
-            description: 'Fundamental for the partials, overriding detection. Only for "scope" and "reference": a render\'s PCM is not retained.'
+            description: 'Fundamental for the partials, overriding detection. Only for "scope", "recent" and "reference": a render\'s PCM is not retained.'
           },
           windows: { type: 'integer', minimum: MIN_ANALYSIS_WINDOWS, maximum: MAX_ANALYSIS_WINDOWS, description: `Spectral windows, default ${MIN_ANALYSIS_WINDOWS}.` },
           format: { type: 'string', enum: [...PAYLOAD_FORMATS], description: 'Default "json"; "text" adds the same metrics as a compact table.' }
@@ -1905,9 +2169,17 @@ export function createWebMcpTools(
       annotations: { readOnlyHint: false },
       async execute(input, options) {
         const signal = invocationSignal(options)
-        const value = assertObject(input, 'input', ['source', 'f0Hz', 'windows', 'format'])
-        if (value.source !== undefined && value.source !== 'scope' && value.source !== 'last-render' && value.source !== 'reference') {
-          throw new Error("source must be 'scope', 'last-render' or 'reference'")
+        const value = assertObject(input, 'input', ['source', 'seconds', 'f0Hz', 'windows', 'format'])
+        const sources = ['scope', 'recent', 'last-render', 'reference']
+        if (value.source !== undefined && !sources.includes(value.source as string)) {
+          throw new Error(`source must be one of ${sources.map(name => `'${name}'`).join(', ')}`)
+        }
+        if (value.seconds !== undefined && value.source !== 'recent') {
+          throw new Error('seconds is only accepted with source: "recent"; every other source has a length of its own')
+        }
+        const seconds = value.seconds === undefined ? RECENT_AUDIO_SECONDS : finite(value.seconds, 'seconds')
+        if (seconds <= 0 || seconds > RECENT_AUDIO_SECONDS) {
+          throw new Error(`seconds must be > 0 and limited to ${RECENT_AUDIO_SECONDS}, the length of the rolling capture`)
         }
         const f0Hz = assertF0Hz(value.f0Hz)
         const windows = assertWindows(value.windows)
@@ -1971,8 +2243,9 @@ export function createWebMcpTools(
           })
         }
         if (value.source === 'scope') return withText(scopeCandidate(analysisOptions))
+        if (value.source === 'recent') return withText(await recentCandidate(requireRecentAudio(seconds), signal, analysisOptions))
         if (value.source === 'last-render' && !session.lastRender) {
-          throw new Error('No render is available yet. Call render_audio first, or pass source: "scope" to analyze the live output')
+          throw new Error('No render is available yet. Call render_audio first, or pass source: "recent" to analyze the last few seconds of live output (source: "scope" sees only the most recent 21 ms of it)')
         }
         // Re-analysis needs PCM, and only the reference and the live scope keep
         // theirs. Saying so beats silently returning the stored metrics, which
@@ -1981,6 +2254,117 @@ export function createWebMcpTools(
           throw new Error('f0Hz and windows cannot be applied to source "last-render": the render\'s PCM is not retained, only its metrics. Call render_audio again (a single-pitch sequence is analyzed at its own f0 automatically), or analyze the reference with source: "reference"')
         }
         return withText(session.lastRender ? currentCandidate() : scopeCandidate(analysisOptions))
+      }
+    },
+    {
+      name: 'capture_audio',
+      description: `Listen back to what just came out of this page: the last \`captureSeconds\` of LIVE output from a rolling ${RECENT_AUDIO_SECONDS} s buffer, with the usual metrics and optionally the samples as a Base64 WAV. The tool for "did you hear that?" — a note a human played is still here seconds after they let go, unlike analyze_audio's 21 ms \`scope\`. \`waitForSignal: true\` waits up to \`maxWaitSeconds\` for sound to start. Offline renders bypass the live graph, so render_audio's output never appears here.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          captureSeconds: {
+            type: 'number', exclusiveMinimum: 0, maximum: RECENT_AUDIO_SECONDS,
+            description: `Window length, ending at the capture. Default ${DEFAULT_CAPTURE_SECONDS}, max ${RECENT_AUDIO_SECONDS} — the whole buffer.`
+          },
+          waitForSignal: {
+            type: 'boolean',
+            description: `Wait for output above ${SIGNAL_ONSET_DB} dBFS, then capture \`captureSeconds\` from there. Default false: read the buffer and return at once.`
+          },
+          maxWaitSeconds: {
+            type: 'number', exclusiveMinimum: 0, maximum: MAX_WAIT_SECONDS,
+            description: `Wait budget, default ${DEFAULT_WAIT_SECONDS}, capped at ${MAX_WAIT_SECONDS}. Waiting in vain returns \`signalDetected: false\`, not an error.`
+          },
+          format: {
+            type: 'string', enum: [...CAPTURE_FORMATS],
+            description: 'Default "metrics". "base64" adds the window as a mono 16-bit WAV; read `audio.transportNote` first.'
+          }
+        },
+        additionalProperties: false
+      },
+      // Reads a buffer the engine fills on its own; captures nothing, plays
+      // nothing, and leaves no `last-render` behind.
+      annotations: { readOnlyHint: true },
+      async execute(input, options) {
+        return runAbortable(invocationSignal(options), async operationSignal => {
+          const value = assertObject(input, 'input', ['captureSeconds', 'waitForSignal', 'maxWaitSeconds', 'format'])
+          if (value.waitForSignal !== undefined && typeof value.waitForSignal !== 'boolean') {
+            throw new Error('waitForSignal must be boolean')
+          }
+          const waitRequested = value.waitForSignal === true
+          if (value.maxWaitSeconds !== undefined && !waitRequested) {
+            throw new Error('maxWaitSeconds only means something with waitForSignal: true; without it the buffer is read and returned at once')
+          }
+          const captureSeconds = value.captureSeconds === undefined
+            ? DEFAULT_CAPTURE_SECONDS
+            : finite(value.captureSeconds, 'captureSeconds')
+          if (captureSeconds <= 0 || captureSeconds > RECENT_AUDIO_SECONDS) {
+            throw new Error(`captureSeconds must be > 0 and limited to ${RECENT_AUDIO_SECONDS}, the length of the rolling buffer`)
+          }
+          const maxWaitSeconds = value.maxWaitSeconds === undefined
+            ? DEFAULT_WAIT_SECONDS
+            : finite(value.maxWaitSeconds, 'maxWaitSeconds')
+          if (waitRequested && (maxWaitSeconds <= 0 || maxWaitSeconds > MAX_WAIT_SECONDS)) {
+            throw new Error(`maxWaitSeconds must be > 0 and limited to ${MAX_WAIT_SECONDS}`)
+          }
+          const format = assertCaptureFormat(value.format)
+
+          // Waiting for output from a graph that is not running would burn the
+          // whole budget on a certainty. Said before the wait rather than after.
+          if (!engine.recentAudio(SIGNAL_POLL_SECONDS)) throw new Error(NO_RECENT_AUDIO)
+
+          let waitedSeconds: number | undefined
+          let signalDetected: boolean | undefined
+          if (waitRequested) {
+            const started = Date.now()
+            const deadline = started + maxWaitSeconds * 1000
+            signalDetected = false
+            for (;;) {
+              throwIfAborted(operationSignal)
+              const probe = engine.recentAudio(SIGNAL_POLL_SECONDS)
+              if (probe && peakAmplitude(probe.channelData) >= SIGNAL_ONSET_AMPLITUDE) {
+                signalDetected = true
+                break
+              }
+              const remaining = deadline - Date.now()
+              if (remaining <= 0) break
+              await sleep(Math.min(SIGNAL_POLL_MS, remaining), operationSignal)
+            }
+            // Let the buffer fill with the sound that was just detected: the
+            // window is read backwards from now, so returning at the onset would
+            // return `captureSeconds` of the silence before it.
+            if (signalDetected) await sleep(captureSeconds * 1000, operationSignal)
+            waitedSeconds = clean((Date.now() - started) / 1000)
+          }
+
+          throwIfAborted(operationSignal)
+          // One read of the ring for both payloads, so the WAV an agent listens
+          // to is the very buffer `metrics` describes and not the window a few
+          // milliseconds later.
+          const recent = requireRecentAudio(captureSeconds)
+          const captured = await recentCandidate(recent, operationSignal)
+          const silent = captured.metrics.peakDb <= SILENT_PEAK_DB
+          return {
+            ...captured,
+            requestedSeconds: clean(captureSeconds),
+            ...(waitRequested ? { waitForSignal: true, maxWaitSeconds, waitedSeconds, signalDetected } : {}),
+            // A silent window is a fact about the room, not a failure of the
+            // tool: reporting it beats throwing, because "nobody played
+            // anything" is the answer the caller asked for.
+            silent,
+            ...(silent ? {
+              silenceNote: signalDetected === false
+                ? `Nothing rose above ${SIGNAL_ONSET_DB} dBFS in ${waitedSeconds} s and the window is digital silence — nobody played. Ask the human to play, then call again, or use render_audio to hear the patch without them.`
+                : `This window is digital silence (peak below ${SILENT_PEAK_DB} dB): the live graph produced nothing in the last ${clean(captureSeconds)} s. Every metric below is measured on silence and describes nothing. Pass waitForSignal: true to wait for a human to play, or call render_audio to hear the patch yourself.`
+            } : {}),
+            ...(format === 'base64' ? {
+              audio: {
+                ...monoWavBase64(recent.channelData, recent.sampleRate),
+                downmixNote: DOWNMIX_NOTE,
+                transportNote: AUDIO_TRANSPORT_NOTE
+              }
+            } : {})
+          }
+        })
       }
     },
     {
@@ -2079,7 +2463,10 @@ export function createWebMcpTools(
           autoRender: { type: 'boolean', description: 'Default true when the reference has a pitch: render at that pitch and duration first. False compares the last render, or the live scope.' },
           notes: { type: 'array', minItems: 1, maxItems: MAX_NOTES, items: noteSchema, description: 'Notes for that render, when the reference\'s own pitch is not what you want.' },
           duration: { type: 'number', exclusiveMinimum: 0, maximum: MAX_RENDER_SECONDS, description: 'Render seconds; defaults to the reference\'s duration.' },
-          format: { type: 'string', enum: [...PAYLOAD_FORMATS], description: 'Default "text": the diff as a compact table. "json" returns the full numeric diff.' },
+          format: {
+            type: 'string', enum: [...PAYLOAD_FORMATS],
+            description: `Default "text": the diff as a compact table, and a summary in the strict sense — the arrays that table restates (\`${TEXT_MODE_OMITTED_FIELDS.join('`, `')}\`) are dropped from both metrics objects, cutting about a third off the response and more as \`windows\` rises. "json" returns everything whole.`
+          },
           maxActions: { type: 'integer', minimum: 0, maximum: MAX_ADVICE_ACTIONS, description: `Ranked moves, default ${DEFAULT_MAX_ACTIONS}.` }
         },
         additionalProperties: false
@@ -2182,11 +2569,15 @@ export function createWebMcpTools(
         dependencies.onComparison?.(comparison, entryId)
         const progress = trackMatchProgress(session, reference, comparison.similarity, entryId)
         const diff = diffAudioMetrics(reference.metrics, candidate.metrics, comparison)
-        diff.actions = adviseFromDiff(diff, currentPatchValues(engine), { maxActions })
+        const mods = currentModRoutes(engine)
+        diff.actions = adviseFromDiff(diff, currentPatchValues(engine), { maxActions, ...(mods ? { mods } : {}) })
         session.lastComparison = {
           diff,
           ...(reference.name ? { referenceName: reference.name } : {}),
-          comparisonNumber: progress.comparisonNumber
+          comparisonNumber: progress.comparisonNumber,
+          // The same id `onComparison` files this comparison under, so
+          // `suggest_patch` can tell whether the patch moved underneath it.
+          ...(entryId === undefined ? {} : { soundEntryId: entryId })
         }
         const text = format === 'text'
           ? formatDiff(diff, {
@@ -2196,8 +2587,16 @@ export function createWebMcpTools(
           })
           : undefined
         return {
-          reference,
-          candidate,
+          // The bulky arrays go only in text mode, where the table restates
+          // them; `format: "json"` keeps `reference`/`candidate` exactly as
+          // `analyze_audio` shapes them. See `TEXT_MODE_OMITTED_METRICS`.
+          reference: format === 'text' ? summarizeAnalysis(reference) : reference,
+          candidate: format === 'text' ? summarizeAnalysis(candidate) : candidate,
+          ...(format === 'text' ? {
+            metricsOmitted: { fields: [...TEXT_MODE_OMITTED_FIELDS], note: METRICS_OMITTED_NOTE }
+          } : {}),
+          // Byte-identical in both modes, and deliberately so: see the comment
+          // above `compareAudioMetrics`.
           comparison,
           // In text mode the table already carries every band, partial and
           // window figure, so shipping the numeric arrays as well would pay for
@@ -2212,7 +2611,7 @@ export function createWebMcpTools(
     },
     {
       name: 'suggest_patch',
-      description: 'Ask "what next" without paying for a render: re-reads the last compare_audio and returns its ranked moves again — parameter ids, directions, legal target values — optionally narrowed by `focus`. Nothing is rendered or measured, so call compare_audio to find out whether a move worked.',
+      description: 'Ask "what next" without paying for a render: re-reads the last compare_audio and returns its ranked moves again — parameter ids, directions, legal target values — optionally narrowed by `focus`. Nothing is rendered or measured, so call compare_audio to find out whether a move worked. `basedOn.stale` is true when the patch changed since that comparison, making `basedOn.similarity` the score of the sound you replaced.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -2231,14 +2630,39 @@ export function createWebMcpTools(
         if (!session.lastComparison) {
           throw new Error('No comparison to advise from yet. Call analyze_reference_audio to set a target, then compare_audio — which renders the candidate for you — and call suggest_patch again; it re-reads that comparison rather than measuring anything itself')
         }
-        const { diff, referenceName, comparisonNumber } = session.lastComparison
+        const { diff, referenceName, comparisonNumber, soundEntryId } = session.lastComparison
+        // Warn, do not refuse. `SILENT_CANDIDATE_REFUSAL` refuses because the
+        // alternative is a fabricated number: scoring against silence invents a
+        // similarity for a comparison that never happened. Stale advice is a
+        // different kind of wrong — the measurement did happen, on a real sound,
+        // and `adviseFromDiff` re-derives every `from`/`to` against the patch as
+        // it is RIGHT NOW, so the moves stay legal and applicable. Refusing would
+        // fire on the one sequence an agent should be praised for (apply the
+        // advice, ask what is next) and force a render this tool exists to save.
+        // What must not survive the edit is the *number*: `similarity` reads as
+        // "where I am" and after an edit it is where the agent was. So the number
+        // is labelled rather than removed, and the label says which sound it
+        // describes.
+        const currentEntryId = dependencies.currentSoundEntryId?.()
+        // Unknowable without history services, and an unknowable staleness is not
+        // reported as `false`: a caller reading `stale === false` is entitled to
+        // treat it as a checked fact.
+        const knowable = soundEntryId !== undefined && currentEntryId !== undefined
+        const stale = knowable && soundEntryId !== currentEntryId
+        const adviceMods = currentModRoutes(engine)
         return {
-          actions: adviseFromDiff(diff, currentPatchValues(engine), { maxActions, ...(focus ? { focus } : {}) }),
+          actions: adviseFromDiff(diff, currentPatchValues(engine), {
+            maxActions, ...(adviceMods ? { mods: adviceMods } : {}), ...(focus ? { focus } : {})
+          }),
           basedOn: {
             ...(referenceName ? { referenceName } : {}),
             comparisonNumber,
             similarity: roundSimilarity(diff.similarity),
-            note: 'Re-read of the last compare_audio, against the patch as it is right now. Nothing was rendered or measured for this call; call compare_audio to measure the effect of a change.'
+            ...(knowable ? { stale } : {}),
+            ...(stale ? { comparedSoundEntryId: soundEntryId, currentSoundEntryId: currentEntryId } : {}),
+            note: stale
+              ? `THE SOUND HAS CHANGED since comparison ${comparisonNumber} was measured: the patch moved from sound-history entry ${soundEntryId} to ${currentEntryId}, so \`similarity\` above scores the patch you REPLACED, not the one loaded now. The ranked moves are still the findings of that comparison, and their from/to values are computed against the current patch, so they remain applicable — but nothing here tells you whether your last edit helped. Call compare_audio to measure the sound as it is.`
+              : 'Re-read of the last compare_audio, against the patch as it is right now. Nothing was rendered or measured for this call; call compare_audio to measure the effect of a change.'
           }
         }
       }
@@ -2255,6 +2679,10 @@ export function createWebMcpTools(
         const value = assertObject(input, 'input', ['name'], ['name'])
         const name = validatePresetName(value.name)
         savePreset(engine.toPreset(name))
+        // The patch on screen is now a copy of something that exists, so it stops
+        // being unattributed and `get_synth_state`'s `patch.preset.dirty` goes
+        // false until the next edit. Read back out of the engine, after the write.
+        markPresetLoaded(name, 'user', engine)
         return {
           name,
           saved: true,
@@ -2317,6 +2745,11 @@ export function createWebMcpTools(
         const preset = user ?? (source === 'user' ? null : getFactoryPreset(name))
         if (!preset) throw new Error(presetNotFound(name, source))
         engine.loadPreset(preset, 'ai')
+        // AFTER the load, never before: the reference is read back out of the
+        // engine, which fills in every parameter the preset omits and stores into
+        // a Float32Array. Comparing against the file instead would report a fresh
+        // load as already modified, which is honest and useless.
+        markPresetLoaded(name, user ? 'user' : 'factory', engine)
         return {
           name,
           loaded: true,
@@ -2333,7 +2766,7 @@ export function createWebMcpTools(
     },
     {
       name: 'list_presets',
-      description: `Every preset this page can load, as ONE ordered list: the ${FACTORY_PRESETS.length} factory patches first, in the dropdown's own order, then this browser's user presets in the order they were saved (oldest first). Each row carries \`source\`, and \`total\`/\`factory\`/\`user\` count them. A name held by both spaces appears twice, once per source — load_preset takes the user one unless asked for {"source":"factory"}.`,
+      description: `Every preset this page can load, as ONE ordered list: the ${FACTORY_PRESETS.length} factory patches first, in the dropdown's own order, then this browser's user presets in the order they were saved (oldest first). Each row carries \`source\`, and \`total\`/\`factory\`/\`user\` count them. A name held by both spaces appears twice, once per source.`,
       inputSchema: emptySchema,
       annotations: { readOnlyHint: true },
       execute(input) {
@@ -2357,6 +2790,92 @@ export function createWebMcpTools(
             shadowedFactoryPresets: shadowed,
             note: `${shadowed.join(', ')} ${shadowed.length === 1 ? 'names' : 'name'} both a factory and a user preset. load_preset returns the user one; pass {"source":"factory"} for the built-in patch.`
           })
+        }
+      }
+    },
+    {
+      name: 'delete_preset',
+      description: "Delete a preset saved in this browser's localStorage. Factory presets are compiled into the page and cannot be deleted, so a factory name is refused unless a user preset shadows it — then the USER copy goes and the built-in patch is loadable again under that name. The patch on screen is never touched; only the entry in storage.",
+      inputSchema: {
+        type: 'object', properties: { name: { type: 'string', minLength: 1, maxLength: 80 } },
+        required: ['name'], additionalProperties: false
+      },
+      annotations: { readOnlyHint: false },
+      execute(input) {
+        const value = assertObject(input, 'input', ['name'], ['name'])
+        const name = validatePresetName(value.name)
+        const shadowsFactory = factoryNames.has(name)
+        // Read before the delete, because the delete is what clears it.
+        const attributed = currentPresetState(engine)
+        // Attempted before the factory check, deliberately: a user preset saved
+        // under a factory name is deliberate work and the only copy of it, so it
+        // IS deletable. Only when storage held nothing does the name get read as
+        // a request to delete the built-in one.
+        const removed = deletePreset(name)
+        if (!removed) throw new Error(shadowsFactory ? factoryDeleteRefusal(name) : presetNotFound(name, 'user'))
+        // A delete never touches the sound, but it can take away what the sound
+        // was a copy OF, and an agent about to answer "is this saved?" needs to
+        // be told that rather than to discover it in the next get_synth_state.
+        const detached = attributed.source === 'user' && attributed.name === name
+        return {
+          name,
+          deleted: true,
+          storage: 'localStorage',
+          ...(shadowsFactory ? { factoryPresetRestored: true } : {}),
+          ...(detached ? { detachedCurrentPatch: true } : {}),
+          note: 'The patch loaded in the synth is untouched; only the entry in storage is gone, and list_presets confirms it.' +
+            (shadowsFactory ? ` A factory preset is also called "${name}", so load_preset({"name":"${name}"}) now returns the built-in patch again.` : '') +
+            (detached ? ' It was the preset this patch came from, so the patch is no longer attributed to one: get_synth_state reports `patch.preset.name` as null. Nothing was lost from the sound — save_preset stores it again, export_preset hands it over as JSON.' : '')
+        }
+      }
+    },
+    {
+      name: 'export_preset',
+      description: `Serialize a patch as the JSON a coSynth import takes back. No argument exports the LIVE patch as it sounds right now; \`name\` exports a stored preset instead, factory or user, on load_preset's shadowing rule. Reading is all it does: nothing is loaded and \`get_synth_state\`'s \`patch.preset\` is the same after. Returns \`json\`, validated on the way out, and a \`filename\` to suggest. No file is written; the page cannot save one.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string', minLength: 1, maxLength: 80,
+            description: 'A stored preset to export. Omit it to export the live patch.'
+          },
+          source: {
+            type: 'string', enum: [...PRESET_SOURCES],
+            description: 'Which space `name` is in. Only meaningful with `name`; omitted, a user preset of that name wins over a factory one.'
+          }
+        },
+        additionalProperties: false
+      },
+      annotations: { readOnlyHint: true },
+      execute(input) {
+        const value = assertObject(input, 'input', ['name', 'source'])
+        const source = assertPresetSource(value.source)
+        if (value.name === undefined) {
+          if (source !== undefined) throw new Error('source says which space to read `name` from, so it needs a `name`. Omit both to export the live patch.')
+          const identity = currentPresetState(engine)
+          const name = identity.name ?? LIVE_PATCH_EXPORT_NAME
+          return {
+            ...exportedPreset(name, engine.toPreset(name), 'live'),
+            note: identity.name === null
+              ? `The live patch, which is not a copy of any saved preset, so it is named "${name}". save_preset stores it in this browser under a name of your choosing.`
+              : `The live patch, which ${identity.dirty ? 'HAS been edited since' : 'still matches'} the ${identity.source} preset "${identity.name}" it came from.${identity.dirty ? ' This export carries the edits; the saved preset does not.' : ''}`
+          }
+        }
+        const name = validatePresetName(value.name)
+        // `listPresets`, never the store's `loadPreset`: that one notifies the
+        // preset-store listeners, so reading a preset through it would announce a
+        // load that never happened and jump the UI's dropdown to a patch nobody
+        // asked for. Reading is the whole job here.
+        const user = source === 'factory' ? undefined : listPresets().find(preset => preset.name === name)
+        const preset = user ?? (source === 'user' ? null : getFactoryPreset(name))
+        if (!preset) throw new Error(presetNotFound(name, source))
+        const shadowed = user !== undefined && factoryNames.has(name)
+        return {
+          ...exportedPreset(name, preset, user ? 'user' : 'factory'),
+          ...(shadowed ? {
+            shadowedFactoryPreset: true,
+            note: `A factory preset is also called "${name}"; this exported the USER preset. Pass {"source":"factory"} for the built-in patch.`
+          } : {})
         }
       }
     }

@@ -1,5 +1,7 @@
 import { driver, type Config, type Driver, type DriveStep } from 'driver.js'
 import { micromark } from 'micromark'
+import { PARAMS, type ParamDef } from '../shared/params'
+import { paramGuideId, paramGuideLabel } from './guide-target'
 
 export type GuideTarget = { id: string; selector?: never } | { selector: string; id?: never }
 export interface GuideStep { target?: GuideTarget; title?: string; markdown?: string }
@@ -163,9 +165,48 @@ function openAll(openers: Opener[]): string[] {
   return opened
 }
 
-export interface GuideTargetInfo { id: string; label: string; type: string; visible: boolean; revealable?: boolean }
+/**
+ * One teaching target. `visible` and `revealable` describe where it stands;
+ * `mounted: false` marks the one row that is not read off an element, because
+ * the tab that owns it has not built it yet. Both optional fields are omitted
+ * in the state that needs no word for it - visible, and mounted.
+ */
+export interface GuideTargetInfo {
+  id: string
+  label: string
+  type: string
+  visible: boolean
+  revealable?: boolean
+  mounted?: boolean
+}
 
 const DEFAULT_TARGET_PAGE_SIZE = 5
+
+/**
+ * The type an unmounted parameter control will have once its tab builds it,
+ * predicted from the definition the three control factories already switch on:
+ * `paramSelect` takes the enumerated parameters, `paramToggle` the 0..1 step-1
+ * ones, and everything else is a `Knob`. Only these three kinds exist for a
+ * parameter, and `guide.test.ts` pins the prediction against every parameter
+ * an ENV or LFO tab owns - the only ones this is ever asked about.
+ */
+function predictedParamKind(def: ParamDef): string {
+  if (def.choices) return 'select'
+  return def.min === 0 && def.max === 1 && def.step === 1 ? 'button' : 'knob'
+}
+
+/**
+ * Every ID a parameter control carries when it is mounted.
+ *
+ * `PARAMS` is the registry the controls are built from, so this is a projection
+ * of it rather than a second list to keep in step: an id, a label and a type
+ * that go stale are ones `knob.ts` and `controls.ts` stopped agreeing with,
+ * which is a change to `PARAMS` and to both of them at once.
+ */
+const PARAM_TARGETS: ReadonlyMap<string, { id: string; label: string; type: string }> =
+  new Map(PARAMS.map(def => [paramGuideId(def.id), {
+    id: paramGuideId(def.id), label: paramGuideLabel(def), type: predictedParamKind(def)
+  }]))
 
 /**
  * One teaching target as a single line: `param.env1.release knob env1 Release`,
@@ -179,9 +220,15 @@ const DEFAULT_TARGET_PAGE_SIZE = 5
  * sees the warning. ` (hidden, revealable)` narrows that further: the guide can
  * open this one itself, so it costs the agent nothing but a `show_ui_guide`
  * call. A bare ` (hidden)` is a control the human has to reach on their own.
+ *
+ * ` (not mounted, revealable)` is the same promise about a control that does
+ * not exist yet: its tab rebuilds its knobs on every click, so the row is
+ * predicted from the parameter registry rather than read off an element.
  */
 export function compactTarget(item: GuideTargetInfo): string {
-  const state = item.visible ? '' : item.revealable ? ' (hidden, revealable)' : ' (hidden)'
+  const state = item.visible ? ''
+    : item.mounted === false ? ' (not mounted, revealable)'
+    : item.revealable ? ' (hidden, revealable)' : ' (hidden)'
   return `${item.id} ${item.type} ${item.label}${state}`
 }
 
@@ -249,12 +296,16 @@ export class UiGuideController {
    * `tab.env2`. Nothing is claimed on the strength of it — the caller opens the
    * tab, looks again, and reports whatever it actually finds.
    */
-  private owningTabs(id: string): HTMLElement[] {
+  private owningTabs(id: string, tabs = this.inactiveTabs()): HTMLElement[] {
     const parts = new Set(id.split('.').filter(part => part && part !== 'tab'))
-    return this.matches('[data-guide-kind="tab"][data-guide-id]')
-      .filter(tab => visible(tab) && !isActiveTab(tab))
+    return tabs
       .filter(tab => (tab.dataset.guideId ?? '').split('.').some(part => part !== 'tab' && parts.has(part)))
       .sort((a, b) => a.dataset.guideId!.localeCompare(b.dataset.guideId!))
+  }
+
+  /** Hoisted out of `owningTabs` so a whole-registry pass queries the DOM once. */
+  private inactiveTabs(): HTMLElement[] {
+    return this.matches('[data-guide-kind="tab"][data-guide-id]').filter(tab => visible(tab) && !isActiveTab(tab))
   }
 
   /** Where a target stands right now, and what would fix it. Never mutates. */
@@ -342,8 +393,10 @@ export class UiGuideController {
       throw new Error('limit must be an integer from 1 to 20')
     }
     const blocking = this.blockingRoot()
+    const mounted = new Set<string>()
     const items: GuideTargetInfo[] = this.matches('[data-guide-id]').map(element => {
       const shown = visible(element) && (!blocking || blocking.contains(element) || blocking === element)
+      mounted.add(element.dataset.guideId!)
       const info: GuideTargetInfo = {
         id: element.dataset.guideId!, label: element.dataset.guideLabel ?? element.dataset.guideId!,
         type: element.dataset.guideKind ?? element.tagName.toLowerCase(), visible: shown
@@ -351,7 +404,8 @@ export class UiGuideController {
       // Only a hidden target needs the extra word, and there are 259 of these.
       if (!shown) info.revealable = this.openersFor(element).length > 0
       return info
-    }).filter(item => `${item.id} ${item.label} ${item.type}`.toLowerCase().includes(search)).sort((a, b) => a.id.localeCompare(b.id))
+    }).concat(this.unmountedTargets(mounted))
+      .filter(item => `${item.id} ${item.label} ${item.type}`.toLowerCase().includes(search)).sort((a, b) => a.id.localeCompare(b.id))
     // A compact call needs no page size: the whole space is the point of it.
     const limit = (value.limit ?? (format === 'compact' ? Math.max(items.length, 1) : DEFAULT_TARGET_PAGE_SIZE)) as number
     const page = items.slice(offset as number, (offset as number) + limit)
@@ -363,13 +417,42 @@ export class UiGuideController {
   }
 
   /**
-   * The other half of "is this target available?".
+   * Parameter controls that exist as far as the app is concerned, but have no
+   * element to describe: the ENV and LFO knob rows are thrown away and rebuilt
+   * on every tab click, so while ENV 1 is selected there is nothing anywhere in
+   * the document for `param.env2.decay`.
    *
-   * A search that matches nothing is ambiguous in the worst way: a wrong ID and
-   * a real control whose tab happens to be closed both come back as an empty
-   * list, because a target that is not mounted cannot be listed. So when a
-   * search finds nothing, say which of the two it was — `revealable: true` means
-   * `show_ui_guide` will open `opens` and the ID will work.
+   * These were the entries a search used to answer with an empty list and a
+   * separate note beside it. They are ordinary rows now, on two pieces of
+   * evidence and no invention: the ID is in `PARAMS`, which is the registry the
+   * control would be built from, and a tab on screen plausibly owns it. What
+   * cannot be read off an element is said out loud - `mounted: false` marks a
+   * row as predicted, so a caller can always tell one from a live element.
+   *
+   * A parameter with no owning tab is left out entirely. Every parameter that
+   * is not in a rebuilt row is mounted for the life of the page, so failing
+   * that test means the guess has nothing behind it.
+   */
+  private unmountedTargets(mounted: ReadonlySet<string>): GuideTargetInfo[] {
+    const tabs = this.inactiveTabs()
+    if (!tabs.length) return []
+    const items: GuideTargetInfo[] = []
+    for (const [id, target] of PARAM_TARGETS) {
+      if (mounted.has(id) || !this.owningTabs(id, tabs).length) continue
+      items.push({ ...target, visible: false, revealable: true, mounted: false })
+    }
+    return items
+  }
+
+  /**
+   * The residue of "is this target available?" that a row cannot answer.
+   *
+   * A search matching nothing is ambiguous in the worst way: a wrong ID and a
+   * real control whose tab happens to be closed both come back empty. For a
+   * parameter that ambiguity is gone - `unmountedTargets` lists it - so what
+   * reaches here is an ID no registry knows, where a tab merely shares a word
+   * with it. That is a hunch, not a control, and it keeps a shape of its own
+   * rather than being dressed up as a row that claims an element exists.
    */
   private unmatched(query: string, matched: number) {
     if (!query || matched) return {}

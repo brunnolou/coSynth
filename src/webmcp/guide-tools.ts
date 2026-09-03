@@ -25,7 +25,7 @@ export type RevealService = Pick<UiGuideController, 'reveal'>
  * because `format` read as a mere formatting flag. Same fix, same wording, as
  * `GROUP_FILTER_DESCRIPTION` in tools.ts.
  */
-const FORMAT_DESCRIPTION = '`compact` returns every match, one `id type label` line each, in one call - no limit, no paging. `(hidden)` means its panel is closed; `(hidden, revealable)` means the guide opens it for you. `full` (the default) returns objects, 5 per page.'
+const FORMAT_DESCRIPTION = '`compact` returns every match, one `id type label` line each, in one call - no limit, no paging. `(hidden)` or `(not mounted)` is off screen; with `revealable`, the guide opens it for you. `full` (the default) returns objects, 5 per page.'
 
 export function createGuideTools(guide: GuideService, lifecycle: AbortSignal): WebMCP.ModelContextTool[] {
   const check = (options?: WebMCP.ToolExecuteCallbackOptions) => {
@@ -33,7 +33,7 @@ export function createGuideTools(guide: GuideService, lifecycle: AbortSignal): W
   }
   return [{
     name: 'get_ui_targets',
-    description: 'Step 1 of teaching, for when someone asks how to do something themselves: find the control to point at instead of changing it for them. Returns the mounted panels, tabs, parameters, sources, and buttons by semantic ID, label, type, and visibility. Pass a returned ID to show_ui_guide, or give that tool a precise CSS selector scoped to the app and its overlays.',
+    description: 'Step 1 of teaching, for when someone asks how to do something themselves: find the control to point at instead of changing it for them. Returns every panel, tab, parameter, source and button by semantic ID, label, type and visibility. Pass a returned ID to show_ui_guide, or give that tool a precise CSS selector scoped to the app and its overlays.',
     inputSchema: {
       type: 'object', additionalProperties: false,
       properties: {

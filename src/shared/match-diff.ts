@@ -14,6 +14,10 @@
  *    has to re-derive per block is a bug.
  * 2. `null` means "not measurable on one side", never "no difference". A 0 that means
  *    "unknown" is exactly how a model gets confidently misled.
+ * 3. Brightness states the same thing with a flag instead: `belowNoiseFloor` on a row whose
+ *    slices were not both above the analyzer's noise gate. `octaveDelta` stays a number so
+ *    that the rules in `match-advice.ts` which mean, spread and trend the trajectory keep
+ *    doing arithmetic on numbers; each of them drops the marked rows first.
  */
 
 import type {
@@ -21,6 +25,7 @@ import type {
   AudioMetricsComparison,
   SpectralWindow
 } from './audio-analysis'
+import { isSpectralWindowBelowNoiseFloor } from './audio-analysis'
 import type { MatchDiff } from './match-types'
 
 /** Octave band centres: 31.25 Hz doubled nine times, ending at 16 kHz. Mirrors the analyzer. */
@@ -125,6 +130,21 @@ const resampledIndex = (length: number, index: number, points: number): number =
  * slice sits at the same fraction of a possibly different duration. When the reference is
  * the coarser side (equal counts included) every row samples reference[i], so the labels
  * are its windows verbatim and the common path is unchanged.
+ *
+ * A row whose reference slice, candidate slice, or both sit below the analyzer's noise gate
+ * is marked `belowNoiseFloor` rather than dropped. One of its two centroids was measured on
+ * the noise the sound decayed into, so its `octaveDelta` is the distance from a sound to a
+ * noise floor: a near-silent -55 dB tail once read a 4,978 Hz centroid and manufactured a
+ * +4.9-octave "brightness swing" that ranked an `env2.decay` move first. The row survives so
+ * the count and the timeline stay readable; the flag is what a consumer drops.
+ *
+ * THE GATE IS APPLIED AFTER RESAMPLING, to the two windows a row actually differenced. The
+ * two sides can carry different window counts, so a slice that is under the gate in the
+ * finer trajectory may be sampled by no row at all, and one that is over it may be sampled
+ * by several. Gating the source arrays first would therefore mark a set of rows that does
+ * not correspond to any pair being compared. `brightnessDetail` in `audio-analysis.ts`
+ * resamples and then tests its resampled pair, exactly here, which is what makes this array
+ * and the score agree on which windows counted.
  */
 function diffBrightness(
   reference: readonly SpectralWindow[],
@@ -135,11 +155,18 @@ function diffBrightness(
   for (let index = 0; index < points; index++) {
     const referenceWindow = reference[resampledIndex(reference.length, index, points)]
     const candidateWindow = candidate[resampledIndex(candidate.length, index, points)]
-    windows.push({
+    const row: MatchDiff['brightness'][number] = {
       startMs: referenceWindow.startMs,
       endMs: referenceWindow.endMs,
       octaveDelta: octaveDelta(referenceWindow.spectralCentroidHz, candidateWindow.spectralCentroidHz)
-    })
+    }
+    // The exported predicate rather than a local threshold: it reads `levelDb`, so a window
+    // hand-built in a test or deserialized from an analysis that predates the flag is gated
+    // on the same terms as one the analyzer marked, and there is one number to change.
+    if (isSpectralWindowBelowNoiseFloor(referenceWindow) || isSpectralWindowBelowNoiseFloor(candidateWindow)) {
+      row.belowNoiseFloor = true
+    }
+    windows.push(row)
   }
   return windows
 }

@@ -1,10 +1,13 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SynthEngine } from '../audio/engine'
-import { savePreset, loadPreset, listPresets, PRESET_STORAGE_KEY } from '../shared/preset-store'
+import {
+  savePreset, loadPreset, listPresets, PRESET_STORAGE_KEY, PRESET_VERSION,
+  clearCurrentPreset, currentPresetState, serializePreset, presetFileName
+} from '../shared/preset-store'
 import { defaultLfoShape, FX_IDS } from '../shared/messages'
 import { normToValue, paramDef, paramIndex, SYNC_DIVISIONS } from '../shared/params'
-import { PresetBrowser } from './presets'
+import { PresetBrowser, deletePresetFromUi, downloadPreset, importPresetFile } from './presets'
 import { createWebMcpTools } from '../webmcp/tools'
 
 describe('compact preset browser', () => {
@@ -27,6 +30,8 @@ describe('compact preset browser', () => {
       this.dispatchEvent(new Event('close'))
     } })
     localStorage.clear()
+    // The loaded-preset reference is module state, like the listener set beside it.
+    clearCurrentPreset()
     engine = new SynthEngine()
     vi.spyOn(engine, 'loadPreset')
     browser = new PresetBrowser(engine)
@@ -35,9 +40,11 @@ describe('compact preset browser', () => {
   afterEach(() => {
     actions().open = false
     toggle()
+    browser.dispose()
     document.body.replaceChildren()
     vi.restoreAllMocks()
     localStorage.clear()
+    clearCurrentPreset()
   })
 
   it('places chevrons around the select and groups all actions behind a cog', () => {
@@ -47,7 +54,7 @@ describe('compact preset browser', () => {
     expect(trigger().getAttribute('aria-label')).toBe('Preset actions')
     expect(trigger().querySelector('svg')).not.toBeNull()
     expect([...actions().querySelectorAll('button')].map(button => button.textContent))
-      .toEqual(['Save', 'Export', 'Import'])
+      .toEqual(['Save', 'Export', 'Import', 'Delete'])
   })
 
   it('loads next and previous presets and wraps in both directions', () => {
@@ -281,5 +288,162 @@ describe('compact preset browser', () => {
     expect(click).toHaveBeenCalledOnce()
     expect(revokeUrl).toHaveBeenCalledWith('blob:patch')
     expect(actions().open).toBe(false)
+  })
+
+  // The export exists to be imported again, so the assertion is equality of the
+  // whole patch, not of a field or two: every parameter, every mod route, all
+  // eight LFO shapes and the FX order, through JSON and back into the engine.
+  it('round-trips an exported preset through the import path exactly', async () => {
+    engine.setParamById('osc1.morph', 0.42)
+    engine.setParamById('filter1.cutoff', 0.31)
+    engine.setParamById('lfo1.division', SYNC_DIVISIONS.indexOf('1/16') / (SYNC_DIVISIONS.length - 1))
+    const exported = engine.toPreset('Round Trip')
+    const json = serializePreset(exported)
+    expect(JSON.parse(json).version).toBe(PRESET_VERSION)
+
+    // Move the patch away, so an import that did nothing could not pass.
+    engine.setParamById('osc1.morph', 0.9)
+    expect(engine.toPreset('Round Trip')).not.toEqual(exported)
+
+    const imported = await importPresetFile(engine, new File([json], presetFileName('Round Trip'), { type: 'application/json' }))
+    expect(imported).toEqual(exported)
+    expect(engine.toPreset('Round Trip')).toEqual(exported)
+    expect(listPresets().map(preset => preset.name)).toEqual(['Round Trip'])
+    expect(presetFileName('Round Trip')).toBe('round-trip.cosynth.json')
+  })
+
+  it('names the downloaded file after the preset', () => {
+    const createUrl = vi.fn(() => 'blob:patch')
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createUrl })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+    const downloads: string[] = []
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      downloads.push(this.download)
+    })
+    downloadPreset(engine.toPreset('My Sound'))
+    select().value = 'factory:Reese Bass'
+    select().dispatchEvent(new Event('change'))
+    button('Export').click()
+    engine.setParamById('osc1.morph', 0.77)
+    button('Export').click()
+    // A modified factory patch must not export as the factory name: importing
+    // saves under it and would shadow the built-in preset.
+    expect(downloads).toEqual(['my-sound.cosynth.json', 'reese-bass.cosynth.json', 'reese-bass-edited.cosynth.json'])
+  })
+
+  const openDelete = () => {
+    actions().open = true
+    button('Delete').click()
+  }
+  const deleteDialog = () => [...browser.root.querySelectorAll('dialog')]
+    .find(dialog => dialog.getAttribute('aria-label') === 'Delete preset')!
+  const confirmDelete = () => (deleteDialog().querySelector('.agent-btn.primary') as HTMLButtonElement).click()
+
+  it('deletes the selected user preset, refreshes the list, and leaves the sound alone', () => {
+    savePreset(engine.toPreset('Doomed'))
+    savePreset(engine.toPreset('Keeper'))
+    browser.dispose()
+    browser = new PresetBrowser(engine)
+    document.body.replaceChildren(browser.root)
+    select().value = 'user:Doomed'
+    select().dispatchEvent(new Event('change'))
+    expect(browser.currentPreset()).toEqual({ name: 'Doomed', source: 'user', dirty: false })
+
+    const sound = engine.captureSoundState()
+    const loads = (engine.loadPreset as ReturnType<typeof vi.fn>).mock.calls.length
+    openDelete()
+    expect(deleteDialog().open).toBe(true)
+    expect(deleteDialog().textContent).toContain('Doomed')
+    confirmDelete()
+
+    expect(deleteDialog().open).toBe(false)
+    expect(listPresets().map(preset => preset.name)).toEqual(['Keeper'])
+    expect([...select().options].map(option => option.value)).not.toContain('user:Doomed')
+    // Deleting a saved copy is not an edit: the patch on screen is untouched,
+    // and nothing is loaded over it.
+    expect(engine.captureSoundState()).toEqual(sound)
+    expect((engine.loadPreset as ReturnType<typeof vi.fn>).mock.calls.length).toBe(loads)
+    // The selection can no longer name a preset, so it falls back to the first
+    // entry and the patch stops claiming to be a copy of anything.
+    expect(select().value).toBe('factory:Init')
+    expect(browser.currentPreset()).toEqual({ name: null, source: null, dirty: false })
+  })
+
+  it('keeps the selection when the deleted preset is not the selected one', () => {
+    savePreset(engine.toPreset('Doomed'))
+    savePreset(engine.toPreset('Keeper'))
+    browser.dispose()
+    browser = new PresetBrowser(engine)
+    document.body.replaceChildren(browser.root)
+    select().value = 'user:Keeper'
+    select().dispatchEvent(new Event('change'))
+    expect(deletePresetFromUi('Doomed').name).toBe('Doomed')
+    expect(select().value).toBe('user:Keeper')
+    expect(browser.currentPreset()).toMatchObject({ name: 'Keeper', source: 'user' })
+  })
+
+  it('refuses to delete a factory preset and says why', () => {
+    expect(select().value).toBe('factory:Init')
+    expect((button('Delete') as HTMLButtonElement).disabled).toBe(true)
+    expect(button('Delete').title).toMatch(/factory preset/i)
+    expect(() => deletePresetFromUi('Init')).toThrow(/factory preset/i)
+    expect(() => deletePresetFromUi('Nothing here')).toThrow(/No preset named/i)
+    // A user preset that shadows a factory name is deliberate work, and stays
+    // deletable; what comes back is the built-in patch of the same name.
+    savePreset(engine.toPreset('Init'))
+    expect(deletePresetFromUi('Init').name).toBe('Init')
+    expect(listPresets()).toHaveLength(0)
+  })
+
+  it('tracks whether the live patch still matches the preset that was loaded', () => {
+    const dirtyMark = () => browser.root.querySelector('.preset-dirty') as HTMLElement
+    expect(browser.currentPreset()).toEqual({ name: null, source: null, dirty: false })
+
+    select().value = 'factory:Reese Bass'
+    select().dispatchEvent(new Event('change'))
+    // A factory preset spells out a fraction of the parameters and the engine
+    // fills in the rest, so the reference has to be the engine's own view.
+    expect(browser.currentPreset()).toEqual({ name: 'Reese Bass', source: 'factory', dirty: false })
+    expect(dirtyMark().hidden).toBe(true)
+
+    const loaded = engine.getParam(paramIndex('osc1.morph'))
+    engine.setParamById('osc1.morph', 0.123)
+    expect(browser.currentPreset()).toMatchObject({ name: 'Reese Bass', dirty: true })
+    expect(dirtyMark().hidden).toBe(false)
+
+    // Exact equality, so putting the value back is not a change.
+    engine.setParamById('osc1.morph', loaded)
+    expect(browser.currentPreset().dirty).toBe(false)
+
+    engine.setParamById('osc1.morph', 0.123)
+    select().value = 'factory:Reese Bass'
+    select().dispatchEvent(new Event('change'))
+    expect(browser.currentPreset()).toEqual({ name: 'Reese Bass', source: 'factory', dirty: false })
+    expect(dirtyMark().hidden).toBe(true)
+
+    // Saving makes the patch a copy of the preset it was just written to.
+    engine.setParamById('osc1.morph', 0.456)
+    button('Save').click()
+    nameInput().value = 'Mine'
+    submit()
+    expect(browser.currentPreset()).toEqual({ name: 'Mine', source: 'user', dirty: false })
+  })
+
+  // Every value the engine holds is a float32, and a format 1 preset on disk is
+  // not: 4/42 rescaled from the old division scale has no float32 form. The
+  // reference is captured from the engine after the load for exactly this case.
+  it('is clean straight after loading a rescaled format 1 preset', () => {
+    localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify([{
+      name: 'Old Patch', version: 1,
+      params: { 'lfo1.division': 4 / 12, 'osc1.morph': 0.1 },
+      mods: [], lfoShapes: Array.from({ length: 8 }, () => defaultLfoShape()), fxOrder: [...FX_IDS]
+    }]))
+    browser.dispose()
+    browser = new PresetBrowser(engine)
+    document.body.replaceChildren(browser.root)
+    select().value = 'user:Old Patch'
+    select().dispatchEvent(new Event('change'))
+    expect(currentPresetState(engine)).toEqual({ name: 'Old Patch', source: 'user', dirty: false })
+    expect(divisionOf('lfo1.division')).toBe('1/4')
   })
 })

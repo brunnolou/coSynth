@@ -24,15 +24,19 @@ export const AGENT_BRIEF_ID = 'cosynth-agent-brief'
 export const AGENT_BRIEF_JSON_ID = 'cosynth-agent-tools'
 
 /**
- * Every tool coSynth registers, in registration order: the fifteen synth tools
- * from `createWebMcpTools`, the four from `createHistoryTools`, and the two
- * from `createGuideTools`.
+ * Every tool coSynth registers, in the order `register.ts` registers them: the
+ * eighteen synth tools from `createWebMcpTools`, then the two from
+ * `createGuideTools`, then the four from `createHistoryTools`.
  *
  * Hardcoded on purpose. Importing the real factories would pull the audio
  * engine, the offline renderer and the analysis worker into the startup path
  * of a module whose only job is to write text into the document. The drift
  * risk that buys is paid for in `announce.test.ts`, which builds the real tool
  * sets and fails if this list stops matching them.
+ *
+ * Every count in the brief is `ANNOUNCED_TOOL_NAMES.length`, never a number
+ * typed out beside it: this list has grown four times and a hand-written total
+ * was wrong after each one.
  */
 export const ANNOUNCED_TOOL_NAMES = [
   'get_synth_state',
@@ -44,18 +48,21 @@ export const ANNOUNCED_TOOL_NAMES = [
   'play_notes',
   'render_audio',
   'analyze_audio',
+  'capture_audio',
   'analyze_reference_audio',
   'compare_audio',
   'suggest_patch',
   'save_preset',
   'load_preset',
   'list_presets',
+  'delete_preset',
+  'export_preset',
+  'get_ui_targets',
+  'show_ui_guide',
   'get_history',
   'navigate_history',
   'replay_history',
-  'stop_performance',
-  'get_ui_targets',
-  'show_ui_guide'
+  'stop_performance'
 ] as const
 
 /**
@@ -89,8 +96,8 @@ export const AGENT_PITFALLS: readonly { title: string; body: string }[] = [
     body: 'A tab you claimed in an external browser may report no model context on this exact URL, because that browsing context does not expose the `webmcp` capability at all. `{"hasMC":false,"keys":[],"ai":false}` from a raw CDP probe means "wrong context", not "no tools". Open the same URL in a WebMCP-capable browser context and probe again before concluding anything.'
   },
   {
-    title: '`analyze_audio({"source":"scope"})` reads about 21 ms of live output.',
-    body: 'The scope buffer is 1024 samples of whatever is sounding at that instant, so it is silence unless a note is ringing right now. Anything about attack, decay, release or the shape of a tail needs `render_audio`, which renders offline, needs no user gesture, and returns metrics for the whole note.'
+    title: '`analyze_audio({"source":"scope"})` reads about 21 ms, so a silent scope is the wrong buffer rather than a silent page.',
+    body: 'The scope is 1024 samples of whatever is sounding at that instant, so a note the human finished a moment ago reads as silence — and taking that for "they played nothing, I heard nothing" is the false negative. The live output is kept for about four seconds: `capture_audio` returns the last few seconds of it with the usual metrics, and optionally the samples themselves, and `analyze_audio({"source":"recent"})` analyzes that same rolling buffer. One of those is the answer to "the human just played something, did you hear it?". Offline renders never reach the live graph and so never appear in it; for a sound nobody is playing, `render_audio` still renders the whole note with no user gesture.'
   },
   {
     title: 'Presets are saved to browser localStorage, not to a folder on disk.',

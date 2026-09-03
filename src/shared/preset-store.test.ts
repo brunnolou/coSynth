@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PresetData } from '../audio/engine'
 import { FX_IDS, MAX_MOD_SLOTS, defaultLfoShape } from './messages'
-import { loadPreset, listPresets, PRESET_STORAGE_KEY, PRESET_VERSION, savePreset, validatePresetData, validatePresetName } from './preset-store'
+import {
+  clearCurrentPreset, currentPresetState, deletePreset, factoryDeleteRefusal, listPresets, loadPreset,
+  markPresetLoaded, onPresetStoreChange, PRESET_STORAGE_KEY, PRESET_VERSION, presetFileName, savePreset,
+  serializePreset, validatePresetData, validatePresetName, type PresetStoreChange
+} from './preset-store'
 import { normToValue, paramDef, SYNC_DIVISIONS } from './params'
 
 class MemoryStorage implements Storage {
@@ -124,6 +128,162 @@ describe('preset store', () => {
     expect(listPresets(throwing)).toEqual([])
     expect(() => savePreset(preset('Blocked'), throwing)).toThrow(/storage/i)
     expect(() => loadPreset('Blocked', throwing)).toThrow(/storage/i)
+  })
+})
+
+describe('deleting a preset', () => {
+  const record = () => {
+    const changes: PresetStoreChange[] = []
+    const stop = onPresetStoreChange(change => changes.push(change))
+    return { changes, stop }
+  }
+
+  it('removes one preset, keeps the rest, and announces the removal', () => {
+    const storage = new MemoryStorage()
+    savePreset(preset('Keeper'), storage)
+    savePreset(preset('Doomed', 0.7), storage)
+    const { changes, stop } = record()
+
+    expect(deletePreset('  Doomed  ', storage)?.params['osc1.level']).toBe(0.7)
+    stop()
+    expect(listPresets(storage).map(item => item.name)).toEqual(['Keeper'])
+    expect(loadPreset('Doomed', storage)).toBeNull()
+    // The listener set is what made the dropdown follow a save; a silent delete
+    // would put the original bug back, one preset at a time.
+    expect(changes).toEqual([{ kind: 'deleted', name: 'Doomed' }])
+  })
+
+  it('reports a name it does not hold without writing or announcing anything', () => {
+    const storage = new MemoryStorage()
+    savePreset(preset('Keeper'), storage)
+    const before = storage.getItem(PRESET_STORAGE_KEY)
+    const { changes, stop } = record()
+
+    // A factory name reaches here as an ordinary miss: storage holds user
+    // presets only, and the refusal is worded by the caller that knows the list.
+    expect(deletePreset('Init', storage)).toBeNull()
+    expect(deletePreset('Keeper ', storage)).not.toBeNull()
+    stop()
+    expect(changes).toEqual([{ kind: 'deleted', name: 'Keeper' }])
+    expect(before).not.toBeNull()
+    expect(() => deletePreset('', storage)).toThrow(/preset name/i)
+    expect(factoryDeleteRefusal('Init')).toMatch(/factory preset/i)
+  })
+
+  it('surfaces a storage failure instead of reporting a delete that did not happen', () => {
+    const storage = new MemoryStorage()
+    savePreset(preset('Doomed'), storage)
+    storage.setItem = () => { throw new DOMException('quota', 'QuotaExceededError') }
+    const { changes, stop } = record()
+    expect(() => deletePreset('Doomed', storage)).toThrow(/Could not delete preset/)
+    stop()
+    expect(changes).toEqual([])
+  })
+})
+
+describe('exporting a preset', () => {
+  it('writes importable JSON, stamped with the current format version', () => {
+    const exported = serializePreset(preset('Exported', 0.4))
+    const parsed = JSON.parse(exported)
+    expect(parsed.version).toBe(PRESET_VERSION)
+    // The exact object the import path produces, so the round trip is closed
+    // before a file is ever written.
+    expect(validatePresetData(parsed)).toEqual(validatePresetData(preset('Exported', 0.4)))
+    expect(exported).toContain('\n')
+  })
+
+  it('refuses to write a file this app would not read back', () => {
+    expect(() => serializePreset({ ...preset('Broken'), fxOrder: [] })).toThrow(/preset/i)
+  })
+
+  it('names the file after the preset', () => {
+    expect(presetFileName('My Sound')).toBe('my-sound.cosynth.json')
+    expect(presetFileName('  ///  ')).toBe('patch.cosynth.json')
+    expect(presetFileName('x'.repeat(80)).length).toBeLessThanOrEqual(60 + '.cosynth.json'.length)
+  })
+})
+
+describe('the preset the patch came from', () => {
+  /**
+   * The engine, as `markPresetLoaded` sees it. Values are what the engine holds
+   * after a load, not what a file spelled out - which is the distinction the
+   * real thing turns on, and the reason this takes a source instead of data.
+   */
+  class FakeEngine {
+    params: Record<string, number> = { 'osc1.level': 0.2, 'filter1.cutoff': 0.5 }
+    toPreset(name: string): PresetData {
+      return {
+        name, version: PRESET_VERSION, params: { ...this.params }, mods: [],
+        lfoShapes: Array.from({ length: 8 }, () => defaultLfoShape()), fxOrder: [...FX_IDS]
+      }
+    }
+  }
+
+  afterEach(() => clearCurrentPreset())
+
+  it('is nothing until a preset is loaded', () => {
+    const engine = new FakeEngine()
+    expect(currentPresetState(engine)).toEqual({ name: null, source: null, dirty: false })
+  })
+
+  it('is clean at the load, dirty at the first change, and clean again at the reload', () => {
+    const engine = new FakeEngine()
+    markPresetLoaded('Reese Bass', 'factory', engine)
+    expect(currentPresetState(engine)).toEqual({ name: 'Reese Bass', source: 'factory', dirty: false })
+
+    engine.params['osc1.level'] = 0.9
+    expect(currentPresetState(engine)).toMatchObject({ name: 'Reese Bass', dirty: true })
+    engine.params['osc1.level'] = 0.2
+    expect(currentPresetState(engine).dirty).toBe(false)
+
+    engine.params['osc1.level'] = 0.9
+    markPresetLoaded('Reese Bass', 'factory', engine)
+    expect(currentPresetState(engine).dirty).toBe(false)
+  })
+
+  it('notices every part of the patch, not just the parameters', () => {
+    const engine = new FakeEngine()
+    markPresetLoaded('Patch', 'user', engine)
+    const mutate = (fn: (preset: PresetData) => void) => {
+      const original = engine.toPreset.bind(engine)
+      engine.toPreset = (name: string) => { const preset = original(name); fn(preset); return preset }
+    }
+    mutate(preset => { preset.fxOrder = [...FX_IDS].reverse() })
+    expect(currentPresetState(engine).dirty).toBe(true)
+    mutate(preset => { preset.mods = [{ source: 'lfo1', dest: 'osc1.level', depth: 0.5, enabled: true }] })
+    expect(currentPresetState(engine).dirty).toBe(true)
+    mutate(preset => { preset.lfoShapes[0][0].y = 0.5 })
+    expect(currentPresetState(engine).dirty).toBe(true)
+    // A rename is not a patch change.
+    engine.toPreset = (name: string) => ({ ...new FakeEngine().toPreset(name), name: 'Something else' })
+    expect(currentPresetState(engine).dirty).toBe(false)
+  })
+
+  it('stops attributing the patch to a preset that was just deleted', () => {
+    const storage = new MemoryStorage()
+    const engine = new FakeEngine()
+    savePreset(preset('Doomed'), storage)
+    markPresetLoaded('Doomed', 'user', engine)
+    expect(currentPresetState(engine).name).toBe('Doomed')
+    deletePreset('Doomed', storage)
+    expect(currentPresetState(engine)).toEqual({ name: null, source: null, dirty: false })
+
+    // A different preset's delete leaves the current one alone.
+    savePreset(preset('Other'), storage)
+    markPresetLoaded('Other', 'user', engine)
+    savePreset(preset('Third'), storage)
+    deletePreset('Third', storage)
+    expect(currentPresetState(engine).name).toBe('Other')
+  })
+
+  it('reads the reference out of the engine, not out of the preset it was handed', () => {
+    const engine = new FakeEngine()
+    const captured = vi.spyOn(engine, 'toPreset')
+    markPresetLoaded('  Patch  ', 'user', engine)
+    // Canonicalized once, and asked for by that name from then on.
+    expect(captured).toHaveBeenCalledExactlyOnceWith('Patch')
+    expect(currentPresetState(engine).name).toBe('Patch')
+    expect(captured).toHaveBeenLastCalledWith('Patch')
   })
 })
 

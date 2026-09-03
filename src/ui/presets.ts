@@ -1,7 +1,11 @@
 // Preset browser: factory presets, localStorage user presets, JSON file
-// export/import.
+// export/import, delete, and whether the live patch still matches what was
+// loaded.
 
-import { listPresets, onPresetStoreChange, savePreset, validatePresetData } from '../shared/preset-store'
+import {
+  currentPresetState, deletePreset, factoryDeleteRefusal, listPresets, markPresetLoaded,
+  onPresetStoreChange, presetFileName, savePreset, serializePreset, validatePresetData
+} from '../shared/preset-store'
 import { FACTORY_PRESETS } from '../shared/factory-presets'
 import type { SynthEngine, PresetData } from '../audio/engine'
 import { el } from './common'
@@ -13,7 +17,9 @@ import './presets.css'
 const MAX_IMPORT_BYTES = 1024 * 1024
 
 export function savePresetFromUi(engine: SynthEngine, name: string, storage?: Storage): PresetData {
-  return savePreset(engine.toPreset(name), storage)
+  const saved = savePreset(engine.toPreset(name), storage)
+  markPresetLoaded(saved.name, 'user', engine)
+  return saved
 }
 
 export async function importPresetFile(engine: SynthEngine, file: File, storage?: Storage): Promise<PresetData> {
@@ -22,16 +28,49 @@ export async function importPresetFile(engine: SynthEngine, file: File, storage?
   const preset = validatePresetData(parsed)
   const saved = savePreset(preset, storage)
   engine.loadPreset(saved)
+  markPresetLoaded(saved.name, 'user', engine)
   return saved
+}
+
+/**
+ * Delete a user preset, refusing a factory name in the caller's own words.
+ *
+ * The factory check lives here rather than in `preset-store` because that
+ * module cannot import the factory list without an import cycle. Anything else
+ * that deletes - the WebMCP tool surface, which already has the factory names -
+ * owes its callers the same two messages.
+ */
+export function deletePresetFromUi(name: string, storage?: Storage): PresetData {
+  const removed = deletePreset(name, storage)
+  if (removed) return removed
+  if (FACTORY_PRESETS.some(preset => preset.name === name)) throw new Error(factoryDeleteRefusal(name))
+  throw new Error(`No preset named "${name}" is saved in this browser.`)
+}
+
+/** Download a preset as the JSON `importPresetFile` reads back. */
+export function downloadPreset(preset: PresetData): void {
+  const blob = new Blob([serializePreset(preset)], { type: 'application/json' })
+  const a = el('a') as HTMLAnchorElement
+  a.href = URL.createObjectURL(blob)
+  a.download = presetFileName(preset.name)
+  a.click()
+  URL.revokeObjectURL(a.href)
 }
 
 export class PresetBrowser {
   readonly root: HTMLElement
   private readonly select: HTMLSelectElement
   private readonly unsubscribe: () => void
+  private readonly unsubscribePatch: () => void
+  private readonly dirtyMark: HTMLElement
+  private readonly deleteBtn: HTMLButtonElement
 
   constructor(private readonly engine: SynthEngine) {
     this.root = el('div', 'presets')
+    this.dirtyMark = el('span', 'preset-dirty', '●')
+    this.dirtyMark.hidden = true
+    this.dirtyMark.setAttribute('aria-hidden', 'true')
+    guideTarget(this.dirtyMark, 'indicator.preset.dirty', 'Unsaved changes marker', 'indicator')
     this.select = el('select', 'param-select preset-select') as HTMLSelectElement
     this.select.setAttribute('aria-label', 'Preset')
     guideTarget(this.select, 'select.preset', 'Preset browser', 'select')
@@ -162,13 +201,7 @@ export class PresetBrowser {
     exportBtn.title = 'Download patch as JSON'
     exportBtn.addEventListener('click', () => {
       closeActions(true)
-      const preset = this.engine.toPreset('Exported Patch')
-      const blob = new Blob([JSON.stringify(preset, null, 2)], { type: 'application/json' })
-      const a = el('a') as HTMLAnchorElement
-      a.href = URL.createObjectURL(blob)
-      a.download = 'patch.cosynth.json'
-      a.click()
-      URL.revokeObjectURL(a.href)
+      downloadPreset(this.engine.toPreset(this.exportName()))
     })
 
     const importBtn = el('button', 'hdr-btn', 'Import')
@@ -193,18 +226,105 @@ export class PresetBrowser {
       file.click()
     })
 
-    for (const button of [save, exportBtn, importBtn]) button.type = 'button'
-    menu.append(save, exportBtn, importBtn)
+    const deleteDialog = new ModalDialog('Delete preset', 'preset-delete')
+    deleteDialog.root.classList.add('preset-save-dialog')
+    deleteDialog.root.setAttribute('aria-label', 'Delete preset')
+    const deleteText = el('p', 'preset-save-help')
+    const deleteError = el('p', 'preset-save-error')
+    deleteError.setAttribute('role', 'alert')
+    deleteDialog.body.append(deleteText, deleteError)
+    const cancelDelete = el('button', 'agent-btn', 'Cancel')
+    cancelDelete.type = 'button'
+    cancelDelete.addEventListener('click', () => deleteDialog.close())
+    const confirmDelete = el('button', 'agent-btn primary', 'Delete')
+    confirmDelete.type = 'button'
+    guideTarget(confirmDelete, 'button.preset.delete-confirm', 'Confirm delete preset', 'button')
+    deleteDialog.footer.append(cancelDelete, confirmDelete)
+    deleteDialog.root.addEventListener('close', () => trigger.focus())
+    confirmDelete.addEventListener('click', () => {
+      try {
+        // The store notification does the refreshing, exactly as a save does.
+        deletePresetFromUi(this.selectedName())
+        deleteDialog.close()
+      } catch (error) {
+        deleteError.textContent = `Could not delete preset: ${error instanceof Error ? error.message : String(error)}`
+      }
+    })
+
+    const deleteBtn = el('button', 'hdr-btn', 'Delete')
+    deleteBtn.type = 'button'
+    guideTarget(deleteBtn, 'button.preset.delete', 'Delete preset', 'button')
+    deleteBtn.addEventListener('click', () => {
+      closeActions(true)
+      const name = this.selectedName()
+      deleteError.textContent = ''
+      // Deleting removes a saved copy; it never touches the sound, and saying so
+      // is the difference between a confirmable action and a scary one.
+      deleteText.textContent = `Delete "${name}" from this browser? The patch you are hearing stays exactly as it is, and this cannot be undone.`
+      deleteDialog.open()
+      confirmDelete.focus()
+    })
+
+    for (const button of [save, exportBtn, importBtn, deleteBtn]) button.type = 'button'
+    menu.append(save, exportBtn, importBtn, deleteBtn)
     actions.append(trigger, menu)
-    this.root.append(previous, this.select, next, actions, file, saveDialog.root)
+    this.root.append(previous, this.select, next, actions, this.dirtyMark, file, saveDialog.root, deleteDialog.root)
+    this.deleteBtn = deleteBtn
     this.refresh('factory:Init')
     // Presets also change from outside this component: an agent's save_preset or
     // load_preset tool call writes and reads the same store with no UI event.
-    this.unsubscribe = onPresetStoreChange(change => this.refresh(`user:${change.name}`))
+    this.unsubscribe = onPresetStoreChange(change =>
+      // A deleted name must not be re-selected; `refresh` falls back on its own.
+      this.refresh(change.kind === 'deleted' ? '' : `user:${change.name}`))
+    // The other half of dirty state: the store says which preset the patch came
+    // from, the engine says whether it has moved since.
+    this.unsubscribePatch = engine.onPatchChange(() => this.syncDirty())
   }
 
   dispose(): void {
     this.unsubscribe()
+    this.unsubscribePatch()
+  }
+
+  /** The live patch against the preset it was loaded from. */
+  currentPreset(): ReturnType<typeof currentPresetState> {
+    return currentPresetState(this.engine)
+  }
+
+  private syncDirty(): void {
+    const state = this.currentPreset()
+    this.dirtyMark.hidden = !state.dirty
+    this.dirtyMark.title = state.dirty ? `${state.name} has unsaved changes` : ''
+  }
+
+  /**
+   * A factory preset has no saved copy to remove, so Delete is only offered for
+   * a user preset - including one saved under a factory name, which is
+   * deliberate work and the only copy of it there is.
+   */
+  private syncDeletable(): void {
+    const user = this.select.value.startsWith('user:')
+    this.deleteBtn.disabled = !user
+    this.deleteBtn.title = user
+      ? 'Remove this saved preset from the browser'
+      : factoryDeleteRefusal(this.selectedName())
+  }
+
+  /** The selected preset's name, without the `factory:` / `user:` space prefix. */
+  private selectedName(): string {
+    return this.select.value.split(':').slice(1).join(':')
+  }
+
+  /**
+   * What an exported file calls itself. A modified factory patch exports as
+   * "Init (edited)" rather than "Init": importing saves under the file's name,
+   * and a user preset that shadows a factory one is a collision the human did
+   * not ask for.
+   */
+  private exportName(): string {
+    const state = this.currentPreset()
+    if (!state.name) return 'Exported Patch'
+    return state.dirty ? `${state.name} (edited)` : state.name
   }
 
   private step(direction: -1 | 1): void {
@@ -240,6 +360,8 @@ export class PresetBrowser {
     this.select.value = selected
     if (!this.select.value) this.select.value = previous
     if (!this.select.value) this.select.selectedIndex = 0
+    this.syncDeletable()
+    this.syncDirty()
   }
 
   private load(key: string): void {
@@ -249,6 +371,12 @@ export class PresetBrowser {
       kind === 'factory'
         ? FACTORY_PRESETS.find(p => p.name === name)
         : listPresets().find(p => p.name === name)
-    if (preset) this.engine.loadPreset(preset)
+    if (!preset) return
+    this.engine.loadPreset(preset)
+    // After the load, never before: the reference is what the engine ended up
+    // holding, which is not the same object a factory preset spells out.
+    markPresetLoaded(name, kind === 'factory' ? 'factory' : 'user', this.engine)
+    this.syncDeletable()
+    this.syncDirty()
   }
 }
