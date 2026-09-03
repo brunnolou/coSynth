@@ -42,7 +42,9 @@
       </p>
       <p>
         To hear what a human just played, read the rolling four-second capture of live output with
-        <code>capture_audio</code>, or <code>analyze_audio</code> with <code>source: "recent"</code>.
+        <code>analyze_audio</code> at <code>source: "recent"</code>, or with <code>capture_audio</code>, which can
+        also block until they start playing (<code>waitForSignal: true</code>). Both return metrics: a tool result
+        here is a JSON value with no audio content block, so no tool hands back audio you could play.
         <code>analyze_audio</code> with <code>source: "scope"</code> holds about 21 ms, so a note that has ended reads
         as silence there — that is the wrong buffer, not a silent page.
       </p>

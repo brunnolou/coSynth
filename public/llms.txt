@@ -66,9 +66,11 @@ JavaScript. This file exists so that fact does not leave you with nothing.
   first, because browser autoplay policy requires a gesture. Offline rendering
   does not.
 - **Hear what the human just played** — live output is kept in a rolling
-  four-second buffer. `capture_audio` returns the last few seconds of it with
-  metrics, and optionally the samples as a Base64 WAV;
-  `analyze_audio({"source": "recent"})` analyzes the same buffer. Do not reach
+  four-second buffer. `analyze_audio({"source": "recent"})` measures the last
+  few seconds of it; `capture_audio` measures the same buffer and, with
+  `waitForSignal: true`, first blocks until someone actually plays. Both return
+  metrics only: a WebMCP tool result is a JSON value with no audio content
+  block, so no tool hands back samples you could listen to. Do not reach
   for `analyze_audio({"source": "scope"})` here: it holds about 21 ms, so a note
   that has ended reads as silence, and that is the wrong buffer rather than a
   silent page. Offline renders bypass the live graph and never appear in it.

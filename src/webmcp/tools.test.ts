@@ -231,9 +231,21 @@ describe('WebMCP tool metadata', () => {
     // tool against 1340 for sixteen, and 438 B of prose per tool against 444.
     // Both averages fell, which is the only reading of this ceiling that means
     // anything — the total may only grow when a tool is added.
-    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(23000)
+    //
+    // Still eighteen, and both ceilings came DOWN when `format: "base64"` was
+    // removed from `render_audio` and `capture_audio`. Nobody ever called it —
+    // zero requests across two eval runs and 89 tool calls — and nobody could
+    // have used it: a WebMCP result is a JSON value with no audio content
+    // block, so 8 s of mono 22 kHz WAV was ~459 KB of Base64, roughly 134k
+    // tokens, behind one enum value. Gone with it: `capture_audio`'s whole
+    // `format` property, and the sentence in its description that sent the
+    // reader to `audio.transportNote` for an explanation of the payload.
+    // 22957 B -> 22731 B and 7883 B -> 7842 B of prose. A ceiling that only
+    // ratchets upward measures nothing, so it is re-cut to what the listing
+    // actually costs.
+    expect(bytes(JSON.stringify(listing))).toBeLessThanOrEqual(22780)
     const prose = listing.reduce((total, tool) => total + bytes(tool.description), 0)
-    expect(prose).toBeLessThanOrEqual(7900)
+    expect(prose).toBeLessThanOrEqual(7860)
     for (const tool of listing) {
       // No single tool may dominate the read: render_audio's description alone
       // was 1273 B, a tenth of the whole listing.
@@ -1142,25 +1154,27 @@ describe('render and analysis tools', () => {
     await expect(execute('capture_audio')).rejects.toThrow(/render_audio/)
   })
 
-  it('captures the requested window and hands back the samples the metrics describe', async () => {
+  it('measures the requested window and returns no samples with it', async () => {
     const { engine, byName, execute } = liveRateSetup()
     const played = playedThenReleased(48000, 1, 0)
     engine.recentBuffer = [played, played.slice()]
 
-    const result = await execute('capture_audio', { captureSeconds: 0.5, format: 'base64' })
+    const result = await execute('capture_audio', { captureSeconds: 0.5 })
     expect(result.source).toBe('recent')
     expect(result.duration).toBeCloseTo(0.5, 3)
     expect(result.requestedSeconds).toBe(0.5)
     expect(result.silent).toBe(false)
     expect(result).not.toHaveProperty('silenceNote')
-    expect(result.audio).toMatchObject({ mimeType: 'audio/wav', channels: 1, base64: expect.any(String) })
-    expect(result.audio.base64.length).toBeGreaterThan(100)
-    // The honest answer to "return actual audio content": WebMCP's execute
-    // returns a JSON value and the API has no audio content block, so Base64
-    // inside the JSON is the whole of what this transport can carry.
-    expect(result.audio.transportNote).toMatch(/no audio content block/i)
     expect(byName.get('capture_audio')!.annotations).toMatchObject({ readOnlyHint: true })
-    expect(await execute('capture_audio')).not.toHaveProperty('audio')
+
+    // A WebMCP tool result is a JSON value with no audio content block, so a
+    // Base64 WAV here was ~134k tokens of characters no model could play. The
+    // window that `metrics` describes is the whole of what this tool returns:
+    // no `audio` object, and no `format` to ask for one.
+    expect(result).not.toHaveProperty('audio')
+    expect((byName.get('capture_audio')!.inputSchema as any).properties).not.toHaveProperty('format')
+    await expect(execute('capture_audio', { format: 'base64' }))
+      .rejects.toThrow(/format.*Accepted: captureSeconds, waitForSignal, maxWaitSeconds/s)
   })
 
   it('reports a silent buffer as silence instead of failing the call', async () => {
@@ -1284,6 +1298,61 @@ describe('render and analysis tools', () => {
     expect(JSON.stringify(result)).not.toContain(audioBase64)
     expect(result).not.toHaveProperty('audioBase64')
     expect(result).not.toHaveProperty('channelData')
+  })
+
+  it('carries a real encoded WAV through the shipping decoder, sample for sample', async () => {
+    // Base64 OUTPUT is gone; Base64 INPUT is the only way a reference file
+    // reaches this app, so this runs the real `decodeBase64Audio` over a real
+    // encoded file rather than the injected stub the tests above use. The one
+    // stub is `decodeAudioData`, which is a browser codec jsdom does not have —
+    // and it decodes the very bytes the Base64 path produced, so a broken
+    // decode shows up as wrong samples rather than a passing test.
+    const rate = 8000
+    const frames = rate / 4
+    const file = new Uint8Array(44 + frames * 2)
+    const header = new DataView(file.buffer)
+    const ascii = (offset: number, text: string) => {
+      for (let index = 0; index < text.length; index++) header.setUint8(offset + index, text.charCodeAt(index))
+    }
+    ascii(0, 'RIFF'); header.setUint32(4, 36 + frames * 2, true); ascii(8, 'WAVE')
+    ascii(12, 'fmt '); header.setUint32(16, 16, true); header.setUint16(20, 1, true); header.setUint16(22, 1, true)
+    header.setUint32(24, rate, true); header.setUint32(28, rate * 2, true)
+    header.setUint16(32, 2, true); header.setUint16(34, 16, true)
+    ascii(36, 'data'); header.setUint32(40, frames * 2, true)
+    const sample = (frame: number) => Math.round(0.5 * Math.sin(2 * Math.PI * 440 * frame / rate) * 32767)
+    for (let frame = 0; frame < frames; frame++) header.setInt16(44 + frame * 2, sample(frame), true)
+    const audioBase64 = `data:audio/wav;base64,${btoa(String.fromCharCode(...file))}`
+
+    const decodeAudioData = vi.fn(async (data: ArrayBuffer) => {
+      const view = new DataView(data)
+      const sampleRate = view.getUint32(24, true)
+      const length = view.getUint32(40, true) / 2
+      const channel = Float32Array.from({ length }, (_, frame) => view.getInt16(44 + frame * 2, true) / 32767)
+      return {
+        numberOfChannels: 1, length, sampleRate, duration: length / sampleRate, getChannelData: () => channel
+      } as unknown as AudioBuffer
+    })
+    const engine = new FakeEngine()
+    engine.ctx = { sampleRate: 48000, decodeAudioData } as unknown as typeof engine.ctx
+    const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, {})
+    const reference = tools.find(tool => tool.name === 'analyze_reference_audio')!
+    const result = await reference.execute(
+      { audioBase64, name: 'sine.wav' }, { signal: new AbortController().signal }
+    ) as any
+
+    expect(decodeAudioData).toHaveBeenCalledTimes(1)
+    expect(result).toMatchObject({
+      source: 'base64-reference', name: 'sine.wav', mimeType: 'audio/wav',
+      decodedBytes: file.length, sampleRate: rate, channels: 1
+    })
+    // The header's own rate, read out of the encoded bytes by the real parser.
+    expect(result.sourceSampleRate).toBe(rate)
+    expect(result.duration).toBeCloseTo(0.25, 3)
+    // The tone survived encode, decode and analysis: it is measured as itself.
+    expect(result.metrics.pitch.f0Hz).toBeCloseTo(440, -1)
+    expect(result.metrics.peakDb).toBeGreaterThan(-8)
+    expect(result.metrics.peakDb).toBeLessThan(-4)
+    expect(JSON.stringify(result)).not.toContain(audioBase64)
   })
 
   it('strictly validates reference properties, name, MIME type, and non-empty Base64', async () => {
@@ -1887,7 +1956,7 @@ describe('offline rendering', () => {
     const { byName } = offlineSetup()
     const tool = byName.get('render_audio')!
     expect((tool.inputSchema as any).properties.mode.enum).toEqual(['offline', 'realtime'])
-    expect((tool.inputSchema as any).properties.format.enum).toEqual(['metrics', 'url', 'base64'])
+    expect((tool.inputSchema as any).properties.format.enum).toEqual(['metrics', 'url'])
     expect(tool.description).toMatch(/offline/i)
     expect(tool.description).not.toMatch(/CLICK TO START AUDIO/i)
     expect(byName.get('play_notes')!.description).toMatch(/CLICK TO START AUDIO/i)
@@ -2085,18 +2154,23 @@ describe('offline rendering', () => {
     expect(result.metrics.pitch.source).toBe('detected')
   })
 
-  it('returns a blob URL or an inline mono WAV on request', async () => {
+  it('returns a blob URL a human can click, and never the samples themselves', async () => {
     const { execute } = offlineSetup()
     const input = { notes: [{ midi: 60, velocity: 0.8, start: 0, duration: 0.5 }], duration: 1 }
     const url = await execute('render_audio', { ...input, format: 'url' })
     expect(url.url).toMatch(/^blob:/)
+    // A few dozen bytes, and the whole result stays small enough to read.
+    expect(JSON.stringify(url).length).toBeLessThan(4000)
     expect(url).not.toHaveProperty('audio')
 
-    const base64 = await execute('render_audio', { ...input, format: 'base64' })
-    expect(base64.audio).toMatchObject({ mimeType: 'audio/wav', channels: 1, sampleRate: 22050, truncated: false })
-    expect(base64.audio.duration).toBeCloseTo(1, 2)
-    expect(atob(base64.audio.base64).slice(0, 4)).toBe('RIFF')
-    expect(base64).not.toHaveProperty('url')
+    const metrics = await execute('render_audio', input)
+    expect(metrics).not.toHaveProperty('url')
+    expect(metrics).not.toHaveProperty('audio')
+
+    // 8 s of mono 22 kHz WAV was ~459 KB of Base64, ~134k tokens in one tool
+    // result, and no model on this transport could play a character of it.
+    await expect(execute('render_audio', { ...input, format: 'base64' }))
+      .rejects.toThrow('format must be one of metrics, url')
   })
 
   it('renders far faster than real time — a 15-second render returns without waiting 15 seconds', async () => {
@@ -2161,7 +2235,7 @@ describe('offline rendering', () => {
     const { execute } = offlineSetup()
     const notes = [{ midi: 60, velocity: 1, start: 0, duration: 0.1 }]
     await expect(execute('render_audio', { notes, mode: 'fast' })).rejects.toThrow(/mode must be one of offline, realtime/)
-    await expect(execute('render_audio', { notes, format: 'wav' })).rejects.toThrow(/format must be one of metrics, url, base64/)
+    await expect(execute('render_audio', { notes, format: 'wav' })).rejects.toThrow(/format must be one of metrics, url$/)
   })
 })
 
