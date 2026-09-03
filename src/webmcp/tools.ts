@@ -19,7 +19,7 @@ import {
 } from '../shared/preset-store'
 import { decodeBase64Audio, MAX_AUDIO_BASE64_CHARACTERS, normalizeAudioMimeType } from './audio-input'
 import { analyzeAudioAbortably } from './audio-analysis-task'
-import { BASE64_MAX_SECONDS, monoWavBase64, offlineRenderAvailable, renderOffline, type OfflineRenderer } from './offline-render'
+import { offlineRenderAvailable, renderOffline, type OfflineRenderer } from './offline-render'
 import { PerformanceManager, performNotes, assertNotesAvailable, validatePerformanceNotes } from '../history/performance'
 import type { ReplayStore } from '../history/replays'
 
@@ -547,9 +547,6 @@ function trackMatchProgress(
   }
 }
 
-/** How the Base64 preview became mono; travels with the payload it describes. */
-const DOWNMIX_NOTE = '"sum" is the plain channel average; "left"/"right" means that average cancelled and the louder channel was sent alone.'
-
 /** One modulation source as a single line: `keytrack voice -1..1`. */
 function compactSource(def: ModSourceDef): string {
   return `${def.id} ${def.perVoice ? 'voice' : 'global'} ${def.bipolar ? '-1..1' : '0..1'}`
@@ -562,7 +559,7 @@ function assertFormat(value: unknown): 'full' | 'compact' {
 }
 
 const RENDER_MODES = ['offline', 'realtime'] as const
-const RENDER_FORMATS = ['metrics', 'url', 'base64'] as const
+const RENDER_FORMATS = ['metrics', 'url'] as const
 type RenderMode = (typeof RENDER_MODES)[number]
 type RenderFormat = (typeof RENDER_FORMATS)[number]
 
@@ -784,22 +781,6 @@ const SIGNAL_POLL_SECONDS = 0.05
 
 const DEFAULT_CAPTURE_SECONDS = 3
 
-/**
- * The honest answer to "return actual audio content".
- *
- * A WebMCP tool result is a plain JSON value — `ModelContextTool.execute`
- * returns `MaybePromise<unknown>` and the browser serialises it. The API has no
- * content-block channel at all, so an MCP `audio` content block that a client
- * would auto-render is not expressible over this transport, by us or by anyone.
- * Base64 inside the JSON is the whole of what can be sent, exactly as
- * `render_audio({format:"base64"})` already sends it.
- */
-const AUDIO_TRANSPORT_NOTE =
-  'A WebMCP tool result is a JSON value: this API has no audio content block, so the WAV arrives as ' +
-  'Base64 here rather than as playable content your client renders on its own. Decode it if you can ' +
-  'listen; a text-only model gains nothing from the samples and should read `metrics`, which is this ' +
-  'very buffer already measured.'
-
 /** `f0Hz` as the analyzer takes it: a positive, finite frequency or nothing at all. */
 function assertF0Hz(value: unknown): number | undefined {
   if (value === undefined) return undefined
@@ -899,17 +880,6 @@ const METRICS_OMITTED_NOTE =
   'and BRIGHTNESS, so the arrays holding them are gone from reference.metrics and candidate.metrics. ' +
   '`comparison` is untouched and byte-identical in both modes, and still scores all of them. ' +
   'format: "json" returns everything, and is the mode in which candidate matches analyze_audio exactly.'
-
-const CAPTURE_FORMATS = ['metrics', 'base64'] as const
-type CaptureFormat = (typeof CAPTURE_FORMATS)[number]
-
-function assertCaptureFormat(value: unknown): CaptureFormat {
-  if (value === undefined) return 'metrics'
-  if (typeof value !== 'string' || !CAPTURE_FORMATS.includes(value as CaptureFormat)) {
-    throw new Error(`format must be one of ${CAPTURE_FORMATS.join(', ')}`)
-  }
-  return value as CaptureFormat
-}
 
 /** `setTimeout` that rejects the moment the composed signal aborts. */
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -2387,7 +2357,7 @@ export function createWebMcpTools(
           },
           format: {
             type: 'string', enum: [...RENDER_FORMATS],
-            description: `Payload beside the metrics: "metrics" (default), "url" (a page-local blob URL), or "base64" (mono 16-bit WAV an audio-capable agent can listen to, first ${BASE64_MAX_SECONDS} s; the returned \`audio\` object describes itself).`
+            description: 'Payload beside the metrics: "metrics" (default) or "url", a page-local blob URL of the rendered WAV a human can click to hear it. The URL costs a few dozen bytes; the samples themselves are never returned.'
           }
         },
         required: ['notes'], additionalProperties: false
@@ -2426,9 +2396,6 @@ export function createWebMcpTools(
             metrics,
             metricNotes: METRIC_NOTES,
             ...(format === 'url' ? { url: rendered.url } : {}),
-            ...(format === 'base64' ? {
-              audio: { ...monoWavBase64(recording.channelData, recording.sampleRate), downmixNote: DOWNMIX_NOTE }
-            } : {}),
             ...(rendered.renderModeFallback ? { renderModeFallback: rendered.renderModeFallback } : {}),
             ...(sequence.overlaps > 0 ? { retriggered: sequence.overlaps } : {})
           })
@@ -2554,7 +2521,7 @@ export function createWebMcpTools(
     },
     {
       name: 'capture_audio',
-      description: `Listen back to what just came out of this page: the last \`captureSeconds\` of LIVE output from a rolling ${RECENT_AUDIO_SECONDS} s buffer, with the usual metrics and optionally the samples as a Base64 WAV. The tool for "did you hear that?" — a note a human played is still here seconds after they let go, unlike analyze_audio's 21 ms \`scope\`. \`waitForSignal: true\` waits up to \`maxWaitSeconds\` for sound to start. Offline renders bypass the live graph, so render_audio's output never appears here.`,
+      description: `The one tool that WAITS for a human to play: \`waitForSignal: true\` blocks up to \`maxWaitSeconds\` for the live output to rise above ${SIGNAL_ONSET_DB} dBFS, then measures the \`captureSeconds\` that follow. Left off, it reads the rolling ${RECENT_AUDIO_SECONDS} s buffer and returns at once, as analyze_audio({source:"recent"}) does. A window nobody played into comes back as \`silent: true\`. Offline renders bypass the live graph, so render_audio's output never appears here.`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -2569,10 +2536,6 @@ export function createWebMcpTools(
           maxWaitSeconds: {
             type: 'number', exclusiveMinimum: 0, maximum: MAX_WAIT_SECONDS,
             description: `Wait budget, default ${DEFAULT_WAIT_SECONDS}, capped at ${MAX_WAIT_SECONDS}. Waiting in vain returns \`signalDetected: false\`, not an error.`
-          },
-          format: {
-            type: 'string', enum: [...CAPTURE_FORMATS],
-            description: 'Default "metrics". "base64" adds the window as a mono 16-bit WAV; read `audio.transportNote` first.'
           }
         },
         additionalProperties: false
@@ -2582,7 +2545,7 @@ export function createWebMcpTools(
       annotations: { readOnlyHint: true },
       async execute(input, options) {
         return runAbortable(invocationSignal(options), async operationSignal => {
-          const value = assertObject(input, 'input', ['captureSeconds', 'waitForSignal', 'maxWaitSeconds', 'format'])
+          const value = assertObject(input, 'input', ['captureSeconds', 'waitForSignal', 'maxWaitSeconds'])
           if (value.waitForSignal !== undefined && typeof value.waitForSignal !== 'boolean') {
             throw new Error('waitForSignal must be boolean')
           }
@@ -2602,7 +2565,6 @@ export function createWebMcpTools(
           if (waitRequested && (maxWaitSeconds <= 0 || maxWaitSeconds > MAX_WAIT_SECONDS)) {
             throw new Error(`maxWaitSeconds must be > 0 and limited to ${MAX_WAIT_SECONDS}`)
           }
-          const format = assertCaptureFormat(value.format)
 
           // Waiting for output from a graph that is not running would burn the
           // whole budget on a certainty. Said before the wait rather than after.
@@ -2633,9 +2595,6 @@ export function createWebMcpTools(
           }
 
           throwIfAborted(operationSignal)
-          // One read of the ring for both payloads, so the WAV an agent listens
-          // to is the very buffer `metrics` describes and not the window a few
-          // milliseconds later.
           const recent = requireRecentAudio(captureSeconds)
           const captured = await recentCandidate(recent, operationSignal)
           const silent = captured.metrics.peakDb <= SILENT_PEAK_DB
@@ -2651,13 +2610,6 @@ export function createWebMcpTools(
               silenceNote: signalDetected === false
                 ? `Nothing rose above ${SIGNAL_ONSET_DB} dBFS in ${waitedSeconds} s and the window is digital silence — nobody played. Ask the human to play, then call again, or use render_audio to hear the patch without them.`
                 : `This window is digital silence (peak below ${SILENT_PEAK_DB} dB): the live graph produced nothing in the last ${clean(captureSeconds)} s. Every metric below is measured on silence and describes nothing. Pass waitForSignal: true to wait for a human to play, or call render_audio to hear the patch yourself.`
-            } : {}),
-            ...(format === 'base64' ? {
-              audio: {
-                ...monoWavBase64(recent.channelData, recent.sampleRate),
-                downmixNote: DOWNMIX_NOTE,
-                transportNote: AUDIO_TRANSPORT_NOTE
-              }
             } : {})
           }
         })

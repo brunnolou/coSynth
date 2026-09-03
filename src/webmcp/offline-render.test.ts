@@ -5,10 +5,7 @@ import type { PerformanceNote } from '../history/types'
 import type { ToWorklet } from '../shared/messages'
 import { paramIndex, WAVETABLE_NAMES } from '../shared/params'
 import { NUM_MIPS, type Wavetable } from '../shared/wavetable-gen'
-import {
-  BASE64_MAX_SECONDS, BASE64_SAMPLE_RATE, encodeWav, monoWavBase64, offlineRenderAvailable, renderOffline,
-  WORKLET_LOAD_FAILURE, type MonoWavBase64
-} from './offline-render'
+import { encodeWav, offlineRenderAvailable, renderOffline, WORKLET_LOAD_FAILURE } from './offline-render'
 
 const SAMPLE_RATE = 48000
 /** The fake's envelope tail, so a note that ends still leaves an audible edge. */
@@ -884,85 +881,5 @@ describe('WAV encoding', () => {
     expect(wav.getUint32(40, true)).toBe(8)
     expect(wav.getInt16(44 + 2, true)).toBe(32767)
     expect(wav.getInt16(44 + 4, true)).toBe(-32767)
-  })
-
-  it('downmixes to mono 22.05 kHz base64 and caps the payload at eight seconds', () => {
-    const frames = 10 * SAMPLE_RATE
-    const left = Float32Array.from({ length: frames }, (_, index) => Math.sin(index / 50))
-    const encoded = monoWavBase64([left, left.slice()], SAMPLE_RATE)
-    expect(encoded.mimeType).toBe('audio/wav')
-    expect(encoded.channels).toBe(1)
-    expect(encoded.sampleRate).toBe(BASE64_SAMPLE_RATE)
-    expect(encoded.duration).toBeCloseTo(BASE64_MAX_SECONDS, 2)
-    expect(encoded.truncated).toBe(true)
-    expect(encoded.bytes).toBe(44 + Math.floor(BASE64_MAX_SECONDS * BASE64_SAMPLE_RATE) * 2)
-    expect(encoded.base64).toMatch(/^[A-Za-z0-9+/]+=*$/)
-    expect(atob(encoded.base64).slice(0, 4)).toBe('RIFF')
-
-    const short = monoWavBase64([left.subarray(0, SAMPLE_RATE)], SAMPLE_RATE)
-    expect(short.truncated).toBe(false)
-    expect(short.duration).toBeCloseTo(1, 2)
-  })
-
-  it('sends the louder channel when the mono sum cancels, and the plain sum otherwise', () => {
-    const tone = (hertz: number, gain = 1, phase = 0) => Float32Array.from(
-      { length: SAMPLE_RATE },
-      (_, index) => gain * Math.sin((2 * Math.PI * hertz * index) / SAMPLE_RATE + phase))
-    const level = (encoded: MonoWavBase64) => {
-      const bytes = atob(encoded.base64)
-      const view = new DataView(Uint8Array.from(bytes, character => character.charCodeAt(0)).buffer)
-      const frames = (view.byteLength - 44) / 2
-      let squares = 0
-      for (let index = 0; index < frames; index++) {
-        const sample = view.getInt16(44 + index * 2, true) / 32767
-        squares += sample * sample
-      }
-      return frames > 0 ? Math.sqrt(squares / frames) : 0
-    }
-
-    // Hard anti-phase: the analyzer's power downmix calls this loud, so a
-    // silent preview would contradict the metrics in the same response.
-    const antiphase = monoWavBase64([tone(1000), tone(1000, 1, Math.PI)], SAMPLE_RATE, 1)
-    expect(antiphase.downmix).toBe('left')
-    expect(level(antiphase), 'the agent hears the content, not the cancellation').toBeGreaterThan(0.5)
-
-    // The louder side wins, and it is named.
-    const quietLeft = monoWavBase64([tone(1000, 0.5), tone(1000, 1, Math.PI)], SAMPLE_RATE, 1)
-    expect(quietLeft.downmix).toBe('right')
-    expect(level(quietLeft)).toBeGreaterThan(0.5)
-
-    // Correlated stereo keeps the plain sum: nothing cancels.
-    const correlated = monoWavBase64([tone(1000), tone(1000)], SAMPLE_RATE, 1)
-    expect(correlated.downmix).toBe('sum')
-    expect(level(correlated)).toBeGreaterThan(0.5)
-
-    // So does ordinary wide stereo: two decorrelated channels lose 3 dB in any
-    // mono sum, which is the physics of mono, not a misleading artifact.
-    const wide = monoWavBase64([tone(1000), tone(1370)], SAMPLE_RATE, 1)
-    expect(wide.downmix, 'decorrelated is not cancelled').toBe('sum')
-
-    // Mono and silence have nothing to choose between.
-    expect(monoWavBase64([tone(1000)], SAMPLE_RATE, 1).downmix).toBe('sum')
-    expect(monoWavBase64([new Float32Array(SAMPLE_RATE), new Float32Array(SAMPLE_RATE)], SAMPLE_RATE, 1).downmix).toBe('sum')
-  })
-
-  it('attenuates content above the preview Nyquist instead of folding it back', () => {
-    const tone = (hertz: number) => Float32Array.from(
-      { length: SAMPLE_RATE }, (_, index) => Math.sin((2 * Math.PI * hertz * index) / SAMPLE_RATE))
-    const level = (samples: Float32Array) => {
-      let sum = 0
-      for (const sample of samples) sum += sample * sample
-      return Math.sqrt(sum / Math.max(1, samples.length))
-    }
-    const decoded = (source: Float32Array) => {
-      const bytes = atob(monoWavBase64([source], SAMPLE_RATE).base64)
-      const view = new DataView(Uint8Array.from(bytes, character => character.charCodeAt(0)).buffer)
-      const frames = (view.byteLength - 44) / 2
-      return Float32Array.from({ length: frames }, (_, index) => view.getInt16(44 + index * 2, true) / 32767)
-    }
-    // 20 kHz has no home below 11.025 kHz: it must be attenuated, not aliased down.
-    expect(level(decoded(tone(20000)))).toBeLessThan(0.4 * level(tone(20000)))
-    // A tone well inside the preview band survives.
-    expect(level(decoded(tone(1000)))).toBeGreaterThan(0.6 * level(tone(1000)))
   })
 })
