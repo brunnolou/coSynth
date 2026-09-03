@@ -35,6 +35,51 @@ export interface RecordedAudio {
   channelData: Float32Array[]
 }
 
+/**
+ * A window of the engine's rolling capture of live output. See
+ * `SynthEngine.recentAudio`.
+ */
+export interface RecentAudio {
+  /** Left and right, oldest sample first, ending at the newest sample captured. */
+  channelData: [Float32Array, Float32Array]
+  sampleRate: number
+  /** Seconds returned, i.e. `channelData[0].length / sampleRate`. */
+  duration: number
+  /** Seconds the ring currently holds. `duration` can never exceed it. */
+  heldSeconds: number
+  /** The ring has wrapped: anything older than `heldSeconds` is gone. */
+  full: boolean
+}
+
+/**
+ * How much live output the rolling capture keeps.
+ *
+ * The scope buffer the meters read is 1024 samples — about 21 ms — so anything
+ * measured on it describes a fragment of a note rather than a note: a human who
+ * plays a chord, releases, and asks "did you hear that?" is asking about audio
+ * that the scope threw away 40 frames ago. Four seconds is long enough to hold
+ * a played note whole, including the gap between the human releasing the key
+ * and an agent's tool call actually running, and it covers the 3 s capture the
+ * reviewer asked for with a second of slack.
+ *
+ * The cost is two Float32Arrays of `RECENT_AUDIO_FRAMES`: 1.5 MB, allocated once
+ * on the first scope frame and never again. That is an eighth of what a single
+ * 30 s stereo reference costs (`WebMcpSessionState.referencePcm`, ~11.5 MB), and
+ * an offline engine never pays it at all — it subscribes to no scope frames.
+ */
+export const RECENT_AUDIO_SECONDS = 4
+
+/**
+ * Ring capacity per channel, fixed at the 48 kHz figure rather than derived
+ * from the context: at 44.1 kHz the same ring simply holds 4.35 s, and a
+ * capacity that changed with the device would make the memory cost above a
+ * range instead of a number.
+ */
+const RECENT_AUDIO_FRAMES = RECENT_AUDIO_SECONDS * 48000
+
+/** Assumed rate for a ring read before `start()` has settled `ctx`. */
+const FALLBACK_SAMPLE_RATE = 48000
+
 export type NoteOwner = symbol
 
 /** Structured state is frozen; imported PCM buffers are shared and never mutated. */
@@ -144,6 +189,25 @@ export class SynthEngine {
   voiceCount = 0
   peakL = 0
   peakR = 0
+
+  /**
+   * The rolling capture, fed from the very same `scope` frames as `scopeL`/
+   * `scopeR` above rather than from a second tap. The worklet posts one
+   * contiguous, non-overlapping 1024-sample frame per 1024 rendered samples
+   * (`SCOPE_SIZE` is a whole number of 128-sample render quanta), and a
+   * MessagePort delivers in order, so writing every frame into a ring yields a
+   * gapless recording of everything the graph produced — not a series of
+   * snapshots with holes between them.
+   *
+   * Allocated lazily on the first frame: an engine that never starts, and every
+   * offline engine, pays nothing. Written with `set` from then on, so steady
+   * state allocates no buffers.
+   */
+  private recent: [Float32Array, Float32Array] | null = null
+  /** Next ring index to write, i.e. one past the newest sample. */
+  private recentWrite = 0
+  /** Frames held, capped at `RECENT_AUDIO_FRAMES` once the ring wraps. */
+  private recentFrames = 0
 
   /** The context the graph is running on; null until `start()` resolves. */
   ctx: BaseAudioContext | null = null
@@ -274,6 +338,11 @@ export class SynthEngine {
     const ctx = this.ctx
     this.node = null
     this.ctx = null
+    // The rolling capture is 1.5 MB of audio this graph produced; a released
+    // graph has no claim on it, and a restart refills it from its own output.
+    this.recent = null
+    this.recentWrite = 0
+    this.recentFrames = 0
     if (node) {
       // Every step is optional: a node may already be detached with its
       // context, and a test double's port is only as complete as that test
@@ -401,6 +470,7 @@ export class SynthEngine {
       case 'scope':
         this.scopeL = msg.left
         this.scopeR = msg.right
+        this.captureRecent(msg.left, msg.right)
         break
       case 'status':
         this.voiceCount = msg.voices
@@ -408,6 +478,65 @@ export class SynthEngine {
         this.peakR = msg.peakR
         this.sourceValues = msg.sources
         break
+    }
+  }
+
+  /** Append one scope frame to the ring, wrapping at the end. Allocates nothing. */
+  private captureRecent(left: Float32Array, right: Float32Array): void {
+    const ring = this.recent ??= [new Float32Array(RECENT_AUDIO_FRAMES), new Float32Array(RECENT_AUDIO_FRAMES)]
+    // Both channels are written to the same indices, so a short channel would
+    // otherwise leave the ring's two sides out of step with each other.
+    const frames = Math.min(left.length, right.length)
+    if (frames === 0) return
+    // Only a frame longer than the whole ring can lose anything, and only its
+    // head: what a rolling buffer holds is always the newest samples.
+    const from = Math.max(0, frames - RECENT_AUDIO_FRAMES)
+    const kept = frames - from
+    const head = Math.min(kept, RECENT_AUDIO_FRAMES - this.recentWrite)
+    const whole = from === 0 && head === kept
+    ring[0].set(whole ? left : left.subarray(from, from + head), this.recentWrite)
+    ring[1].set(whole ? right : right.subarray(from, from + head), this.recentWrite)
+    if (kept > head) {
+      ring[0].set(left.subarray(from + head, from + kept), 0)
+      ring[1].set(right.subarray(from + head, from + kept), 0)
+    }
+    this.recentWrite = (this.recentWrite + kept) % RECENT_AUDIO_FRAMES
+    this.recentFrames = Math.min(RECENT_AUDIO_FRAMES, this.recentFrames + kept)
+  }
+
+  /**
+   * The last `seconds` of live output, oldest sample first, or `null` when the
+   * graph has produced none — an engine before the Start gesture, or an offline
+   * one, which is subscribed to no scope frames at all.
+   *
+   * Unlike `scopeL`/`scopeR`, which hold the most recent 1024 samples and
+   * nothing else, this is real recent audio: long enough for `attackMs`,
+   * `decayT60Ms`, `envelopeDb` and a brightness trajectory to describe a note.
+   * The window is capped by what the ring holds, so asking for more than
+   * `RECENT_AUDIO_SECONDS` returns everything there is rather than padding.
+   */
+  recentAudio(seconds: number = RECENT_AUDIO_SECONDS): RecentAudio | null {
+    const ring = this.recent
+    if (!ring || this.recentFrames === 0) return null
+    const sampleRate = this.ctx?.sampleRate ?? FALLBACK_SAMPLE_RATE
+    const requested = Number.isFinite(seconds) && seconds > 0
+      ? Math.max(1, Math.round(seconds * sampleRate))
+      : this.recentFrames
+    const frames = Math.min(this.recentFrames, requested)
+    const start = (this.recentWrite - frames + RECENT_AUDIO_FRAMES) % RECENT_AUDIO_FRAMES
+    const head = Math.min(frames, RECENT_AUDIO_FRAMES - start)
+    const channelData = ring.map(channel => {
+      const out = new Float32Array(frames)
+      out.set(channel.subarray(start, start + head), 0)
+      if (frames > head) out.set(channel.subarray(0, frames - head), head)
+      return out
+    }) as [Float32Array, Float32Array]
+    return {
+      channelData,
+      sampleRate,
+      duration: frames / sampleRate,
+      heldSeconds: this.recentFrames / sampleRate,
+      full: this.recentFrames >= RECENT_AUDIO_FRAMES
     }
   }
 

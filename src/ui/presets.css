@@ -38,6 +38,17 @@
 }
 
 .preset-actions-menu > button:hover { background: var(--panel-2); }
+.preset-actions-menu > button:disabled { opacity: 0.45; cursor: not-allowed; }
+.preset-actions-menu > button:disabled:hover { background: transparent; }
+
+/* Unsaved-changes marker: the live patch no longer matches the loaded preset. */
+.presets .preset-dirty {
+  flex-shrink: 0;
+  margin-left: -2px;
+  color: var(--accent);
+  font-size: 10px;
+  line-height: 26px;
+}
 .presets :is(button, summary):focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;

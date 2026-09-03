@@ -15,6 +15,22 @@ export interface ParamDef {
   curve?: 'lin' | 'exp'  // knob/normalization mapping (exp requires min > 0)
   step?: number          // quantize raw value (1 = integer)
   choices?: string[]     // enumerated parameter (min/max ignored, 0..len-1)
+  /**
+   * What each `choices` entry does, keyed by the choice label, for the choices
+   * whose NAME does not say. A name is enough for `LP 12` or `1/8`; it is not
+   * enough for a wavetable, where the name carries no timbre at all and the
+   * only way to learn one is to render it and listen.
+   *
+   * Keyed rather than positional so a renderer can emit it verbatim and an
+   * agent can read it without zipping two arrays, and so that inserting a
+   * choice cannot silently shift every description by one.
+   *
+   * Deliberately NOT part of the compact line (`compactParameter`) or of the
+   * tool listing: this is the detail `get_parameter_schema`'s full format
+   * exists to hand over, paid by the one caller that asked about the parameter
+   * rather than by every agent on every discovery call.
+   */
+  choiceNotes?: Readonly<Record<string, string>>
   unit?: string
   moddable?: boolean
   fmt?: (v: number) => string
@@ -69,6 +85,68 @@ export const SYNC_DIVISION_ORDER = [
 ]
 export const WAVETABLE_NAMES = ['Basic Shapes', 'Harmonic Sweep', 'PWM', 'Vocal', 'FM Bell', 'Digital', 'Custom']
 
+/**
+ * What each `osc*.wavetable` choice actually sounds like, and what `osc*.morph`
+ * traverses inside it.
+ *
+ * These seven names are the parameter that decides the whole timbre, and a name
+ * carries none of it: an evaluated matching agent burned four render-and-compare
+ * rounds on tables that were all too dark before it happened to try `Digital`,
+ * the one table with a near-flat spectrum. That was luck, and this is the fix.
+ *
+ * Every number here is MEASURED, not asserted from the comments in
+ * `wavetable-gen.ts`: `params.test.ts` generates each table, reproduces
+ * `WavetableData.read()`'s frame interpolation at the quoted morph positions,
+ * FFTs the resulting cycle and checks the claim. A description that drifts from
+ * the DSP fails the suite.
+ *
+ * The vocabulary is deliberately the match diff's own (`audio-analysis.ts`):
+ * `tiltDbPerOctave` is a least-squares fit of partial level against log2(n) and
+ * `oddEvenDb` is mean(odd) - mean(even), BOTH over partials 1..12 only
+ * (`HARMONIC_COUNT`). So every tilt and odd/even figure below is over partials
+ * 1..12 as well, which makes them directly comparable to a diff line: an agent
+ * told "your odd/even is +9 dB too high" can read these and move toward the
+ * `Basic Shapes` saw frame, and one told "too dark" can read them and go
+ * straight to `Digital` instead of guessing four times.
+ */
+export const WAVETABLE_NOTES: Readonly<Record<string, string>> = {
+  'Basic Shapes':
+    'Morph lands exactly on four shapes: 0 sine (one partial), 1/3 triangle (odd only, -12 dB/oct), 2/3 saw (every partial, -6 dB/oct, odd/even +2 dB), 1 square (odd only, -6 dB/oct). Even partials fade in over 1/3..2/3 and back out by 1.',
+  'Harmonic Sweep':
+    'A 1/sqrt(k) series (-3 dB/oct, odd/even +1 dB) brick-walled at harmonic 2^(5*morph): 1 partial at morph 0, 2 at 0.2, 4 at 0.4, 8 at 0.6, 16 at 0.8, 32 at 1. Morph moves the cutoff, not the shape, and nothing exceeds harmonic 32.',
+  PWM:
+    'Pulse width 50% at morph 0 (exactly a square: odd only, -6 dB/oct) narrowing to 5% at morph 1, where partials 1..12 sit within 6 dB of each other (-1.5 dB/oct) and RMS is ~7 dB lower. Notches at every multiple of 1/width, moving down as morph rises.',
+  Vocal:
+    'Three resonances at fixed harmonic NUMBERS, so the formants transpose with the note instead of staying at fixed Hz. Nothing above harmonic 47 at all; odd/even stays within 3.2 dB. Morph 0 puts partial 6 about 19 dB ABOVE the fundamental (tilt +2.6); 0.5 is darkest (-14 dB/oct); 1 is -7.',
+  'FM Bell':
+    'Phase modulation, so partials arrive in gaps rather than as a series. Morph 0 is near-sine, odd only (3rd at -15 dB). Morph 1 keeps only k mod 5 = 1 or 4 (1, 4, 6, 9, 11, ...), with 9 and 11 as loud as the fundamental and every other partial silent. Widest around morph 0.7.',
+  Digital:
+    'Random hard-edged staircases, 15..31 equal steps per cycle, so partials at multiples of the step count drop out. The only near-flat table: tilt stays between -3.3 and +0.7 dB/oct over the whole morph and no partial 1..12 falls below -20 dB. Morph reshuffles which partials are loud, not brightness.',
+  Custom:
+    'Slot for a WAV imported through the browser UI; no tool can import one. With nothing imported the oscillator falls back to Digital, so selecting Custom from a tool changes the label and nothing else. An imported table brings its own frames, so morph means whatever that file means.'
+} as const
+
+/**
+ * `dist.type` does not pick a flavour of one algorithm, it picks between two
+ * branches that read DIFFERENT parameters (`worklet/voice.ts`): the three
+ * waveshapers use `dist.drive`, Bitcrush uses `dist.bits` and
+ * `dist.downsample` and reads `dist.drive` without ever applying it. An agent
+ * turning up Drive under Bitcrush is turning a knob that is wired to nothing,
+ * which is the sort of thing a schema should say out loud.
+ */
+export const DIST_TYPE_NOTES: Readonly<Record<string, string>> = {
+  'Soft Clip': 'tanh(x * (1 + 15*drive)), compensated by 1/sqrt(gain): rounded saturation, adds mostly odd partials, never a hard edge.',
+  'Hard Clip': 'Clamps at +-0.8 after the same 1 + 15*drive gain: flat-topped, a far brighter partial spray than Soft Clip at equal drive.',
+  Wavefold: 'sin(x * 1.5 * (1 + 15*drive)): past the first fold the transfer curve turns back on itself, so partials appear and vanish non-monotonically as drive rises.',
+  Bitcrush: 'Quantizes to 2^dist.bits levels and holds each sample dist.downsample times. dist.drive is read and then UNUSED on this branch; bits and downsample are ignored by the other three types.'
+} as const
+
+/** Parallel averages the two branches, which is a level change the label hides. */
+export const FILTER_ROUTING_NOTES: Readonly<Record<string, string>> = {
+  Series: 'filter1 feeds filter2; whichever one is enabled runs alone if the other is off.',
+  Parallel: 'Both filters take the same input and their outputs are averaged (x0.5), so an enabled pair lands ~6 dB below the same pair in Series. With one filter enabled this is identical to Series.'
+} as const
+
 /** Beats per cycle for a sync division: `n/d` is 4n/d beats, `.` dotted, `T` triplet. */
 export function divisionToBeats(divIndex: number): number {
   const name = SYNC_DIVISIONS[divIndex] ?? '1/4'
@@ -112,7 +190,7 @@ p({ id: 'master.bend_range', name: 'Bend Rng', group: 'global', min: 1, max: 48,
 for (let o = 1; o <= 3; o++) {
   const g = `osc${o}`
   p({ id: `${g}.enabled`, name: 'On', group: g, min: 0, max: 1, def: o === 1 ? 1 : 0, step: 1 })
-  p({ id: `${g}.wavetable`, name: 'Table', group: g, min: 0, max: WAVETABLE_NAMES.length - 1, def: 0, choices: WAVETABLE_NAMES })
+  p({ id: `${g}.wavetable`, name: 'Table', group: g, min: 0, max: WAVETABLE_NAMES.length - 1, def: 0, choices: WAVETABLE_NAMES, choiceNotes: WAVETABLE_NOTES })
   p({ id: `${g}.morph`, name: 'Morph', group: g, min: 0, max: 1, def: 0, moddable: true, fmt: pct })
   p({ id: `${g}.level`, name: 'Level', group: g, min: 0, max: 1, def: 0.7, moddable: true, fmt: pct })
   p({ id: `${g}.pan`, name: 'Pan', group: g, min: -1, max: 1, def: 0, moddable: true, fmt: v => (Math.abs(v) < 0.01 ? 'C' : v < 0 ? `${Math.round(-v * 100)}L` : `${Math.round(v * 100)}R`) })
@@ -153,11 +231,11 @@ for (let f = 1; f <= 2; f++) {
 }
 // Grouped as `filter` to match the id prefix: presets persist the id, never the
 // group, and a `filterRouting` group had agents filtering on a name no id carries.
-p({ id: 'filter.routing', name: 'Routing', group: 'filter', min: 0, max: 1, def: 0, choices: FILTER_ROUTINGS })
+p({ id: 'filter.routing', name: 'Routing', group: 'filter', min: 0, max: 1, def: 0, choices: FILTER_ROUTINGS, choiceNotes: FILTER_ROUTING_NOTES })
 
 // ---------------------------------------------------------------- distortion section (per-voice)
 p({ id: 'dist.enabled', name: 'On', group: 'dist', min: 0, max: 1, def: 0, step: 1 })
-p({ id: 'dist.type', name: 'Type', group: 'dist', min: 0, max: DIST_TYPES.length - 1, def: 0, choices: DIST_TYPES })
+p({ id: 'dist.type', name: 'Type', group: 'dist', min: 0, max: DIST_TYPES.length - 1, def: 0, choices: DIST_TYPES, choiceNotes: DIST_TYPE_NOTES })
 p({ id: 'dist.drive', name: 'Drive', group: 'dist', min: 0, max: 1, def: 0.3, moddable: true, fmt: pct })
 p({ id: 'dist.mix', name: 'Mix', group: 'dist', min: 0, max: 1, def: 1, moddable: true, fmt: pct })
 p({ id: 'dist.bits', name: 'Bits', group: 'dist', min: 1, max: 16, def: 8, moddable: true, fmt: v => `${v.toFixed(1)} bit` })
@@ -178,7 +256,27 @@ p({ id: 'dist.downsample', name: 'Rate', group: 'dist', min: 1, max: 64, def: 1,
  */
 const ENVELOPE_CURVE_NOTE = 'atk_curve, dec_curve, and rel_curve shape a stage, they do not lengthen it: 0 is linear. Positive atk_curve starts the attack slowly and rises steeply at its end; negative atk_curve jumps up and eases into the peak. dec_curve and rel_curve read the opposite way: positive falls fast and trails off into a long low tail (the usual exponential-sounding decay), negative holds near the level it started from and drops steeply only at the end of the stage - the default -0.4 is still at 96% of its starting level a quarter of the way through decay, which sounds like a delay before the decay rather than a slow one.'
 
+/**
+ * The other hardwired routing an agent cannot read off a parameter list: a
+ * `filter*.mix` of 0 is a full bypass of that filter AND of its drive, because
+ * `VoiceFilter.process` (`worklet/dsp.ts`) applies drive inside the wet path
+ * only - `dry * input + wet * filtered(tanh(input * driveGain))`. A patch left
+ * at mix 0.5 reads as "too bright" in a match diff no matter where the cutoff
+ * goes, and nothing in `mix 0..1 =1` says why.
+ *
+ * These land on `filter1` and `filter2`, not on `filter`, because an agent that
+ * filters the schema to one filter is exactly the one about to set its mix.
+ */
+const FILTER_MIX_NOTE = (g: string) => `${g}.mix is dry/wet against this filter's own input and ${g}.drive sits inside the wet path, so mix 0 bypasses both and mix 1 is fully filtered. Cutoff is multiplied by 2^((note - 60)/12 * ${g}.keytrack).`
+
 export const PARAM_GROUP_NOTES: Readonly<Record<string, string>> = {
+  filter1: FILTER_MIX_NOTE('filter1'),
+  filter2: FILTER_MIX_NOTE('filter2'),
+  // Chain position, which decides what the section even hears. `voice.ts` runs
+  // oscillators+sub+noise -> filters -> dist -> env1 (VCA), per voice, so dist
+  // shapes each note before the notes sum and before the amp envelope scales
+  // them; `fxdist` is the master-bus distortion that works on the sum.
+  dist: 'The dist section is PER VOICE and sits between the filters and the amp envelope, so it distorts each note on its own, before the voices sum and before env1 scales them; fxdist is the master-bus distortion. Which of its parameters do anything at all depends on dist.type.',
   env1: 'env1 is the amplitude envelope (VCA), hardwired to voice level and voice lifetime: a note stops sounding when env1 finishes its release. env2..env6 and lfo1..lfo8 have no hardwired destination and do nothing until routed with set_modulation. ' + ENVELOPE_CURVE_NOTE,
   ...Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`env${i + 2}`, ENVELOPE_CURVE_NOTE]))
 }

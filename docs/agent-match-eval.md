@@ -103,14 +103,31 @@ One extra rule specific to this eval:
 
 ## Runs
 
-| | run 1 | run 2 |
-|---|---|---|
-| Total calls / failed | 87 / 0 | 78 / 7 |
-| Comparisons | 27 | 20 |
-| Similarity, first -> best | 0.520 -> 0.847 | 0.513 -> 0.837 |
-| Comparisons spent after the peak | **13** | **3** |
-| Returned to the best patch | no | **yes**, via `navigate_history` restore |
-| Saved which patch | the final (0.819) | **the best** (`ref-match-best-0.8368`) |
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| Total calls / failed | 87 / 0 | 78 / 7 | **36 / 0** |
+| Comparisons | 27 | 20 | 16 |
+| Similarity, first -> best (10-term) | 0.520 -> 0.847 | 0.513 -> 0.837 | 0.505 -> 0.814 |
+| Similarity, first -> best (13-term) | n/a | n/a | 0.472 -> 0.800 |
+| Comparisons spent after the peak | **13** | **3** | **0** |
+| Returned to the best patch | no | **yes**, via `navigate_history` restore | n/a, never left it |
+| Saved which patch | the final (0.819) | **the best** (`ref-match-best-0.8368`) | **the best** (`agent-match-eval-best`) |
+
+Run 3 is the first on the analysis rewrite: detected reference pitch, harmonics
+on both sides, a signed per-dimension diff, and ranked moves in parameter ids.
+
+**Read the two similarity rows carefully; they are not the same scale.** Adding
+`harmonics`, `tilt` and `inharmonicity` to the score took the unweighted mean
+from 10 terms to 13, so run 3's raw figure is not comparable with runs 1 and 2.
+The 10-term row recomputes the old mean from that run's own `detailSimilarities`,
+which is what runs 1 and 2 measured. Only that row may be compared. Run 3's
+first comparison recomputes to 0.505 against 0.520 and 0.513, which is the
+evidence that the recomputation is sound rather than flattering.
+
+On the comparable scale run 3 peaked **lower** - 0.814 against 0.847 and 0.837 -
+in **less than half the calls**, with no failures and nothing spent past the
+peak. The gain is cost and reliability, not quality of match, and it should be
+reported that way.
 
 Both runs found the loop without the prompt naming a single tool, which is the
 thing this eval was built to check: the field evidence that started this work
@@ -149,19 +166,54 @@ failure.
 
 ## Results
 
-| | C r1 | X r1 |
-|---|---|---|
-| Reached `analyze_reference_audio` | | |
-| `compare_audio` calls | | |
-| Similarity trajectory | | |
-| Improved monotonically | | |
-| Best / final | | |
-| Edits between comparisons | | |
-| Total calls / failed | | |
-| What ended the run | | |
+| | C r3 |
+|---|---|
+| Reached `analyze_reference_audio` | yes, call 3 of 36 |
+| `compare_audio` calls | 16 |
+| Similarity trajectory (13-term) | 0.472 0.644 0.560 0.637 0.688 0.681 0.742 0.759 0.752 0.747 0.788 0.771 0.791 0.798 0.727 0.800 |
+| Improved monotonically | no - 5 of 12 edit rounds went backwards |
+| Best / final | 0.800 / 0.800 - finished on its best, after reverting a regression |
+| Edits between comparisons | not measured; see the probe bug below |
+| Total calls / failed | 36 / 0 |
+| What ended the run | the agent stopped, having reverted a 0.798 -> 0.727 regression and confirmed the recovery |
 
-C = Claude, X = Codex. No agent run yet — the rows below are the author's own
-hand-driven proof that the loop is physically possible, not an eval result.
+C = Claude, X = Codex. The `## Runs` table above carries runs 1 and 2, which
+predate this table; this one starts at run 3. The harness proof below is the
+author's own hand-driven check that the loop is physically possible, and is not
+an eval result.
+
+### What run 3 found
+
+The measurement layer held up; every defect was in the advice built on top of
+it, which is the part with no prior art in this codebase.
+
+- **The score rewards becoming unmeasurable.** A high shelf pushed the candidate
+  past the pitch detector, `PITCH` and `PARTIALS` both went `n/a`, and similarity
+  reached a new best of 0.688 - because a term that is null is excluded from the
+  mean, so losing a dimension the candidate was failing raises the average. The
+  agent named this as the number it trusted least, correctly.
+- **A silent window produced a real-looking brightness swing.** The final window
+  sat near -55 dB with every harmonic on the -120 floor, and its centroid read
+  4,978 Hz. That fake +4.9-octave swing is what pushed an `env2.decay` move to
+  rank 1.
+- **A ranked action recommended an envelope that was not routed.** `env2` reaches
+  the sound only through a mod slot, the patch had none, and the rule hedged in
+  prose instead of reading the matrix the app already has.
+- **`editsBetweenComparisons` read all zeros** across 15 successful `apply_patch`
+  calls: the probe counted `update_parameters` only, so a tool added after it was
+  written made the run look like it changed nothing.
+- **A degenerate `env1.sustain 0.0 -> 0.0` was printed as a ranked move.**
+- **Resolution falls between the two spectral views.** Partials stop at n=12,
+  which is 444 Hz on a 37 Hz fundamental, and the bands are octave-wide. The
+  1-2 kHz region carrying this sound's centroid is described by neither, and the
+  agent fought a deficit there for the whole back half without closing it.
+
+One result worth keeping. The agent declined the rank-1 `env2.decay` move in six
+consecutive comparisons, reasoning that it would darken a sound already too dark,
+then ran it as an isolated experiment to settle the argument: **0.742 -> 0.759**.
+Its own reasoning was about brightness *level*; the action was about the
+brightness *curve*. That distinction is the reason per-window brightness exists,
+and the ranked action was right where the model was wrong.
 
 ### Harness proof (author-driven, not an eval run)
 

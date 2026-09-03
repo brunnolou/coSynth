@@ -33,7 +33,8 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   const header = el('header')
   guideTarget(header, 'panel.header', 'Main toolbar', 'panel')
   header.appendChild(el('div', 'logo brand-logo', 'coSynth'))
-  header.appendChild(new PresetBrowser(engine).root)
+  const presetBrowser = new PresetBrowser(engine)
+  header.appendChild(presetBrowser.root)
   const hdrRight = el('div', 'hdr-right')
   hdrRight.appendChild(new Knob(engine, paramIndex('master.volume'), 40).root)
   hdrRight.appendChild(new Knob(engine, paramIndex('master.bpm'), 40).root)
@@ -369,6 +370,7 @@ export function buildApp(engine: SynthEngine, container: HTMLElement, services: 
   return () => {
     cancelKnobDrag(container.ownerDocument)
     cancelAnimationFrame(frame)
+    presetBrowser.dispose()
     highlights.dispose()
     agentActivity.dispose()
     keyboard.dispose()

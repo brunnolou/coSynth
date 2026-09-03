@@ -1,6 +1,7 @@
 // On-screen keyboard (pointer + computer-keyboard input) with octave shift.
 
 import type { SynthEngine } from '../audio/engine'
+import { noteName } from '../shared/notes'
 import { el } from './common'
 import { guideTarget } from './guide-target'
 import { isTextEditing } from './history-bindings'
@@ -13,8 +14,6 @@ const KEYMAP: Record<string, number> = {
 
 const WHITE_OFFSETS = [0, 2, 4, 5, 7, 9, 11]
 const KEYMAP_SPAN = Math.max(...Object.values(KEYMAP))
-const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-const noteName = (note: number) => `${NOTE_NAMES[note % 12]}${Math.floor(note / 12) - 1}`
 
 /** Selectable widths of the drawn keyboard, in octaves. */
 const OCTAVE_CHOICES = [1, 2, 3, 4, 5, 6, 7]

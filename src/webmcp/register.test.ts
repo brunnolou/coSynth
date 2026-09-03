@@ -1,9 +1,30 @@
 import { describe, expect, it, vi } from 'vitest'
 import { registerWebMcpTools } from './register'
 import { agentActivityFor } from './activity'
+import { createWebMcpTools } from './tools'
+import { createGuideTools, type GuideService } from './guide-tools'
 import { SynthEngine } from '../audio/engine'
 
 const engine = new SynthEngine()
+
+/**
+ * The tool set as the real factory builds it, and the only place this file says
+ * how big it is.
+ *
+ * The literal list used to be typed out here as well as in `tools.test.ts` and
+ * `announce.ts`, and it drifted on every addition - these assertions were still
+ * asserting 15 after `capture_audio` made it 16. What
+ * belongs here is that `registerWebMcpTools` registers each tool once, in the
+ * factory's order, with one shared signal; which names those are is pinned in
+ * `tools.test.ts` (workflow order) and `announce.test.ts` (exact set equality
+ * against every factory).
+ */
+const SYNTH_TOOL_NAMES = createWebMcpTools(engine, new AbortController().signal).map(tool => tool.name)
+const SYNTH_TOOL_COUNT = SYNTH_TOOL_NAMES.length
+const GUIDE_TOOL_COUNT = createGuideTools(
+  { show: vi.fn(), listTargets: vi.fn() } as unknown as GuideService,
+  new AbortController().signal
+).length
 
 function context(registerTool: (tool: WebMCP.ModelContextTool, options?: WebMCP.ModelContextRegisterToolOptions) => Promise<void> | void) {
   return { registerTool } as unknown as WebMCP.ModelContext
@@ -20,7 +41,7 @@ describe('registerWebMcpTools', () => {
     expect(registration.errors).toEqual([])
   })
 
-  it('registers each of the twelve tools exactly once with a shared lifecycle signal', async () => {
+  it('registers each synth tool exactly once, in factory order, with a shared lifecycle signal', async () => {
     const calls: Array<{ tool: WebMCP.ModelContextTool; signal?: AbortSignal }> = []
     const modelContext = context((tool, options) => {
       calls.push({ tool, signal: options?.signal })
@@ -30,14 +51,10 @@ describe('registerWebMcpTools', () => {
     const registration = registerWebMcpTools(engine, modelContext)
     await registration.ready
 
-    expect(calls.map(({ tool }) => tool.name)).toEqual([
-      'get_synth_state', 'get_parameter_schema', 'update_parameters',
-      'set_modulation', 'play_notes', 'render_audio', 'analyze_audio',
-      'analyze_reference_audio', 'compare_audio', 'save_preset', 'load_preset', 'list_presets'
-    ])
+    expect(calls.map(({ tool }) => tool.name)).toEqual(SYNTH_TOOL_NAMES)
     expect(new Set(calls.map(call => call.signal)).size).toBe(1)
     expect(calls[0].signal?.aborted).toBe(false)
-    expect(registration.registeredCount).toBe(12)
+    expect(registration.registeredCount).toBe(SYNTH_TOOL_COUNT)
     registration.dispose()
     expect(calls[0].signal?.aborted).toBe(true)
   })
@@ -52,7 +69,7 @@ describe('registerWebMcpTools', () => {
     await registerWebMcpTools(engine, context(tool => { names.push(tool.name) }), { audioTools: 'exclude' }).ready
     expect(names).toContain('play_notes')
     expect(names).toContain('render_audio')
-    expect(names).toHaveLength(12)
+    expect(names).toHaveLength(SYNTH_TOOL_COUNT)
   })
 
   it('returns actionable expected errors while preserving cancellation semantics', async () => {
@@ -85,14 +102,14 @@ describe('registerWebMcpTools', () => {
 
     const registration = registerWebMcpTools(engine, modelContext)
     await expect(registration.ready).resolves.toBeUndefined()
-    expect(registration.registeredCount).toBe(10)
+    expect(registration.registeredCount).toBe(SYNTH_TOOL_COUNT - 2)
     expect(registration.available).toBe(true)
     expect(registration.pending).toBe(false)
     expect(registration.errors).toEqual(expect.arrayContaining([
       { tool: 'get_parameter_schema', message: 'sync failure' },
       { tool: 'set_modulation', message: 'async failure' }
     ]))
-    expect(attempted).toHaveLength(12)
+    expect(attempted).toHaveLength(SYNTH_TOOL_COUNT)
     expect(warn).toHaveBeenCalledTimes(2)
     warn.mockRestore()
   })
@@ -103,7 +120,7 @@ describe('registerWebMcpTools', () => {
     const guide = { show: vi.fn(() => ({ shown: true, stepCount: 1, warnings: [] })), listTargets: vi.fn(() => ({ items: [], total: 0, offset: 0, limit: 5 })) }
     const registration = registerWebMcpTools(engine, context(tool => { calls.push(tool) }), { guide })
     await registration.ready
-    expect(registration.registeredCount).toBe(14)
+    expect(registration.registeredCount).toBe(SYNTH_TOOL_COUNT + GUIDE_TOOL_COUNT)
     const show = calls.find(t => t.name === 'show_ui_guide')!
     const get = calls.find(t => t.name === 'get_ui_targets')!
     expect(show.annotations?.readOnlyHint).toBe(false)

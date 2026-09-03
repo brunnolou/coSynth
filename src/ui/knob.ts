@@ -8,7 +8,7 @@ import { PARAMS, formatValue, defaultNorm } from '../shared/params'
 import { MOD_SOURCES } from '../shared/messages'
 import type { SynthEngine } from '../audio/engine'
 import { ACCENT_COLOR, colorWithAlpha, el, sourceColor, clamp01, showPopup, closePopup } from './common'
-import { guideTarget } from './guide-target'
+import { guideTarget, paramGuideId, paramGuideLabel } from './guide-target'
 import { startKnobDrag } from './knob-drag'
 import { knobWheelValue, snapKnobValue } from './knob-value'
 
@@ -33,7 +33,7 @@ export class Knob {
   ) {
     const def = PARAMS[paramIndex]
     this.root = el('div', 'knob')
-    guideTarget(this.root, `param.${def.id}`, `${def.group} ${def.name}`, 'knob')
+    guideTarget(this.root, paramGuideId(def.id), paramGuideLabel(def), 'knob')
     const canvasStack = el('div', 'knob-canvases')
     canvasStack.style.width = `${size}px`
     canvasStack.style.height = `${size}px`

@@ -33,7 +33,13 @@ function registeredTool(tool: WebMCP.ModelContextTool, activity: AgentActivitySt
     async execute(input, options) {
       const actionId = activity.startAction(tool.name)
       try {
-        const changesSound = ['update_parameters', 'set_modulation', 'load_preset'].includes(tool.name)
+        // Every tool here writes the patch synchronously before its first `await`,
+        // which `runAi` requires: it is a synchronous transaction and closes as soon
+        // as the callback returns, so a tool that awaited before writing would have
+        // its edits recorded one history version at a time, attributed to the human.
+        // `apply_patch` is async for its optional audition render and keeps every
+        // engine write above that await for exactly this reason.
+        const changesSound = ['update_parameters', 'set_modulation', 'set_fx_order', 'apply_patch', 'load_preset'].includes(tool.name)
         const result = await (changesSound && services
           ? services.history.runAi(tool.name.replaceAll('_', ' '), () => execute(input, options))
           : execute(input, options))

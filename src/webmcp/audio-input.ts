@@ -3,10 +3,46 @@ export const MAX_REFERENCE_AUDIO_SECONDS = 30
 export const MAX_REFERENCE_CHANNELS = 2
 export const MAX_REFERENCE_PCM_SAMPLES = 6_000_000
 
+/**
+ * The rate a decode-only `AudioContext` is built at when the engine has none of
+ * its own. Deliberately explicit rather than whatever the output device runs at.
+ *
+ * `decodeAudioData` resamples to the rate of the context it is called on and
+ * reports nothing about having done so, so a decode context that follows the
+ * output device silently rewrites the reference. Playwright's bundled Chromium
+ * reports a **16 kHz** device rate — measured, headless and headed alike, and
+ * unchanged by every audio launch flag tried (`--use-fake-device-for-media-stream`,
+ * `--audio-output-channels`, `--disable-features=AudioServiceOutOfProcess`,
+ * `--alsa-output-device`). At 16 kHz a 44.1 kHz reference loses everything above
+ * 8 kHz: its top octave band drops to the -100 dB floor and the 8 kHz band below
+ * it loses half its span, while the candidate — rendered by `renderOffline` at
+ * *its* fallback rate — reads real energy in both. Measured on the shipped
+ * reference: -23.3 dB in the 16 kHz band at 48 kHz, -100 dB at 16 kHz, for a
+ * phantom +75.1 dB error a live eval spent a comparison failing to close.
+ *
+ * 48000 is not a free choice: it is `DEFAULT_SAMPLE_RATE` in `offline-render.ts`,
+ * the rate a render falls back to in exactly the same "no engine context" case.
+ * The two fallbacks have to name the same number or the reference and the
+ * candidate are measured on different frequency axes.
+ */
+export const REFERENCE_DECODE_SAMPLE_RATE = 48000
+
 export interface ParsedBase64Audio {
   bytes: Uint8Array
   decodedBytes: number
   mimeType?: string
+  /**
+   * The rate written in the file's own header, when the container states one.
+   * Absent for containers this module does not read (only RIFF/WAVE is parsed)
+   * and for headers too short to hold a rate.
+   *
+   * Kept separate from the decoded rate because `decodeAudioData` resamples to
+   * its context's rate silently. The two together are what lets a caller say
+   * "your 44.1 kHz reference was analysed at 16 kHz, so every band above 8 kHz
+   * reads empty for reasons that have nothing to do with the patch" instead of
+   * presenting that emptiness as a gap to close.
+   */
+  sourceSampleRate?: number
 }
 
 export interface DecodedBase64Audio extends Omit<ParsedBase64Audio, 'bytes'> {
@@ -50,7 +86,50 @@ function throwIfAborted(signal?: AbortSignal): void {
 
 function defaultContext(): AudioDecodeContext {
   if (typeof AudioContext === 'undefined') throw new Error('AudioContext is unavailable for reference audio decoding')
-  return new AudioContext()
+  try {
+    return new AudioContext({ sampleRate: REFERENCE_DECODE_SAMPLE_RATE })
+  } catch {
+    // A browser may refuse a rate its hardware cannot run — Safari has. A
+    // device-rate context still decodes; it may just resample, and
+    // `sourceSampleRate` is what makes that visible rather than silent.
+    return new AudioContext()
+  }
+}
+
+/** RIFF magic, total size, and the `WAVE` form type: the bytes before the first chunk. */
+const RIFF_HEADER_BYTES = 12
+/** `audioFormat` u16, `numChannels` u16, `sampleRate` u32, and four more fields. */
+const WAV_FMT_MINIMUM_BYTES = 16
+
+/**
+ * The sample rate declared by a RIFF/WAVE `fmt ` chunk, or undefined for any
+ * other container and for a header too truncated or malformed to hold one.
+ *
+ * Header-only: it never touches the audio data, and it never throws — an
+ * unreadable header is simply an unknown rate, not a decode failure.
+ */
+function readWavSampleRate(bytes: Uint8Array): number | undefined {
+  if (bytes.byteLength < RIFF_HEADER_BYTES) return undefined
+  const fourCc = (at: number) =>
+    String.fromCharCode(bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3])
+  if (fourCc(0) !== 'RIFF' || fourCc(8) !== 'WAVE') return undefined
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  let at = RIFF_HEADER_BYTES
+  while (at + 8 <= bytes.byteLength) {
+    const size = view.getUint32(at + 4, true)
+    if (fourCc(at) === 'fmt ') {
+      if (size < WAV_FMT_MINIMUM_BYTES || at + 8 + WAV_FMT_MINIMUM_BYTES > bytes.byteLength) return undefined
+      const rate = view.getUint32(at + 12, true)
+      return rate > 0 ? rate : undefined
+    }
+    // Chunks are word-aligned. A zero-size chunk cannot be walked past, so a
+    // header claiming one is malformed rather than something to keep scanning.
+    const advance = 8 + size + (size % 2)
+    if (advance <= 8) return undefined
+    at += advance
+  }
+  return undefined
 }
 
 function decodeAudioDataAbortably(
@@ -116,7 +195,13 @@ export function parseBase64Audio(audioBase64: string, signal?: AbortSignal): Par
   const bytes = new Uint8Array(binary.length)
   for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index)
   throwIfAborted(signal)
-  return { bytes, decodedBytes: bytes.byteLength, ...(mimeType ? { mimeType } : {}) }
+  const sourceSampleRate = readWavSampleRate(bytes)
+  return {
+    bytes,
+    decodedBytes: bytes.byteLength,
+    ...(mimeType ? { mimeType } : {}),
+    ...(sourceSampleRate ? { sourceSampleRate } : {})
+  }
 }
 
 export async function decodeBase64Audio(
@@ -183,6 +268,7 @@ export async function decodeBase64Audio(
     return {
       decodedBytes: parsed.decodedBytes,
       ...(parsed.mimeType ? { mimeType: parsed.mimeType } : {}),
+      ...(parsed.sourceSampleRate ? { sourceSampleRate: parsed.sourceSampleRate } : {}),
       sampleRate: decoded.sampleRate,
       duration: derivedDuration,
       channels: decoded.numberOfChannels,

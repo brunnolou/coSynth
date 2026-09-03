@@ -4,7 +4,7 @@ import { PARAMS, paramIndex, normToValue, valueToNorm } from '../shared/params'
 import type { SynthEngine } from '../audio/engine'
 import { el } from './common'
 import { Knob } from './knob'
-import { guideTarget } from './guide-target'
+import { guideTarget, paramGuideId, paramGuideLabel } from './guide-target'
 
 export interface ParamSelectOptions {
   choiceLabels?: readonly string[]
@@ -19,7 +19,7 @@ export function paramSelect(engine: SynthEngine, id: string, options: ParamSelec
   const def = PARAMS[index]
   const choices = def.choices ?? []
   const sel = el('select', 'param-select') as HTMLSelectElement
-  guideTarget(sel, `param.${id}`, `${def.group} ${def.name}`, 'select')
+  guideTarget(sel, paramGuideId(id), paramGuideLabel(def), 'select')
   const order = options.choiceOrder ?? choices.map((_, i) => i)
   order.forEach(i => {
     const c = choices[i]
@@ -52,7 +52,7 @@ export function paramSelect(engine: SynthEngine, id: string, options: ParamSelec
 export function paramToggle(engine: SynthEngine, id: string, label = 'ON'): HTMLButtonElement {
   const index = paramIndex(id)
   const b = el('button', 'toggle', label) as HTMLButtonElement
-  guideTarget(b, `param.${id}`, `${PARAMS[index].group} ${PARAMS[index].name}`, 'button')
+  guideTarget(b, paramGuideId(id), paramGuideLabel(PARAMS[index]), 'button')
   const sync = () => b.classList.toggle('on', engine.getParam(index) >= 0.5)
   sync()
   b.addEventListener('click', () => {

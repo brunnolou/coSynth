@@ -680,14 +680,22 @@ describe('renderOffline worklet barrier and silence guard', () => {
         },
         // Deliberately generous, and deliberately not overriding the mid-render
         // budget: the point is that the four unanswered suspensions do NOT get
-        // to spend this.
-        syncTimeoutMs: 600
+        // to spend this. It is far larger than any plausible jsdom overhead so
+        // the two outcomes cannot be confused by a slow runner.
+        syncTimeoutMs: 5000
       }
     )
     const elapsed = Date.now() - started
     expect(context!.suspendTimes.length, 'four scheduled events, four suspensions').toBe(4)
+    // Four unanswered barriers on the 50 ms mid-render budget is ~200 ms of
+    // deliberate waiting; the rest is whatever jsdom's timers cost that day,
+    // which under the parallel suite ran to several hundred milliseconds and
+    // made a 300 ms ceiling flap. The claim is about the BUDGET, so the two
+    // outcomes are separated by an order of magnitude instead of by a margin:
+    // one barrier charged to the pre-render budget would take 5 s here, and
+    // four would take 20 s.
     expect(elapsed, `a stalled mid-render barrier must not cost the pre-render budget (took ${elapsed}ms)`)
-      .toBeLessThan(300)
+      .toBeLessThan(1500)
     // Giving up is not skipping: the render finished and the events are in it.
     expect(context!.rendered).toBe(true)
     expect(messages.filter(message => message.type === 'noteOn').map(message => message.note)).toEqual([60, 64])

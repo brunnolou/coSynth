@@ -21,8 +21,10 @@
     "webmcp-types": "^0.1.5"
   },
   "dependencies": {
+    "@audio/pitch-yin": "^1.0.5",
     "driver.js": "^1.8.0",
     "lucide": "^1.37.0",
-    "micromark": "^4.0.2"
+    "micromark": "^4.0.2",
+    "pitchy": "^4.1.0"
   }
 }

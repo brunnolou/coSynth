@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { SynthEngine } from './engine'
+import { RECENT_AUDIO_SECONDS, SynthEngine } from './engine'
 import { paramIndex } from '../shared/params'
 import type { ToWorklet } from '../shared/messages'
 
@@ -156,5 +156,121 @@ describe('SynthEngine context injection', () => {
 
     expect(offline.messages).toEqual(liveMessages)
     expect(offline.messages.length).toBeGreaterThan(0)
+    // Two full engines, and `start()` plus `loadPreset` builds every oscillator's
+    // wavetable and its mip pyramid on each of them, twice over — then
+    // `structuredClone` copies those buffers into the message log. It is a
+    // couple of seconds of pure CPU on an idle machine and comfortably past the
+    // 5 s default on a busy one, which is why it fails under a parallel run and
+    // passes on its own. Nothing here is asynchronous or waiting on a timer, so
+    // a generous ceiling costs nothing and removes a flake that is really just
+    // an under-provisioned budget.
+  }, 30000)
+})
+
+describe('SynthEngine rolling capture', () => {
+  const SCOPE_SIZE = 1024
+  const SAMPLE_RATE = 48000
+  const CAPACITY = RECENT_AUDIO_SECONDS * SAMPLE_RATE
+
+  /** A live engine with its worklet port in hand, ready to be fed scope frames. */
+  async function liveEngine() {
+    const { ports } = stubWorkletNode()
+    vi.stubGlobal('AudioContext', class {
+      constructor() { return fakeLiveContext() as unknown as AudioContext }
+    })
+    const engine = new SynthEngine()
+    await engine.start()
+    // Every sample carries its own index, so a gap or a reordering in the ring
+    // shows up as an arithmetic error rather than as a plausible waveform.
+    let written = 0
+    const post = (frames = 1) => {
+      for (let frame = 0; frame < frames; frame++) {
+        const left = Float32Array.from({ length: SCOPE_SIZE }, (_, index) => written + index)
+        const right = Float32Array.from({ length: SCOPE_SIZE }, (_, index) => -(written + index))
+        written += SCOPE_SIZE
+        ;(ports[0].onmessage as (event: { data: unknown }) => void)({ data: { type: 'scope', left, right } })
+      }
+    }
+    return { engine, post, total: () => written }
+  }
+
+  it('holds nothing until the graph has produced output', async () => {
+    const { engine } = await liveEngine()
+    expect(engine.recentAudio()).toBeNull()
+  })
+
+  it('keeps the live output gapless, oldest sample first, from the very frames the meters read', async () => {
+    const { engine, post, total } = await liveEngine()
+    post(10)
+
+    const recent = engine.recentAudio()!
+    expect(recent.sampleRate).toBe(SAMPLE_RATE)
+    expect(recent.channelData[0]).toHaveLength(total())
+    expect(recent.duration).toBeCloseTo(total() / SAMPLE_RATE, 6)
+    expect(recent.full).toBe(false)
+    // The worklet posts one contiguous 1024-sample frame per 1024 rendered
+    // samples, so the ring is a recording rather than a series of snapshots:
+    // sample k is exactly k, across every frame boundary.
+    for (let index = 0; index < total(); index += 337) {
+      expect(recent.channelData[0][index]).toBe(index)
+      expect(recent.channelData[1][index]).toBe(-index)
+    }
+    // The scope itself still holds only the newest frame — the 21 ms that made
+    // `analyze_audio({source:"scope"})` report silence for a note just played.
+    expect(engine.scopeL).toHaveLength(SCOPE_SIZE)
+    expect(engine.scopeL[0]).toBe(total() - SCOPE_SIZE)
+  })
+
+  it('returns the newest window when asked for less than it holds', async () => {
+    const { engine, post, total } = await liveEngine()
+    post(20)
+
+    const window = engine.recentAudio(0.1)!
+    const frames = Math.round(0.1 * SAMPLE_RATE)
+    expect(window.channelData[0]).toHaveLength(frames)
+    expect(window.channelData[0][0]).toBe(total() - frames)
+    expect(window.channelData[0].at(-1)).toBe(total() - 1)
+    expect(window.heldSeconds).toBeCloseTo(total() / SAMPLE_RATE, 6)
+  })
+
+  it('wraps without a seam and then holds exactly the buffer length', async () => {
+    const { engine, post, total } = await liveEngine()
+    // 192000 frames of capacity is not a whole number of 1024-sample frames, so
+    // going past it forces the split write this test exists to cover.
+    post(Math.ceil(CAPACITY / SCOPE_SIZE) + 3)
+    expect(total()).toBeGreaterThan(CAPACITY)
+
+    const recent = engine.recentAudio()!
+    expect(recent.full).toBe(true)
+    expect(recent.heldSeconds).toBe(RECENT_AUDIO_SECONDS)
+    expect(recent.channelData[0]).toHaveLength(CAPACITY)
+    // Still one unbroken run ending at the newest sample: the wrap moved where
+    // the samples live, not what order they come back in.
+    const first = total() - CAPACITY
+    for (let index = 0; index < CAPACITY; index += 4099) {
+      expect(recent.channelData[0][index]).toBe(first + index)
+    }
+    expect(recent.channelData[0].at(-1)).toBe(total() - 1)
+
+    // Asking for more than the buffer holds returns the buffer, never padding.
+    expect(engine.recentAudio(RECENT_AUDIO_SECONDS * 4)!.channelData[0]).toHaveLength(CAPACITY)
+  })
+
+  it('releases the buffer with the graph', async () => {
+    const { engine, post } = await liveEngine()
+    post(4)
+    expect(engine.recentAudio()).not.toBeNull()
+
+    engine.dispose()
+    // 1.5 MB of audio a released graph has no claim on, and a restart refills
+    // it from its own output rather than replaying the previous session's.
+    expect(engine.recentAudio()).toBeNull()
+  })
+
+  it('costs an offline engine nothing, because it subscribes to no scope frames', async () => {
+    stubWorkletNode()
+    const engine = new SynthEngine({ context: fakeOfflineContext() as unknown as BaseAudioContext })
+    await engine.start()
+    expect(engine.recentAudio()).toBeNull()
   })
 })

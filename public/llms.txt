@@ -45,10 +45,19 @@ JavaScript. This file exists so that fact does not leave you with nothing.
 ## What you can do
 
 - **Discover** — `get_parameter_schema`, `get_synth_state`, `list_presets`,
-  `get_ui_targets`
+  `get_ui_targets`. `get_synth_state` also carries `patch.preset`
+  (`{name, source, dirty}`), which is how you tell whether the patch has been
+  edited since the preset it came from — ask it before deciding to save.
 - **Change the sound** — `update_parameters` (atomic batches, raw units or
-  choice labels), `set_modulation` (32-slot matrix), `load_preset`,
+  choice labels), `set_modulation` (32-slot matrix), `set_fx_order` (the effect
+  chain, as a full permutation), `apply_patch` (all of those plus a preset save
+  and an audition render as one validated transaction, with `dryRun` and a
+  rollback handle), `load_preset`,
   `save_preset`
+- **Keep or hand over a patch** — `delete_preset` removes one user preset
+  (factory patches are compiled into the page and are refused, with the reason);
+  `export_preset` serializes a patch as the JSON an import takes back, live or
+  stored, and loads nothing while doing it
 - **Hear and measure it** — `render_audio` renders offline by default: faster
   than real time, no user gesture needed, and it returns metrics describing
   envelope, level, spectrum and harmonic structure, so an agent with no ears can
@@ -56,6 +65,25 @@ JavaScript. This file exists so that fact does not leave you with nothing.
 - **Play it live** — `play_notes` needs a human to click "CLICK TO START AUDIO"
   first, because browser autoplay policy requires a gesture. Offline rendering
   does not.
+- **Hear what the human just played** — live output is kept in a rolling
+  four-second buffer. `capture_audio` returns the last few seconds of it with
+  metrics, and optionally the samples as a Base64 WAV;
+  `analyze_audio({"source": "recent"})` analyzes the same buffer. Do not reach
+  for `analyze_audio({"source": "scope"})` here: it holds about 21 ms, so a note
+  that has ended reads as silence, and that is the wrong buffer rather than a
+  silent page. Offline renders bypass the live graph and never appear in it.
+- **Match a reference sound** — the loop is `analyze_reference_audio` →
+  `compare_audio` → `update_parameters`, repeated. Send the target as Base64 to
+  `analyze_reference_audio`, which analyzes it with the same metrics as synth
+  output and detects its pitch. Then `compare_audio`, which **renders the
+  candidate for you** at that detected pitch and duration and returns the
+  signed, per-dimension error plus ranked moves in this synth's parameter ids —
+  so there is no separate `render_audio` step, and no way to compare an
+  octave-off render whose scalars still look plausible. Apply a move with
+  `update_parameters` and compare again. `suggest_patch` re-reads the last
+  comparison's ranked moves with no render at all, and every `compare_audio`
+  result carries a `progress` block naming the best similarity so far, so you
+  can stop on a plateau instead of editing past your own best patch.
 - **Teach** — `show_ui_guide` drives an interactive walkthrough of the real UI
 - **Undo** — `get_history`, `navigate_history`, `replay_history`
 

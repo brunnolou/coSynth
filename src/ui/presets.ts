@@ -1,8 +1,12 @@
 // Preset browser: factory presets, localStorage user presets, JSON file
-// export/import.
+// export/import, delete, and whether the live patch still matches what was
+// loaded.
 
-import { paramDef, valueToNorm } from '../shared/params'
-import { listPresets, savePreset, validatePresetData } from '../shared/preset-store'
+import {
+  currentPresetState, deletePreset, factoryDeleteRefusal, listPresets, markPresetLoaded,
+  onPresetStoreChange, presetFileName, savePreset, serializePreset, validatePresetData
+} from '../shared/preset-store'
+import { FACTORY_PRESETS } from '../shared/factory-presets'
 import type { SynthEngine, PresetData } from '../audio/engine'
 import { el } from './common'
 import { guideTarget } from './guide-target'
@@ -10,551 +14,12 @@ import { ModalDialog } from './dialog'
 import { ChevronLeft, ChevronRight, Cog, createElement } from 'lucide'
 import './presets.css'
 
-/** Convenience: author factory presets in raw units, store normalized. */
-function P(raw: Record<string, number>): Record<string, number> {
-  const out: Record<string, number> = {}
-  for (const [id, v] of Object.entries(raw)) out[id] = valueToNorm(paramDef(id), v)
-  return out
-}
-
-const FACTORY: Partial<PresetData>[] = [
-  { name: 'Init', params: {} },
-  {
-    name: 'Deep Saw Bass',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.7, 'osc1.unison': 5, 'osc1.detune': 9,
-      'osc1.transpose': -12, 'osc1.level': 0.8, 'sub.enabled': 1, 'sub.level': 0.7, 'sub.octave': -1,
-      'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 300, 'filter1.resonance': 0.35, 'filter1.drive': 0.3,
-      'env1.attack': 0.003, 'env1.decay': 0.4, 'env1.sustain': 0.9, 'env1.release': 0.12,
-      'env2.attack': 0.003, 'env2.decay': 0.35, 'env2.sustain': 0.15, 'env2.release': 0.1,
-      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.25
-    }),
-    mods: [{ source: 'env2', dest: 'filter1.cutoff', depth: 0.45, enabled: true }]
-  },
-  {
-    name: 'Morphing Pad',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 3, 'osc1.unison': 7, 'osc1.detune': 16, 'osc1.spread': 0.9, 'osc1.level': 0.55,
-      'osc2.enabled': 1, 'osc2.wavetable': 1, 'osc2.unison': 5, 'osc2.detune': 12, 'osc2.transpose': 12, 'osc2.level': 0.3,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 2200, 'filter1.resonance': 0.15,
-      'env1.attack': 0.9, 'env1.decay': 1.5, 'env1.sustain': 0.8, 'env1.release': 1.8,
-      'lfo1.rate': 0.12, 'lfo1.sync': 0,
-      'chorus.enabled': 1, 'chorus.mix': 0.4, 'reverb.enabled': 1, 'reverb.size': 0.85, 'reverb.mix': 0.35
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'osc1.morph', depth: 0.6, enabled: true },
-      { source: 'lfo2', dest: 'osc2.morph', depth: 0.3, enabled: true }
-    ]
-  },
-  {
-    name: 'Sync Pluck',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.55, 'osc1.sync': 1,
-      'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 900, 'filter1.resonance': 0.3, 'filter1.keytrack': 1,
-      'env1.attack': 0.002, 'env1.decay': 0.5, 'env1.sustain': 0, 'env1.release': 0.4,
-      'env2.attack': 0.001, 'env2.decay': 0.25, 'env2.sustain': 0, 'env2.release': 0.2,
-      'delay.enabled': 1, 'delay.mix': 0.25, 'delay.feedback': 0.35,
-      'reverb.enabled': 1, 'reverb.mix': 0.2
-    }),
-    mods: [
-      { source: 'env2', dest: 'filter1.cutoff', depth: 0.5, enabled: true },
-      { source: 'env2', dest: 'osc1.sync', depth: 0.5, enabled: true },
-      { source: 'velocity', dest: 'filter1.cutoff', depth: 0.25, enabled: true }
-    ]
-  },
-  {
-    name: 'PWM Keys',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 2, 'osc1.morph': 0.3, 'osc1.unison': 3, 'osc1.detune': 6,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 5000,
-      'env1.attack': 0.01, 'env1.decay': 0.8, 'env1.sustain': 0.6, 'env1.release': 0.5,
-      'lfo1.rate': 0.6, 'lfo1.sync': 0,
-      'chorus.enabled': 1, 'chorus.mix': 0.35, 'eq.enabled': 1, 'eq.high_gain': 2
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'osc1.morph', depth: 0.35, enabled: true },
-      { source: 'modwheel', dest: 'osc1.morph', depth: 0.5, enabled: true }
-    ]
-  },
-
-  // ------------------------------------------------------------------ bass
-  {
-    name: 'Reese Bass',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.7, 'osc1.unison': 2, 'osc1.detune': 35,
-      'osc1.blend': 1, 'osc1.spread': 0, 'osc1.transpose': -12, 'osc1.level': 0.6,
-      'osc2.enabled': 1, 'osc2.wavetable': 0, 'osc2.morph': 0.7, 'osc2.transpose': -12, 'osc2.fine': 12, 'osc2.level': 0.5,
-      'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 700, 'filter1.resonance': 0.1, 'filter1.drive': 0.4,
-      'env1.attack': 0.003, 'env1.decay': 0.5, 'env1.sustain': 1, 'env1.release': 0.15,
-      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.3, 'eq.enabled': 1, 'eq.low_gain': 2
-    }),
-    mods: [{ source: 'modwheel', dest: 'filter1.cutoff', depth: 0.3, enabled: true }]
-  },
-  {
-    name: 'Acid Squelch',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.7, 'osc1.transpose': -12, 'osc1.level': 0.75,
-      'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 350, 'filter1.resonance': 0.75,
-      'filter1.drive': 0.5, 'filter1.keytrack': 0.5,
-      'env1.attack': 0.002, 'env1.decay': 0.3, 'env1.sustain': 0.6, 'env1.release': 0.08,
-      'env2.attack': 0.001, 'env2.decay': 0.18, 'env2.sustain': 0, 'env2.release': 0.1,
-      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.35,
-      'delay.enabled': 1, 'delay.division': 7, 'delay.mix': 0.18, 'delay.feedback': 0.3
-    }),
-    mods: [
-      { source: 'env2', dest: 'filter1.cutoff', depth: 0.4, enabled: true },
-      { source: 'velocity', dest: 'filter1.cutoff', depth: 0.2, enabled: true },
-      { source: 'modwheel', dest: 'filter1.resonance', depth: 0.3, enabled: true }
-    ]
-  },
-  {
-    name: 'Wobble Bass',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 5, 'osc1.morph': 0.4, 'osc1.transpose': -12, 'osc1.level': 0.8,
-      'sub.enabled': 1, 'sub.shape': 0, 'sub.octave': -1, 'sub.level': 0.6,
-      'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 400, 'filter1.resonance': 0.4, 'filter1.drive': 0.3,
-      'env1.attack': 0.002, 'env1.decay': 0.4, 'env1.sustain': 1, 'env1.release': 0.1,
-      'lfo1.sync': 1, 'lfo1.division': 4,
-      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.3
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'filter1.cutoff', depth: 0.5, enabled: true },
-      { source: 'lfo1', dest: 'osc1.morph', depth: 0.3, enabled: true }
-    ]
-  },
-  {
-    name: 'FM Knock',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 4, 'osc1.morph': 0.25, 'osc1.transpose': -12, 'osc1.level': 0.8,
-      'sub.enabled': 1, 'sub.shape': 0, 'sub.octave': -1, 'sub.level': 0.7,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 1200,
-      'env1.attack': 0.001, 'env1.decay': 0.35, 'env1.sustain': 0, 'env1.release': 0.2,
-      'env2.attack': 0.001, 'env2.decay': 0.08, 'env2.sustain': 0, 'env2.release': 0.05
-    }),
-    mods: [
-      { source: 'env2', dest: 'osc1.morph', depth: 0.5, enabled: true },
-      { source: 'env2', dest: 'osc1.transpose', depth: 0.15, enabled: true },
-      { source: 'velocity', dest: 'osc1.morph', depth: 0.3, enabled: true }
-    ]
-  },
-  {
-    name: 'Solid Square',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 2, 'osc1.morph': 0.15, 'osc1.transpose': -12, 'osc1.level': 0.55,
-      'sub.enabled': 1, 'sub.shape': 0, 'sub.octave': -1, 'sub.level': 0.65,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 2500,
-      'env1.attack': 0.003, 'env1.decay': 0.4, 'env1.sustain': 0.9, 'env1.release': 0.12,
-      'eq.enabled': 1, 'eq.low_gain': 3
-    }),
-    mods: [{ source: 'modwheel', dest: 'osc1.morph', depth: 0.4, enabled: true }]
-  },
-  {
-    name: 'Neuro Growl',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 3, 'osc1.morph': 0.3, 'osc1.transpose': -12, 'osc1.level': 0.8,
-      'osc2.enabled': 1, 'osc2.wavetable': 5, 'osc2.morph': 0.5, 'osc2.transpose': -12, 'osc2.level': 0.5,
-      'filter1.enabled': 1, 'filter1.type': 8, 'filter1.cutoff': 800, 'filter1.resonance': 0.5, 'filter1.mix': 0.8,
-      'filter2.enabled': 1, 'filter2.type': 1, 'filter2.cutoff': 900, 'filter2.resonance': 0.2,
-      'env1.attack': 0.002, 'env1.decay': 0.4, 'env1.sustain': 1, 'env1.release': 0.1,
-      'lfo1.sync': 1, 'lfo1.division': 1, 'lfo2.sync': 1, 'lfo2.division': 7,
-      'dist.enabled': 1, 'dist.type': 2, 'dist.drive': 0.35, 'dist.mix': 0.7
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'filter1.cutoff', depth: 0.45, enabled: true },
-      { source: 'lfo1', dest: 'osc1.morph', depth: 0.5, enabled: true },
-      { source: 'lfo2', dest: 'osc2.morph', depth: 0.25, enabled: true }
-    ]
-  },
-  {
-    name: '808 Drop',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0, 'osc1.transpose': -12, 'osc1.level': 0.9,
-      'env1.attack': 0.001, 'env1.decay': 1.2, 'env1.sustain': 0.4, 'env1.release': 0.3,
-      'env2.attack': 0.001, 'env2.decay': 0.09, 'env2.sustain': 0, 'env2.release': 0.05,
-      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.2
-    }),
-    mods: [
-      { source: 'env2', dest: 'osc1.transpose', depth: 0.25, enabled: true },
-      { source: 'velocity', dest: 'dist.drive', depth: 0.2, enabled: true }
-    ]
-  },
-
-  // ------------------------------------------------------------------ leads
-  {
-    name: 'Super Saw Lead',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.7, 'osc1.unison': 7, 'osc1.detune': 20,
-      'osc1.spread': 1, 'osc1.blend': 0.8, 'osc1.level': 0.6,
-      'osc2.enabled': 1, 'osc2.wavetable': 0, 'osc2.morph': 0.7, 'osc2.unison': 7, 'osc2.detune': 25,
-      'osc2.transpose': 12, 'osc2.spread': 1, 'osc2.level': 0.35,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 9000,
-      'env1.attack': 0.005, 'env1.decay': 0.5, 'env1.sustain': 0.85, 'env1.release': 0.3,
-      'lfo1.sync': 0, 'lfo1.rate': 5.5,
-      'delay.enabled': 1, 'delay.division': 7, 'delay.mix': 0.2,
-      'reverb.enabled': 1, 'reverb.size': 0.6, 'reverb.mix': 0.2, 'eq.enabled': 1, 'eq.high_gain': 2
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'osc1.fine', depth: 0.03, enabled: true },
-      { source: 'lfo1', dest: 'osc2.fine', depth: 0.03, enabled: true }
-    ]
-  },
-  {
-    name: 'Sync Screamer',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 1, 'osc1.morph': 0.4, 'osc1.level': 0.75,
-      'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 3500, 'filter1.resonance': 0.25, 'filter1.drive': 0.5,
-      'env1.attack': 0.002, 'env1.decay': 0.4, 'env1.sustain': 1, 'env1.release': 0.25,
-      'env2.attack': 0.001, 'env2.decay': 0.6, 'env2.sustain': 0.3, 'env2.release': 0.3,
-      'lfo1.sync': 0, 'lfo1.rate': 6,
-      'dist.enabled': 1, 'dist.type': 1, 'dist.drive': 0.25,
-      'delay.enabled': 1, 'delay.division': 7, 'delay.mix': 0.22
-    }),
-    mods: [
-      { source: 'env2', dest: 'osc1.sync', depth: 0.6, enabled: true },
-      { source: 'modwheel', dest: 'osc1.sync', depth: 0.4, enabled: true },
-      { source: 'lfo1', dest: 'osc1.fine', depth: 0.04, enabled: true }
-    ]
-  },
-  {
-    name: 'Breath Flute',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.05, 'osc1.level': 0.6,
-      'noise.enabled': 1, 'noise.type': 1, 'noise.level': 0.15,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 4000, 'filter1.keytrack': 0.6,
-      'env1.attack': 0.06, 'env1.decay': 0.4, 'env1.sustain': 0.85, 'env1.release': 0.25,
-      'lfo1.sync': 0, 'lfo1.rate': 5,
-      'reverb.enabled': 1, 'reverb.mix': 0.25
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'osc1.fine', depth: 0.035, enabled: true },
-      { source: 'lfo1', dest: 'osc1.level', depth: 0.08, enabled: true },
-      { source: 'aftertouch', dest: 'osc1.level', depth: 0.1, enabled: true }
-    ]
-  },
-  {
-    name: 'Chip Lead',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 2, 'osc1.morph': 0, 'osc1.phase_rand': 0, 'osc1.level': 0.65,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 12000,
-      'env1.attack': 0.001, 'env1.decay': 0.3, 'env1.sustain': 1, 'env1.release': 0.05,
-      'lfo1.sync': 0, 'lfo1.rate': 6.5,
-      'dist.enabled': 1, 'dist.type': 3, 'dist.bits': 6, 'dist.downsample': 6, 'dist.mix': 0.8,
-      'delay.enabled': 1, 'delay.division': 7, 'delay.mix': 0.25, 'delay.feedback': 0.25
-    }),
-    mods: [{ source: 'lfo1', dest: 'osc1.fine', depth: 0.04, enabled: true }]
-  },
-  {
-    name: 'Vox Lead',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 3, 'osc1.morph': 0.4, 'osc1.unison': 3, 'osc1.detune': 8, 'osc1.level': 0.7,
-      'filter1.enabled': 1, 'filter1.type': 8, 'filter1.cutoff': 1200, 'filter1.resonance': 0.4, 'filter1.mix': 0.9,
-      'env1.attack': 0.02, 'env1.decay': 0.5, 'env1.sustain': 0.9, 'env1.release': 0.3,
-      'lfo1.sync': 0, 'lfo1.rate': 0.4, 'lfo2.sync': 0, 'lfo2.rate': 5.2,
-      'chorus.enabled': 1, 'chorus.mix': 0.3, 'reverb.enabled': 1, 'reverb.mix': 0.25
-    }),
-    mods: [
-      { source: 'modwheel', dest: 'osc1.morph', depth: 0.5, enabled: true },
-      { source: 'lfo1', dest: 'filter1.cutoff', depth: 0.15, enabled: true },
-      { source: 'lfo2', dest: 'osc1.fine', depth: 0.03, enabled: true }
-    ]
-  },
-  {
-    name: 'Crystal Bell',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 4, 'osc1.morph': 0.25, 'osc1.level': 0.65,
-      'osc2.enabled': 1, 'osc2.wavetable': 4, 'osc2.morph': 0.7, 'osc2.transpose': 12, 'osc2.level': 0.3,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 9000,
-      'env1.attack': 0.002, 'env1.decay': 1.8, 'env1.sustain': 0, 'env1.release': 1.2,
-      'env2.attack': 0.001, 'env2.decay': 1.2, 'env2.sustain': 0, 'env2.release': 0.8,
-      'delay.enabled': 1, 'delay.division': 6, 'delay.pingpong': 1, 'delay.mix': 0.3,
-      'reverb.enabled': 1, 'reverb.size': 0.8, 'reverb.mix': 0.35
-    }),
-    mods: [
-      { source: 'env2', dest: 'osc1.morph', depth: 0.35, enabled: true },
-      { source: 'velocity', dest: 'osc1.morph', depth: 0.2, enabled: true }
-    ]
-  },
-
-  // ------------------------------------------------------------------ pads
-  {
-    name: 'Warm Analog Pad',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.65, 'osc1.unison': 5, 'osc1.detune': 10,
-      'osc1.blend': 0.8, 'osc1.level': 0.55,
-      'osc2.enabled': 1, 'osc2.wavetable': 0, 'osc2.morph': 0.65, 'osc2.unison': 3, 'osc2.detune': 7,
-      'osc2.transpose': -12, 'osc2.level': 0.4,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 1800, 'filter1.resonance': 0.1,
-      'env1.attack': 1.2, 'env1.decay': 2, 'env1.sustain': 0.8, 'env1.release': 2.2,
-      'lfo1.sync': 0, 'lfo1.rate': 0.07, 'lfo1.mode': 1,
-      'chorus.enabled': 1, 'chorus.mix': 0.4, 'reverb.enabled': 1, 'reverb.size': 0.7, 'reverb.mix': 0.3
-    }),
-    mods: [{ source: 'lfo1', dest: 'filter1.cutoff', depth: 0.12, enabled: true }]
-  },
-  {
-    name: 'Choir Pad',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 3, 'osc1.morph': 0.55, 'osc1.unison': 5, 'osc1.detune': 9,
-      'osc1.spread': 0.8, 'osc1.level': 0.6,
-      'filter1.enabled': 1, 'filter1.type': 8, 'filter1.cutoff': 900, 'filter1.resonance': 0.35, 'filter1.mix': 0.85,
-      'env1.attack': 0.8, 'env1.decay': 1.5, 'env1.sustain': 0.85, 'env1.release': 1.6,
-      'lfo1.sync': 0, 'lfo1.rate': 0.09, 'lfo1.mode': 1, 'lfo2.sync': 0, 'lfo2.rate': 0.13, 'lfo2.mode': 1,
-      'chorus.enabled': 1, 'chorus.mix': 0.3, 'reverb.enabled': 1, 'reverb.size': 0.85, 'reverb.mix': 0.4
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'osc1.morph', depth: 0.3, enabled: true },
-      { source: 'lfo2', dest: 'filter1.cutoff', depth: 0.15, enabled: true }
-    ]
-  },
-  {
-    name: 'Shimmer Pad',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 1, 'osc1.morph': 0.3, 'osc1.unison': 5, 'osc1.detune': 12, 'osc1.level': 0.5,
-      'osc2.enabled': 1, 'osc2.wavetable': 1, 'osc2.morph': 0.5, 'osc2.unison': 3, 'osc2.detune': 10,
-      'osc2.transpose': 19, 'osc2.level': 0.25,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 6000,
-      'env1.attack': 1.5, 'env1.decay': 2, 'env1.sustain': 0.8, 'env1.release': 3,
-      'lfo1.sync': 0, 'lfo1.rate': 0.06, 'lfo1.mode': 1, 'lfo2.sync': 0, 'lfo2.rate': 0.08, 'lfo2.mode': 1,
-      'delay.enabled': 1, 'delay.division': 3, 'delay.mix': 0.25,
-      'reverb.enabled': 1, 'reverb.size': 0.95, 'reverb.damp': 0.2, 'reverb.mix': 0.5
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'osc1.morph', depth: 0.4, enabled: true },
-      { source: 'lfo2', dest: 'osc2.morph', depth: 0.35, enabled: true }
-    ]
-  },
-  {
-    name: 'Dark Matter',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 5, 'osc1.morph': 0.2, 'osc1.unison': 3, 'osc1.detune': 8,
-      'osc1.transpose': -12, 'osc1.level': 0.55,
-      'sub.enabled': 1, 'sub.shape': 1, 'sub.octave': -1, 'sub.level': 0.4,
-      'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 700, 'filter1.resonance': 0.3, 'filter1.drive': 0.2,
-      'env1.attack': 2, 'env1.decay': 2, 'env1.sustain': 0.85, 'env1.release': 3,
-      'lfo1.sync': 0, 'lfo1.rate': 0.05, 'lfo1.mode': 1,
-      'phaser.enabled': 1, 'phaser.rate': 0.08, 'phaser.mix': 0.3,
-      'reverb.enabled': 1, 'reverb.size': 0.9, 'reverb.damp': 0.7, 'reverb.mix': 0.4
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'filter1.cutoff', depth: 0.18, enabled: true },
-      { source: 'lfo1', dest: 'osc1.morph', depth: 0.15, enabled: true }
-    ]
-  },
-  {
-    name: 'Glass Pad',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 4, 'osc1.morph': 0.35, 'osc1.unison': 4, 'osc1.detune': 6, 'osc1.level': 0.5,
-      'osc2.enabled': 1, 'osc2.wavetable': 0, 'osc2.morph': 0, 'osc2.transpose': 12, 'osc2.level': 0.3,
-      'filter1.enabled': 1, 'filter1.type': 4, 'filter1.cutoff': 2500, 'filter1.resonance': 0.2, 'filter1.mix': 0.7,
-      'env1.attack': 0.9, 'env1.decay': 1.5, 'env1.sustain': 0.8, 'env1.release': 2,
-      'lfo1.sync': 0, 'lfo1.rate': 0.1, 'lfo1.mode': 1,
-      'chorus.enabled': 1, 'chorus.mix': 0.45, 'reverb.enabled': 1, 'reverb.mix': 0.35
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'osc1.morph', depth: 0.3, enabled: true },
-      { source: 'keytrack', dest: 'filter1.cutoff', depth: 0.2, enabled: true }
-    ]
-  },
-  {
-    name: 'Aurora Texture',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 1, 'osc1.morph': 0.2, 'osc1.unison': 3, 'osc1.spread': 1, 'osc1.level': 0.45,
-      'osc2.enabled': 1, 'osc2.wavetable': 3, 'osc2.morph': 0.6, 'osc2.fine': 8, 'osc2.level': 0.4,
-      'osc3.enabled': 1, 'osc3.wavetable': 5, 'osc3.morph': 0.5, 'osc3.transpose': 12, 'osc3.level': 0.2,
-      'filter.routing': 1,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 3000,
-      'filter2.enabled': 1, 'filter2.type': 4, 'filter2.cutoff': 1200, 'filter2.resonance': 0.4,
-      'env1.attack': 2.5, 'env1.decay': 2, 'env1.sustain': 0.9, 'env1.release': 4,
-      'lfo1.sync': 0, 'lfo1.rate': 0.04, 'lfo1.mode': 1, 'lfo2.sync': 0, 'lfo2.rate': 0.07, 'lfo2.mode': 1,
-      'lfo3.sync': 0, 'lfo3.rate': 0.05, 'lfo3.mode': 1, 'lfo4.sync': 0, 'lfo4.rate': 0.03, 'lfo4.mode': 1,
-      'phaser.enabled': 1, 'phaser.rate': 0.3, 'phaser.mix': 0.4,
-      'reverb.enabled': 1, 'reverb.size': 0.9, 'reverb.mix': 0.5
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'osc1.morph', depth: 0.5, enabled: true },
-      { source: 'lfo2', dest: 'osc2.morph', depth: 0.4, enabled: true },
-      { source: 'lfo3', dest: 'osc3.morph', depth: 0.5, enabled: true },
-      { source: 'lfo4', dest: 'filter2.cutoff', depth: 0.25, enabled: true }
-    ]
-  },
-
-  // ------------------------------------------------------------------ keys
-  {
-    name: 'Lo-Fi EP',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 4, 'osc1.morph': 0.25, 'osc1.level': 0.7,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 5000, 'filter1.keytrack': 0.4,
-      'env1.attack': 0.002, 'env1.decay': 1.5, 'env1.sustain': 0.35, 'env1.release': 0.4,
-      'lfo1.sync': 0, 'lfo1.rate': 4.5, 'lfo1.mode': 1,
-      'dist.enabled': 1, 'dist.type': 3, 'dist.bits': 10, 'dist.downsample': 2, 'dist.mix': 0.5,
-      'chorus.enabled': 1, 'chorus.mix': 0.35, 'reverb.enabled': 1, 'reverb.mix': 0.18
-    }),
-    mods: [
-      { source: 'velocity', dest: 'filter1.cutoff', depth: 0.25, enabled: true },
-      { source: 'velocity', dest: 'osc1.morph', depth: 0.15, enabled: true },
-      { source: 'lfo1', dest: 'osc1.pan', depth: 0.25, enabled: true }
-    ]
-  },
-  {
-    name: 'Drawbar Organ',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0, 'osc1.level': 0.5,
-      'osc2.enabled': 1, 'osc2.wavetable': 0, 'osc2.morph': 0, 'osc2.transpose': 12, 'osc2.level': 0.35,
-      'osc3.enabled': 1, 'osc3.wavetable': 0, 'osc3.morph': 0, 'osc3.transpose': 19, 'osc3.level': 0.25,
-      'sub.enabled': 1, 'sub.shape': 0, 'sub.octave': -1, 'sub.level': 0.4,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 10000,
-      'env1.attack': 0.003, 'env1.decay': 0.1, 'env1.sustain': 1, 'env1.release': 0.05,
-      'chorus.enabled': 1, 'chorus.rate': 0.8, 'chorus.depth': 0.7, 'chorus.mix': 0.5
-    }),
-    mods: [{ source: 'modwheel', dest: 'chorus.rate', depth: 0.3, enabled: true }]
-  },
-  {
-    name: 'Funk Clav',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.75, 'osc1.level': 0.7,
-      'filter1.enabled': 1, 'filter1.type': 7, 'filter1.cutoff': 2000, 'filter1.resonance': 0.6,
-      'filter2.enabled': 1, 'filter2.type': 0, 'filter2.cutoff': 4000, 'filter2.keytrack': 0.5,
-      'env1.attack': 0.001, 'env1.decay': 0.8, 'env1.sustain': 0.2, 'env1.release': 0.08,
-      'env2.attack': 0.001, 'env2.decay': 0.12, 'env2.sustain': 0, 'env2.release': 0.05
-    }),
-    mods: [
-      { source: 'env2', dest: 'filter2.cutoff', depth: 0.3, enabled: true },
-      { source: 'velocity', dest: 'filter2.cutoff', depth: 0.25, enabled: true }
-    ]
-  },
-  {
-    name: 'Rave Stab',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.7, 'osc1.unison': 5, 'osc1.detune': 15, 'osc1.level': 0.6,
-      'osc2.enabled': 1, 'osc2.wavetable': 0, 'osc2.morph': 0.7, 'osc2.unison': 3, 'osc2.detune': 12,
-      'osc2.transpose': 12, 'osc2.level': 0.4,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 4500, 'filter1.resonance': 0.15,
-      'env1.attack': 0.002, 'env1.decay': 0.4, 'env1.sustain': 0, 'env1.release': 0.25,
-      'env2.attack': 0.001, 'env2.decay': 0.2, 'env2.sustain': 0, 'env2.release': 0.1,
-      'dist.enabled': 1, 'dist.type': 0, 'dist.drive': 0.2, 'reverb.enabled': 1, 'reverb.mix': 0.2
-    }),
-    mods: [
-      { source: 'velocity', dest: 'filter1.cutoff', depth: 0.3, enabled: true },
-      { source: 'env2', dest: 'filter1.cutoff', depth: 0.25, enabled: true }
-    ]
-  },
-
-  // ------------------------------------------------------------------ plucks
-  {
-    name: 'Ice Pluck',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 5, 'osc1.morph': 0.7, 'osc1.level': 0.65,
-      'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 1500, 'filter1.resonance': 0.2, 'filter1.keytrack': 0.8,
-      'env1.attack': 0.001, 'env1.decay': 0.35, 'env1.sustain': 0, 'env1.release': 0.5,
-      'env2.attack': 0.001, 'env2.decay': 0.15, 'env2.sustain': 0, 'env2.release': 0.1,
-      'delay.enabled': 1, 'delay.division': 6, 'delay.pingpong': 1, 'delay.mix': 0.3, 'delay.feedback': 0.4,
-      'reverb.enabled': 1, 'reverb.size': 0.8, 'reverb.mix': 0.3
-    }),
-    mods: [
-      { source: 'env2', dest: 'filter1.cutoff', depth: 0.45, enabled: true },
-      { source: 'velocity', dest: 'filter1.cutoff', depth: 0.2, enabled: true },
-      { source: 'random', dest: 'osc1.morph', depth: 0.15, enabled: true }
-    ]
-  },
-  {
-    name: 'Kalimba',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.02, 'osc1.level': 0.7,
-      'noise.enabled': 1, 'noise.type': 0, 'noise.level': 0.08,
-      'filter1.enabled': 1, 'filter1.type': 0, 'filter1.cutoff': 3000, 'filter1.keytrack': 0.7,
-      'env1.attack': 0.001, 'env1.decay': 0.5, 'env1.sustain': 0, 'env1.release': 0.4,
-      'env2.attack': 0.001, 'env2.decay': 0.05, 'env2.sustain': 0, 'env2.release': 0.03,
-      'reverb.enabled': 1, 'reverb.size': 0.5, 'reverb.mix': 0.25
-    }),
-    mods: [
-      { source: 'env2', dest: 'filter1.cutoff', depth: 0.3, enabled: true },
-      { source: 'velocity', dest: 'filter1.cutoff', depth: 0.2, enabled: true }
-    ]
-  },
-  {
-    name: 'Rubber Pluck',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0.5, 'osc1.level': 0.7,
-      'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 900, 'filter1.resonance': 0.35,
-      'env1.attack': 0.001, 'env1.decay': 0.4, 'env1.sustain': 0, 'env1.release': 0.3,
-      'env2.attack': 0.001, 'env2.decay': 0.1, 'env2.sustain': 0, 'env2.release': 0.05,
-      'dist.enabled': 1, 'dist.type': 2, 'dist.drive': 0.45, 'dist.mix': 0.8
-    }),
-    mods: [
-      { source: 'env2', dest: 'filter1.cutoff', depth: 0.35, enabled: true },
-      { source: 'env2', dest: 'dist.drive', depth: 0.25, enabled: true },
-      { source: 'velocity', dest: 'filter1.cutoff', depth: 0.25, enabled: true }
-    ]
-  },
-  {
-    name: 'Arp Nights',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 2, 'osc1.morph': 0.4, 'osc1.unison': 2, 'osc1.detune': 12, 'osc1.level': 0.6,
-      'filter1.enabled': 1, 'filter1.type': 1, 'filter1.cutoff': 2200, 'filter1.resonance': 0.3, 'filter1.keytrack': 0.4,
-      'env1.attack': 0.001, 'env1.decay': 0.28, 'env1.sustain': 0, 'env1.release': 0.2,
-      'env2.attack': 0.001, 'env2.decay': 0.12, 'env2.sustain': 0, 'env2.release': 0.08,
-      'lfo1.sync': 1, 'lfo1.division': 7,
-      'delay.enabled': 1, 'delay.division': 10, 'delay.pingpong': 1, 'delay.mix': 0.35, 'delay.feedback': 0.45,
-      'reverb.enabled': 1, 'reverb.mix': 0.25
-    }),
-    mods: [
-      { source: 'env2', dest: 'filter1.cutoff', depth: 0.4, enabled: true },
-      { source: 'lfo1', dest: 'osc1.morph', depth: 0.2, enabled: true },
-      { source: 'modwheel', dest: 'filter1.cutoff', depth: 0.3, enabled: true }
-    ]
-  },
-
-  // ------------------------------------------------------------------ fx / other
-  {
-    name: 'Tension Riser',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 1, 'osc1.morph': 0.1, 'osc1.unison': 7, 'osc1.detune': 30,
-      'osc1.spread': 1, 'osc1.level': 0.5,
-      'noise.enabled': 1, 'noise.type': 0, 'noise.level': 0.35,
-      'filter1.enabled': 1, 'filter1.type': 2, 'filter1.cutoff': 200,
-      'env1.attack': 4, 'env1.decay': 1, 'env1.sustain': 1, 'env1.release': 1.5,
-      'env2.attack': 5, 'env2.decay': 1, 'env2.sustain': 1, 'env2.release': 1,
-      'lfo1.sync': 0, 'lfo1.rate': 8,
-      'reverb.enabled': 1, 'reverb.size': 0.9, 'reverb.mix': 0.4
-    }),
-    mods: [
-      { source: 'env2', dest: 'osc1.transpose', depth: 0.12, enabled: true },
-      { source: 'env2', dest: 'filter1.cutoff', depth: 0.3, enabled: true },
-      { source: 'env2', dest: 'osc1.morph', depth: 0.6, enabled: true },
-      { source: 'lfo1', dest: 'osc1.fine', depth: 0.05, enabled: true }
-    ]
-  },
-  {
-    name: 'Ocean Drift',
-    params: P({
-      'osc1.enabled': 0,
-      'noise.enabled': 1, 'noise.type': 1, 'noise.level': 0.6,
-      'filter1.enabled': 1, 'filter1.type': 4, 'filter1.cutoff': 800, 'filter1.resonance': 0.5,
-      'env1.attack': 1.5, 'env1.decay': 1, 'env1.sustain': 1, 'env1.release': 2.5,
-      'lfo1.sync': 0, 'lfo1.rate': 0.06, 'lfo1.mode': 1, 'lfo2.sync': 0, 'lfo2.rate': 0.11, 'lfo2.mode': 1,
-      'reverb.enabled': 1, 'reverb.size': 0.9, 'reverb.mix': 0.45
-    }),
-    mods: [
-      { source: 'lfo1', dest: 'filter1.cutoff', depth: 0.3, enabled: true },
-      { source: 'lfo2', dest: 'noise.level', depth: 0.2, enabled: true },
-      { source: 'lfo2', dest: 'filter1.resonance', depth: 0.15, enabled: true }
-    ]
-  },
-  {
-    name: 'Laser Zap',
-    params: P({
-      'osc1.enabled': 1, 'osc1.wavetable': 0, 'osc1.morph': 0, 'osc1.transpose': 24, 'osc1.level': 0.7,
-      'env1.attack': 0.001, 'env1.decay': 0.25, 'env1.sustain': 0, 'env1.release': 0.1,
-      'env2.attack': 0.001, 'env2.decay': 0.18, 'env2.sustain': 0, 'env2.release': 0.05,
-      'delay.enabled': 1, 'delay.division': 7, 'delay.mix': 0.2, 'delay.feedback': 0.3
-    }),
-    mods: [{ source: 'env2', dest: 'osc1.transpose', depth: 0.35, enabled: true }]
-  }
-]
-
 const MAX_IMPORT_BYTES = 1024 * 1024
 
 export function savePresetFromUi(engine: SynthEngine, name: string, storage?: Storage): PresetData {
-  return savePreset(engine.toPreset(name), storage)
+  const saved = savePreset(engine.toPreset(name), storage)
+  markPresetLoaded(saved.name, 'user', engine)
+  return saved
 }
 
 export async function importPresetFile(engine: SynthEngine, file: File, storage?: Storage): Promise<PresetData> {
@@ -563,15 +28,49 @@ export async function importPresetFile(engine: SynthEngine, file: File, storage?
   const preset = validatePresetData(parsed)
   const saved = savePreset(preset, storage)
   engine.loadPreset(saved)
+  markPresetLoaded(saved.name, 'user', engine)
   return saved
+}
+
+/**
+ * Delete a user preset, refusing a factory name in the caller's own words.
+ *
+ * The factory check lives here rather than in `preset-store` because that
+ * module cannot import the factory list without an import cycle. Anything else
+ * that deletes - the WebMCP tool surface, which already has the factory names -
+ * owes its callers the same two messages.
+ */
+export function deletePresetFromUi(name: string, storage?: Storage): PresetData {
+  const removed = deletePreset(name, storage)
+  if (removed) return removed
+  if (FACTORY_PRESETS.some(preset => preset.name === name)) throw new Error(factoryDeleteRefusal(name))
+  throw new Error(`No preset named "${name}" is saved in this browser.`)
+}
+
+/** Download a preset as the JSON `importPresetFile` reads back. */
+export function downloadPreset(preset: PresetData): void {
+  const blob = new Blob([serializePreset(preset)], { type: 'application/json' })
+  const a = el('a') as HTMLAnchorElement
+  a.href = URL.createObjectURL(blob)
+  a.download = presetFileName(preset.name)
+  a.click()
+  URL.revokeObjectURL(a.href)
 }
 
 export class PresetBrowser {
   readonly root: HTMLElement
   private readonly select: HTMLSelectElement
+  private readonly unsubscribe: () => void
+  private readonly unsubscribePatch: () => void
+  private readonly dirtyMark: HTMLElement
+  private readonly deleteBtn: HTMLButtonElement
 
   constructor(private readonly engine: SynthEngine) {
     this.root = el('div', 'presets')
+    this.dirtyMark = el('span', 'preset-dirty', '●')
+    this.dirtyMark.hidden = true
+    this.dirtyMark.setAttribute('aria-hidden', 'true')
+    guideTarget(this.dirtyMark, 'indicator.preset.dirty', 'Unsaved changes marker', 'indicator')
     this.select = el('select', 'param-select preset-select') as HTMLSelectElement
     this.select.setAttribute('aria-label', 'Preset')
     guideTarget(this.select, 'select.preset', 'Preset browser', 'select')
@@ -702,13 +201,7 @@ export class PresetBrowser {
     exportBtn.title = 'Download patch as JSON'
     exportBtn.addEventListener('click', () => {
       closeActions(true)
-      const preset = this.engine.toPreset('Exported Patch')
-      const blob = new Blob([JSON.stringify(preset, null, 2)], { type: 'application/json' })
-      const a = el('a') as HTMLAnchorElement
-      a.href = URL.createObjectURL(blob)
-      a.download = 'patch.cosynth.json'
-      a.click()
-      URL.revokeObjectURL(a.href)
+      downloadPreset(this.engine.toPreset(this.exportName()))
     })
 
     const importBtn = el('button', 'hdr-btn', 'Import')
@@ -733,11 +226,105 @@ export class PresetBrowser {
       file.click()
     })
 
-    for (const button of [save, exportBtn, importBtn]) button.type = 'button'
-    menu.append(save, exportBtn, importBtn)
+    const deleteDialog = new ModalDialog('Delete preset', 'preset-delete')
+    deleteDialog.root.classList.add('preset-save-dialog')
+    deleteDialog.root.setAttribute('aria-label', 'Delete preset')
+    const deleteText = el('p', 'preset-save-help')
+    const deleteError = el('p', 'preset-save-error')
+    deleteError.setAttribute('role', 'alert')
+    deleteDialog.body.append(deleteText, deleteError)
+    const cancelDelete = el('button', 'agent-btn', 'Cancel')
+    cancelDelete.type = 'button'
+    cancelDelete.addEventListener('click', () => deleteDialog.close())
+    const confirmDelete = el('button', 'agent-btn primary', 'Delete')
+    confirmDelete.type = 'button'
+    guideTarget(confirmDelete, 'button.preset.delete-confirm', 'Confirm delete preset', 'button')
+    deleteDialog.footer.append(cancelDelete, confirmDelete)
+    deleteDialog.root.addEventListener('close', () => trigger.focus())
+    confirmDelete.addEventListener('click', () => {
+      try {
+        // The store notification does the refreshing, exactly as a save does.
+        deletePresetFromUi(this.selectedName())
+        deleteDialog.close()
+      } catch (error) {
+        deleteError.textContent = `Could not delete preset: ${error instanceof Error ? error.message : String(error)}`
+      }
+    })
+
+    const deleteBtn = el('button', 'hdr-btn', 'Delete')
+    deleteBtn.type = 'button'
+    guideTarget(deleteBtn, 'button.preset.delete', 'Delete preset', 'button')
+    deleteBtn.addEventListener('click', () => {
+      closeActions(true)
+      const name = this.selectedName()
+      deleteError.textContent = ''
+      // Deleting removes a saved copy; it never touches the sound, and saying so
+      // is the difference between a confirmable action and a scary one.
+      deleteText.textContent = `Delete "${name}" from this browser? The patch you are hearing stays exactly as it is, and this cannot be undone.`
+      deleteDialog.open()
+      confirmDelete.focus()
+    })
+
+    for (const button of [save, exportBtn, importBtn, deleteBtn]) button.type = 'button'
+    menu.append(save, exportBtn, importBtn, deleteBtn)
     actions.append(trigger, menu)
-    this.root.append(previous, this.select, next, actions, file, saveDialog.root)
+    this.root.append(previous, this.select, next, actions, this.dirtyMark, file, saveDialog.root, deleteDialog.root)
+    this.deleteBtn = deleteBtn
     this.refresh('factory:Init')
+    // Presets also change from outside this component: an agent's save_preset or
+    // load_preset tool call writes and reads the same store with no UI event.
+    this.unsubscribe = onPresetStoreChange(change =>
+      // A deleted name must not be re-selected; `refresh` falls back on its own.
+      this.refresh(change.kind === 'deleted' ? '' : `user:${change.name}`))
+    // The other half of dirty state: the store says which preset the patch came
+    // from, the engine says whether it has moved since.
+    this.unsubscribePatch = engine.onPatchChange(() => this.syncDirty())
+  }
+
+  dispose(): void {
+    this.unsubscribe()
+    this.unsubscribePatch()
+  }
+
+  /** The live patch against the preset it was loaded from. */
+  currentPreset(): ReturnType<typeof currentPresetState> {
+    return currentPresetState(this.engine)
+  }
+
+  private syncDirty(): void {
+    const state = this.currentPreset()
+    this.dirtyMark.hidden = !state.dirty
+    this.dirtyMark.title = state.dirty ? `${state.name} has unsaved changes` : ''
+  }
+
+  /**
+   * A factory preset has no saved copy to remove, so Delete is only offered for
+   * a user preset - including one saved under a factory name, which is
+   * deliberate work and the only copy of it there is.
+   */
+  private syncDeletable(): void {
+    const user = this.select.value.startsWith('user:')
+    this.deleteBtn.disabled = !user
+    this.deleteBtn.title = user
+      ? 'Remove this saved preset from the browser'
+      : factoryDeleteRefusal(this.selectedName())
+  }
+
+  /** The selected preset's name, without the `factory:` / `user:` space prefix. */
+  private selectedName(): string {
+    return this.select.value.split(':').slice(1).join(':')
+  }
+
+  /**
+   * What an exported file calls itself. A modified factory patch exports as
+   * "Init (edited)" rather than "Init": importing saves under the file's name,
+   * and a user preset that shadows a factory one is a collision the human did
+   * not ask for.
+   */
+  private exportName(): string {
+    const state = this.currentPreset()
+    if (!state.name) return 'Exported Patch'
+    return state.dirty ? `${state.name} (edited)` : state.name
   }
 
   private step(direction: -1 | 1): void {
@@ -748,10 +335,11 @@ export class PresetBrowser {
   }
 
   private refresh(selected: string): void {
+    const previous = this.select.value
     this.select.textContent = ''
     const fGroup = el('optgroup') as HTMLOptGroupElement
     fGroup.label = 'Factory'
-    for (const p of FACTORY) {
+    for (const p of FACTORY_PRESETS) {
       const o = el('option', undefined, p.name) as HTMLOptionElement
       o.value = `factory:${p.name}`
       fGroup.appendChild(o)
@@ -768,7 +356,12 @@ export class PresetBrowser {
       }
       this.select.appendChild(uGroup)
     }
+    // A name from another storage (or one just deleted) must not blank the field.
     this.select.value = selected
+    if (!this.select.value) this.select.value = previous
+    if (!this.select.value) this.select.selectedIndex = 0
+    this.syncDeletable()
+    this.syncDirty()
   }
 
   private load(key: string): void {
@@ -776,8 +369,14 @@ export class PresetBrowser {
     const name = rest.join(':')
     const preset =
       kind === 'factory'
-        ? FACTORY.find(p => p.name === name)
+        ? FACTORY_PRESETS.find(p => p.name === name)
         : listPresets().find(p => p.name === name)
-    if (preset) this.engine.loadPreset(preset)
+    if (!preset) return
+    this.engine.loadPreset(preset)
+    // After the load, never before: the reference is what the engine ended up
+    // holding, which is not the same object a factory preset spells out.
+    markPresetLoaded(name, kind === 'factory' ? 'factory' : 'user', this.engine)
+    this.syncDeletable()
+    this.syncDirty()
   }
 }

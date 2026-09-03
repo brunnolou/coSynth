@@ -1,8 +1,11 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { SynthEngine } from '../audio/engine'
+import { renderOffline } from './offline-render'
 import {
   MAX_AUDIO_BASE64_CHARACTERS,
   MAX_REFERENCE_CHANNELS,
   MAX_REFERENCE_PCM_SAMPLES,
+  REFERENCE_DECODE_SAMPLE_RATE,
   decodeBase64Audio,
   normalizeAudioMimeType,
   parseBase64Audio,
@@ -210,5 +213,159 @@ describe('decodeBase64Audio', () => {
     await expect(decodeBase64Audio(rawBase64, { context: context(decoded) })).resolves.toMatchObject({
       duration: 4 / 8000
     })
+  })
+})
+
+/**
+ * The rate a reference is measured on, which nothing in the pipeline used to
+ * state out loud.
+ *
+ * `decodeAudioData` resamples to the rate of the context it is handed and
+ * reports nothing about it, so the decode context's rate silently decides how
+ * much of the reference survives. Playwright's Chromium reports a 16 kHz output
+ * device — measured, headless and headed alike — which put a 44.1 kHz reference
+ * through an 8 kHz ceiling while the candidate rendered at the 48 kHz fallback.
+ * `bandsDb`'s top octave band then reads the -100 dB floor on the reference and
+ * real energy on the candidate: a live eval measured +75.1 dB there and spent a
+ * comparison establishing that no patch could close it.
+ */
+describe('reference decode sample rate', () => {
+  /**
+   * The first 48 bytes of `docs/agent-match-eval-reference.wav`, verbatim: its
+   * RIFF preamble, its whole `fmt ` chunk and the head of the `LIST` chunk
+   * behind it. The eval's own reference material, run through the real parser,
+   * rather than a hand-built stand-in that could agree with a wrong reading.
+   *
+   * The bytes are inlined because this project ships no Node type definitions
+   * on purpose — a browser app that can see `Buffer` and `node:fs` in every
+   * file is one careless import away from shipping them. Regenerate with:
+   * `node -e "console.log(require('fs').readFileSync('docs/agent-match-eval-reference.wav').subarray(0, 48).toString('base64'))"`
+   */
+  const referenceBase64 = 'UklGRtivAgBXQVZFZm10IBAAAAABAAIARKwAAJgJBAAGABgATElTVHYAAABJTkZP'
+
+  /** Base64 for a handmade header, so the malformed cases stay readable inline. */
+  const encode = (...values: number[]) => btoa(String.fromCharCode(...values))
+  const ascii = (text: string) => [...text].map(character => character.charCodeAt(0))
+  const u32 = (value: number) => [value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, (value >>> 24) & 0xff]
+  const u16 = (value: number) => [value & 0xff, (value >> 8) & 0xff]
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('reads the 44.1 kHz rate out of the shipped reference file header', () => {
+    expect(parseBase64Audio(referenceBase64)).toMatchObject({ sourceSampleRate: 44100 })
+    expect(parseBase64Audio(`data:audio/wav;base64,${referenceBase64}`)).toMatchObject({
+      mimeType: 'audio/wav',
+      sourceSampleRate: 44100
+    })
+  })
+
+  it('reports the file rate beside the decoded rate, so a downsample is visible rather than silent', async () => {
+    const downsampled = audioBuffer({ sampleRate: 16000, duration: 4 / 16000 })
+    await expect(decodeBase64Audio(referenceBase64, { context: context(downsampled) })).resolves.toMatchObject({
+      sourceSampleRate: 44100,
+      sampleRate: 16000
+    })
+  })
+
+  it('builds its own decode context at an explicit rate instead of inheriting the output device', async () => {
+    const constructed: unknown[] = []
+    class StubAudioContext {
+      readonly sampleRate: number
+      constructor(options?: { sampleRate?: number }) {
+        constructed.push(options)
+        // What this browser hands out when nobody asks for a rate.
+        this.sampleRate = options?.sampleRate ?? 16000
+      }
+      async decodeAudioData() {
+        return audioBuffer({ sampleRate: this.sampleRate, duration: 4 / this.sampleRate })
+      }
+      async close() {}
+    }
+    vi.stubGlobal('AudioContext', StubAudioContext)
+
+    await expect(decodeBase64Audio(referenceBase64, { context: null })).resolves.toMatchObject({
+      sourceSampleRate: 44100,
+      sampleRate: REFERENCE_DECODE_SAMPLE_RATE
+    })
+    expect(constructed).toEqual([{ sampleRate: REFERENCE_DECODE_SAMPLE_RATE }])
+  })
+
+  it('falls back to a device-rate context when the browser refuses the explicit rate', async () => {
+    const constructed: unknown[] = []
+    class PickyAudioContext {
+      readonly sampleRate = 44100
+      constructor(options?: { sampleRate?: number }) {
+        constructed.push(options)
+        if (options?.sampleRate !== undefined) throw new Error('NotSupportedError')
+      }
+      async decodeAudioData() {
+        return audioBuffer({ sampleRate: 44100, duration: 4 / 44100 })
+      }
+      async close() {}
+    }
+    vi.stubGlobal('AudioContext', PickyAudioContext)
+
+    await expect(decodeBase64Audio(referenceBase64, { context: null })).resolves.toMatchObject({ sampleRate: 44100 })
+    expect(constructed).toEqual([{ sampleRate: REFERENCE_DECODE_SAMPLE_RATE }, undefined])
+  })
+
+  /**
+   * The invariant the phantom band error came out of: with no engine context the
+   * reference decode and the candidate render each pick their own fallback rate,
+   * and the two have to name the same number. They were 16000 and 48000.
+   * `createContext` throws once it has recorded what the render asked for, since
+   * the rate is settled before any rendering starts.
+   */
+  it('decodes at exactly the rate an engine-less render falls back to', async () => {
+    const asked: number[] = []
+    const engine = new SynthEngine()
+    expect(engine.context).toBeNull()
+
+    await expect(renderOffline(engine, [{ midi: 60, velocity: 1, start: 0, duration: 0.1 }], 0.2, {
+      createContext: options => {
+        asked.push(options.sampleRate)
+        throw new Error('rate recorded')
+      }
+    })).rejects.toThrow('rate recorded')
+    expect(asked).toEqual([REFERENCE_DECODE_SAMPLE_RATE])
+  })
+
+  it.each([
+    ['a non-RIFF container', encode(...ascii('ID3'), ...u32(0), ...ascii('meta'))],
+    ['a RIFF form that is not WAVE', encode(...ascii('RIFF'), ...u32(36), ...ascii('AVI '), ...ascii('fmt '))],
+    ['a header shorter than the RIFF preamble', encode(...ascii('RIFF'), ...u32(0))],
+    [
+      'a fmt chunk too short to hold a rate',
+      encode(...ascii('RIFF'), ...u32(20), ...ascii('WAVE'), ...ascii('fmt '), ...u32(8), ...u16(1), ...u16(2), ...u32(44100))
+    ],
+    [
+      'a fmt chunk truncated mid-field',
+      encode(...ascii('RIFF'), ...u32(24), ...ascii('WAVE'), ...ascii('fmt '), ...u32(16), ...u16(1), ...u16(2))
+    ],
+    [
+      'a zero-size chunk that cannot be walked past',
+      encode(...ascii('RIFF'), ...u32(28), ...ascii('WAVE'), ...ascii('LIST'), ...u32(0), ...ascii('fmt '), ...u32(16),
+        ...u16(1), ...u16(2), ...u32(44100), ...u32(0), ...u16(0), ...u16(0))
+    ],
+    [
+      'a fmt chunk declaring a zero rate',
+      encode(...ascii('RIFF'), ...u32(28), ...ascii('WAVE'), ...ascii('fmt '), ...u32(16), ...u16(1), ...u16(2),
+        ...u32(0), ...u32(0), ...u16(0), ...u16(0))
+    ],
+    ['no chunks at all after the preamble', encode(...ascii('RIFF'), ...u32(4), ...ascii('WAVE'))]
+  ])('reports no source rate for %s, without throwing', (_label, value) => {
+    expect(parseBase64Audio(value).sourceSampleRate).toBeUndefined()
+  })
+
+  it('walks past a leading metadata chunk to the fmt chunk behind it', () => {
+    const value = encode(
+      ...ascii('RIFF'), ...u32(40), ...ascii('WAVE'),
+      // Odd-sized, so the word-alignment pad byte has to be counted.
+      ...ascii('LIST'), ...u32(5), ...ascii('INFO'), 0, 0,
+      ...ascii('fmt '), ...u32(16), ...u16(1), ...u16(2), ...u32(96000), ...u32(0), ...u16(0), ...u16(0)
+    )
+    expect(parseBase64Audio(value).sourceSampleRate).toBe(96000)
   })
 })

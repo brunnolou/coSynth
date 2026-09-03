@@ -4,11 +4,13 @@ import assert from 'node:assert/strict'
 import { chromium } from 'playwright'
 
 // Every tool registers at page load and the set never changes across the
-// gesture. play_notes is registered but refuses until audio starts: an agent
-// that could not see it concluded playback was not a tool at all and went off
-// to drive the DOM instead.
-const TOOLS_AT_LOAD = 18
-const TOOLS_AFTER_AUDIO = 18
+// gesture, so one constant covers both sides of the Start click and the feed
+// line the UI prints. play_notes is registered but refuses until audio starts:
+// an agent that could not see it concluded playback was not a tool at all and
+// went off to drive the DOM instead.
+// Thirteen synth tools, four history tools, two guide tools. `webmcp-smoke.mjs`
+// holds the names; this file only ever needs the total.
+const TOOL_COUNT = 24
 
 const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined })
 try {
@@ -36,8 +38,8 @@ try {
   const next = () => page.locator('.driver-popover-next-btn').click()
   const previous = () => page.locator('.driver-popover-prev-btn').click()
 
-  await page.waitForFunction(count => window.__guideTestTools.size === count, TOOLS_AT_LOAD)
-  assert.equal(await page.locator('.agent-feed-line').textContent(), `${TOOLS_AT_LOAD} tools ready · Start audio for live playback`)
+  await page.waitForFunction(count => window.__guideTestTools.size === count, TOOL_COUNT)
+  assert.equal(await page.locator('.agent-feed-line').textContent(), `${TOOL_COUNT} tools ready · Start audio for live playback`)
   await show([{ markdown: 'Introduction' }, { target: { id: 'button.audio.start' }, markdown: 'Start audio yourself when ready.' }])
   await page.keyboard.press('ArrowRight')
   await highlighted('button.audio.start')
@@ -47,7 +49,7 @@ try {
   const replaysBeforeWelcome = await call('get_history', { view: 'replays', limit: 20 })
   await page.locator('#start-btn').click()
   await page.locator('#start-overlay').waitFor({ state: 'detached' })
-  await page.waitForFunction(count => window.__guideTestTools.size === count, TOOLS_AFTER_AUDIO)
+  await page.waitForFunction(count => window.__guideTestTools.size === count, TOOL_COUNT)
 
   // The built-in tour starts once after audio and stays separate from AI replay history.
   await page.locator('.driver-popover-title', { hasText: 'Create sounds with AI' }).waitFor()
@@ -141,7 +143,9 @@ try {
   await page.locator('[data-guide-id="tab.env2"]').click()
   await next(); await highlighted('param.env2.attack')
   await clear()
-  await show([{ target: { id: 'param.env6.attack' }, markdown: 'Missing target instructions remain visible.' }])
+  // An id sharing a segment with a live tab (param.env6.attack -> tab.env6) is now revealed
+  // rather than warned about, so the unavailable path needs an id nothing can own.
+  await show([{ target: { id: 'param.nosuch.control' }, markdown: 'Missing target instructions remain visible.' }])
   assert.match(await page.locator('.driver-popover-description').textContent(), /Target unavailable/)
   await clear()
 
@@ -232,7 +236,7 @@ try {
   }
   await page.locator('.driver-popover').waitFor({ state: 'detached' })
   assert.deepEqual(errors, [])
-  console.log(`Guide smoke passed: ${TOOLS_AFTER_AUDIO} tools; discovery, interactive tours, safe Markdown, dynamic targets, dialogs, mobile, and unchanged sound history verified.`)
+  console.log(`Guide smoke passed: ${TOOL_COUNT} tools; discovery, interactive tours, safe Markdown, dynamic targets, dialogs, mobile, and unchanged sound history verified.`)
 } finally {
   await browser.close()
 }

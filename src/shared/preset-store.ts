@@ -1,6 +1,7 @@
 import type { PresetData } from '../audio/engine'
 import { PARAMS, SYNC_DIVISIONS } from './params'
 import { FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, type LfoPoint } from './messages'
+import { samePatchValue } from './patch-change'
 
 export const PRESET_STORAGE_KEY = 'cosynth.presets.v1'
 const LEGACY_PRESET_STORAGE_KEY = 'soundgineer.presets.v1'
@@ -133,6 +134,32 @@ export function validatePresetData(value: unknown): PresetData {
   return { name, version: PRESET_VERSION, params, mods, lfoShapes, fxOrder }
 }
 
+/**
+ * A preset was written, read back to be made current, or removed. `savePreset`,
+ * `loadPreset` and `deletePreset` are the only ways in, so every caller - the
+ * preset browser, a file import, and the WebMCP `save_preset` / `load_preset`
+ * tools - announces itself here without knowing that a UI exists.
+ *
+ * `deleted` earns its place for the same reason `saved` did: a delete that
+ * stayed silent would leave the dropdown listing a preset that no longer
+ * exists, which is exactly the bug this listener set was added to fix.
+ */
+export interface PresetStoreChange {
+  kind: 'saved' | 'loaded' | 'deleted'
+  name: string
+}
+
+const presetStoreListeners = new Set<(change: PresetStoreChange) => void>()
+
+export function onPresetStoreChange(listener: (change: PresetStoreChange) => void): () => void {
+  presetStoreListeners.add(listener)
+  return () => { presetStoreListeners.delete(listener) }
+}
+
+function notifyPresetStore(change: PresetStoreChange): void {
+  for (const listener of [...presetStoreListeners]) listener(change)
+}
+
 function browserStorage(): Storage {
   try {
     if (typeof localStorage === 'undefined') throw new Error('localStorage is unavailable')
@@ -191,6 +218,7 @@ export function savePreset(preset: PresetData, storage?: Storage): PresetData {
   } catch (error) {
     throw new Error(`Could not save preset to browser storage: ${error instanceof Error ? error.message : String(error)}`)
   }
+  notifyPresetStore({ kind: 'saved', name: saved.name })
   return validatePresetData(saved)
 }
 
@@ -200,5 +228,136 @@ export function loadPreset(name: unknown, storage?: Storage): PresetData | null 
   let list: PresetData[]
   try { list = readPresets(target) } catch (error) { throw storageReadError(error) }
   const found = list.find(item => item.name === canonical)
-  return found ? validatePresetData(found) : null
+  if (!found) return null
+  notifyPresetStore({ kind: 'loaded', name: canonical })
+  return validatePresetData(found)
+}
+
+/**
+ * Remove a user preset, and say which one went. `null` means this browser held
+ * no preset by that name; only a real removal writes storage and notifies.
+ *
+ * Factory presets are not deletable, and are not in here to begin with: storage
+ * holds user presets only, so a factory name finds nothing and returns `null`
+ * rather than throwing. The refusal message belongs to the caller, which knows
+ * the factory list - this module cannot import `factory-presets.ts`, because
+ * that module imports this one for `validatePresetData` - so
+ * `factoryDeleteRefusal` keeps the wording itself in one place.
+ *
+ * That split is also the right semantics for the collision the save tool
+ * already warns about: a user preset saved under a factory name is deliberate
+ * work, and deleting it is allowed. What comes back is the built-in patch of
+ * the same name, which is the only outcome a human would expect.
+ */
+export function deletePreset(name: unknown, storage?: Storage): PresetData | null {
+  const target = storage ?? browserStorage()
+  const canonical = validatePresetName(name)
+  let list: PresetData[]
+  try { list = readPresets(target) } catch (error) { throw storageReadError(error) }
+  const index = list.findIndex(item => item.name === canonical)
+  if (index < 0) return null
+  const [removed] = list.splice(index, 1)
+  try {
+    target.setItem(PRESET_STORAGE_KEY, JSON.stringify(list))
+  } catch (error) {
+    throw new Error(`Could not delete preset from browser storage: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  // The patch on screen is untouched by a delete, but it is no longer a copy of
+  // anything that exists, so it stops being attributed to the deleted preset.
+  if (isCurrentUserPreset(canonical)) clearCurrentPreset()
+  notifyPresetStore({ kind: 'deleted', name: canonical })
+  return removed
+}
+
+/** Why a delete was refused. Worded once here; the factory check is the caller's. */
+export function factoryDeleteRefusal(name: string): string {
+  return `"${name}" is a factory preset, and factory presets cannot be deleted: they are built into the page and can always be loaded again. Only presets saved in this browser can be deleted.`
+}
+
+/**
+ * A preset as the JSON an import will take back. Validation runs on the way
+ * out, so an export cannot produce a file this app would reject, and the result
+ * carries the two things a reimport needs: every semantic field, and
+ * `version: PRESET_VERSION`. The version is not decoration - a format 1 file
+ * has its LFO divisions rescaled on load and a format 2 file does not, and
+ * nothing but that tag separates them.
+ */
+export function serializePreset(preset: PresetData): string {
+  return JSON.stringify(validatePresetData(preset), null, 2)
+}
+
+/** Download name for an exported preset: its own name, slugged, or `patch`. */
+export function presetFileName(name: string): string {
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60)
+  return `${slug || 'patch'}.cosynth.json`
+}
+
+export type PresetSource = 'factory' | 'user'
+
+/**
+ * Which preset the live patch came from, and whether it still matches it.
+ * `name` is null before anything has been loaded, and after the current preset
+ * is deleted; `dirty` is false in that state because there is nothing to differ
+ * from.
+ */
+export interface CurrentPresetState {
+  name: string | null
+  source: PresetSource | null
+  dirty: boolean
+}
+
+/** The engine, as much of it as preset identity needs. */
+export interface PatchSource {
+  toPreset(name: string): PresetData
+}
+
+let current: { name: string; source: PresetSource; patch: PresetData } | null = null
+
+/**
+ * Record that the live patch is now a copy of this preset.
+ *
+ * The reference is read back out of the engine rather than taken from the
+ * preset that was passed to it, and that is the whole reason this takes a
+ * `PatchSource` instead of a `PresetData`. A preset on disk is not what the
+ * engine ends up holding: `applyPreset` fills in every parameter the preset
+ * omits (every factory preset omits most of them), clamps to 0..1, and stores
+ * into a Float32Array, so a stored 4/42 comes back as its float32 neighbour.
+ * Comparing against the file would report a fresh load as already modified.
+ *
+ * Call it AFTER `engine.loadPreset`, never before.
+ */
+export function markPresetLoaded(name: string, source: PresetSource, engine: PatchSource): void {
+  const canonical = validatePresetName(name)
+  current = { name: canonical, source, patch: engine.toPreset(canonical) }
+}
+
+/** Forget which preset the patch came from, without touching the patch. */
+export function clearCurrentPreset(): void {
+  current = null
+}
+
+/** Whether the patch is currently attributed to this browser's copy of `name`. */
+function isCurrentUserPreset(name: string): boolean {
+  return current?.source === 'user' && current.name === name
+}
+
+/**
+ * Whether the live patch still equals the preset that was loaded.
+ *
+ * Exact equality, no tolerance: both sides are the same `toPreset` accessor
+ * over the same Float32Array, so nothing arithmetic happens between them that
+ * an epsilon would have to absorb. A knob moved away and moved back to the same
+ * float32 value is genuinely not a change, and reporting it as one would make
+ * the flag useless for the thing it is for - "is there work here I would lose".
+ *
+ * `name` is left out of the comparison; only the sound is compared. So are the
+ * imported wavetable and noise sample, because `PresetData` cannot carry them:
+ * a preset that never held them cannot be dirtied by them either.
+ */
+export function currentPresetState(engine: PatchSource): CurrentPresetState {
+  if (!current) return { name: null, source: null, dirty: false }
+  const live = engine.toPreset(current.name)
+  const sound = (preset: PresetData) =>
+    ({ params: preset.params, mods: preset.mods, lfoShapes: preset.lfoShapes, fxOrder: preset.fxOrder })
+  return { name: current.name, source: current.source, dirty: !samePatchValue(sound(current.patch), sound(live)) }
 }
