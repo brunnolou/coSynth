@@ -256,6 +256,8 @@ main {
 }
 .agent-activity-actions { display: flex; gap: 4px; flex: 0 0 auto; }
 .agent-history-open { margin-left: 8px; }
+/* Keeps History at the far left while Keep/Reject stay right-aligned — and in place when they hide. */
+.agent-review-history { margin-right: auto; }
 .agent-guide-actions { margin-left: auto; display: flex; gap: 4px; flex: 0 0 auto; }
 .agent-btn {
   background: var(--panel-2);
@@ -802,10 +804,6 @@ body.mod-dragging .knob.moddable .knob-main-canvas {
   cursor: pointer;
 }
 .oct-btn:disabled { opacity: 0.35; cursor: default; }
-/* Two classes so this beats .agent-icon-button's 30x28 from iconButton,
-   whatever order the stylesheets land in. */
-.kb-bar .kb-history { flex: 0 0 22px; width: 22px; height: 20px; padding: 0; }
-.kb-bar .kb-history svg { width: 13px; height: 13px; }
 .oct-label { font-size: 10px; color: var(--text-dim); width: 56px; text-align: center; }
 .kb-range { font-size: 10px; padding: 2px 4px; }
 .kb-hint { font-size: 9px; color: var(--text-dim); margin-left: auto; }
@@ -917,6 +915,8 @@ input[type='range'] { accent-color: var(--accent); }
 .history-alternatives > summary { margin-bottom: 8px; font-size: 12px; }
 .history-retention { margin: 0; }
 [data-guide-id='dialog.history'] .modal-footer { flex-direction: column; align-items: stretch; gap: 4px; }
+/* The footer stacks, so this button keeps its own width instead of stretching across it. */
+.history-open-review { align-self: flex-start; margin-bottom: 4px; }
 @media (max-width: 520px) {
   .history-row-head { align-items: flex-start; }
   .history-row-head .agent-btn { max-width: 112px; white-space: normal; }

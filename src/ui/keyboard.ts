@@ -35,8 +35,7 @@ export class Keyboard {
   private readonly keyboardNotes = new Map<string, number>()
   private readonly disposeListeners: (() => void)[] = []
 
-  /** `leading` sits at the bottom-left of the keyboard bar, before the octave controls. */
-  constructor(private readonly engine: SynthEngine, leading?: HTMLElement) {
+  constructor(private readonly engine: SynthEngine) {
     this.root = el('div', 'keyboard-wrap')
     guideTarget(this.root, 'panel.keyboard', 'Playable keyboard', 'panel')
     const octDown = el('button', 'oct-btn', '−')
@@ -67,7 +66,6 @@ export class Keyboard {
     })
 
     const bar = el('div', 'kb-bar')
-    if (leading) bar.append(leading)
     bar.append(octDown, this.octLabel, octUp, range, el('span', 'kb-hint', "Play: A W S E D F T G Y H U J K O L P ; ' · octave Z / X"))
 
     this.keys.addEventListener('pointerdown', e => {
