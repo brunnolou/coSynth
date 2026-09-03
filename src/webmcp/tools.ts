@@ -412,6 +412,33 @@ function assertWindows(value: unknown): number | undefined {
   return boundedInteger(value, 'windows', MIN_ANALYSIS_WINDOWS, MIN_ANALYSIS_WINDOWS, MAX_ANALYSIS_WINDOWS)
 }
 
+/**
+ * How `compare_audio` analyses the candidate it renders, against a given reference.
+ *
+ * Deliberately carries NO `f0Hz`. `resolvePitch` treats a supplied one as
+ * `source: 'given'` with `confidence: 1` and never inspects the samples, so passing
+ * the reference's fundamental here - as this used to - meant the candidate's pitch
+ * was asserted rather than measured: `diff.pitch.centsError` was structurally 0, the
+ * `pitch-error` advice rule could never fire, and the harmonic picker searched bins
+ * the render had no partials in whenever `osc1.transpose`, `osc1.fine` or a reference
+ * sitting between two equal-tempered notes moved it off that frequency. An octave-off
+ * candidate is the exact failure this comparison exists to catch, so its fundamental
+ * is detected from its own samples.
+ *
+ * `windows` is copied from the reference so both sides are cut into the same number of
+ * time slices. The reference is analysable at `windows: 4…32`; a 4-window candidate
+ * against an 8-window reference makes the two brightness trajectories describe
+ * different fractions of sound and costs half the resolution the caller paid for.
+ * Anything outside the analyzer's bounds is dropped rather than passed on, so a
+ * stubbed or older metrics object cannot make the render throw.
+ */
+function candidateAnalysisOptions(reference: ReferenceAnalysis): AnalyzeAudioOptions {
+  const windows = reference.metrics.spectralWindows?.length ?? 0
+  return Number.isInteger(windows) && windows >= MIN_ANALYSIS_WINDOWS && windows <= MAX_ANALYSIS_WINDOWS
+    ? { windows }
+    : {}
+}
+
 /** Milliseconds trimmed off one end of a reference before it is analysed. */
 function assertTrimMs(value: unknown, label: string): number {
   if (value === undefined) return 0
@@ -1271,7 +1298,7 @@ export function createWebMcpTools(
     },
     {
       name: 'analyze_audio',
-      description: 'Re-analyze the last render (default), the live output (`source: "scope"`), or the uploaded reference. `source: "reference"` re-analyzes the retained reference PCM, so a corrected `f0Hz` or a higher `windows` count costs no re-upload. `render_audio` already returns these metrics, so call this only for a fresh look without re-rendering.',
+      description: 'Re-analyze the last render (default), the live output (`source: "scope"`), or the uploaded reference. `source: "reference"` re-analyzes the retained reference PCM, so a corrected `f0Hz` or a higher `windows` count costs no re-upload and replaces the active reference. `render_audio` already returns these metrics, so call this only for a fresh look without re-rendering.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1285,7 +1312,12 @@ export function createWebMcpTools(
         },
         additionalProperties: false
       },
-      annotations: { readOnlyHint: true },
+      // Not read-only: `source: "reference"` with a corrected `f0Hz` or a raised
+      // `windows` replaces the active reference and resets the best-so-far with
+      // it. Every other branch only reads, but an annotation is per tool, and
+      // claiming read-only for a call that moves the matching target is the kind
+      // of quiet inaccuracy this file refuses elsewhere.
+      annotations: { readOnlyHint: false },
       async execute(input, options) {
         const signal = invocationSignal(options)
         const value = assertObject(input, 'input', ['source', 'f0Hz', 'windows', 'format'])
@@ -1306,16 +1338,51 @@ export function createWebMcpTools(
           if (!session.lastReference || !session.referencePcm) {
             throw new Error('No reference is available yet. Call analyze_reference_audio first; its decoded PCM is retained so this call can re-analyze it at a different f0Hz or window count')
           }
+          const previous = session.lastReference
           const pcm = session.referencePcm
           const metrics = await analyzeAudioAsync(pcm.channelData, pcm.sampleRate, signal, analysisOptions)
+          // The re-analysis BECOMES the reference. Returning it and leaving
+          // `lastReference` untouched made the correction this branch advertises -
+          // detection picked the wrong octave, re-analyse at the right f0 without
+          // re-uploading - a no-op: every later `compare_audio` went on scoring
+          // against the very metrics the caller had just corrected, and a raised
+          // `windows` count was discarded with them.
+          //
+          // `f0Hz` and `windows` are the only inputs that can change the result: the
+          // PCM is unchanged and `analyzeAudio` is deterministic on it, so the
+          // fundamental and the window count settle whether this analysis differs
+          // from the stored one. A plain look at the reference therefore costs
+          // nothing - it re-derives the same numbers and leaves the session alone.
+          const replaced =
+            previous.metrics.pitch?.f0Hz !== metrics.pitch?.f0Hz ||
+            previous.metrics.pitch?.source !== metrics.pitch?.source ||
+            previous.metrics.spectralWindows?.length !== metrics.spectralWindows?.length
+          if (replaced) {
+            session.lastReference = { ...previous, metrics }
+            // A similarity scored against the old metrics is not comparable to one
+            // scored against these, so the running best starts over rather than
+            // carrying a figure earned against a different measurement of the same
+            // file - the same class of wrong-number-an-agent-trusts that
+            // `SILENT_CANDIDATE_REFUSAL` refuses. `trackMatchProgress` keys on
+            // reference identity, so the replacement above already resets it; this
+            // says so out loud and clears `lastComparison`, which `suggest_patch`
+            // would otherwise keep re-reading against a target that has moved.
+            session.match = null
+            session.lastComparison = null
+          }
           return withText({
             source: 'reference' as const,
-            ...(session.lastReference.name ? { name: session.lastReference.name } : {}),
-            duration: session.lastReference.duration,
+            ...(previous.name ? { name: previous.name } : {}),
+            duration: previous.duration,
             sampleRate: pcm.sampleRate,
             channels: pcm.channelData.length,
             metrics,
-            metricNotes: METRIC_NOTES
+            metricNotes: METRIC_NOTES,
+            activeReference: replaced ? ('replaced' as const) : ('unchanged' as const),
+            matchProgressReset: replaced,
+            note: replaced
+              ? 'These metrics are now the active reference: every later compare_audio scores against them. The best-so-far was reset with them, because a similarity measured against the previous analysis of this file cannot be compared with one measured against this analysis. Comparison numbering restarts at 1.'
+              : 'Same fundamental and same window count as the stored analysis, so this changed nothing: the active reference and the running best-so-far are untouched.'
           })
         }
         if (value.source === 'scope') return withText(scopeCandidate(analysisOptions))
@@ -1469,11 +1536,34 @@ export function createWebMcpTools(
             : validatePerformanceNotes(value.notes, MAX_RENDER_SECONDS)
           if (duration < sequence.duration) throw new Error('Render duration must cover the complete note sequence')
           try {
+            // The candidate's fundamental is MEASURED here, never assumed - see
+            // `candidateAnalysisOptions` for what assuming it cost.
+            //
+            // The consequence, decided deliberately: the two sides are now analysed
+            // at their OWN fundamentals, so "partial 3" is a different absolute
+            // frequency on each side. The per-partial diff nonetheless stays indexed
+            // by partial NUMBER rather than aligned by frequency. Timbre is the shape
+            // of the series relative to its own fundamental - which is exactly what
+            // `harmonicShape.amplitudesDbRelF0` holds - so partial n against partial n
+            // is the comparison a synthesist makes: "your third partial is 6 dB down
+            // on the target's" is a sentence about the patch, and it stays true after
+            // the tuning is fixed. Aligning by frequency would let an octave-high
+            // candidate match its partial 2k against the reference's partial k and
+            // score a near-perfect timbre match on half the reference's series, which
+            // is the very confusion this change exists to remove. The tuning error is
+            // reported on its own as `diff.pitch.centsError`, so the model fixes the
+            // octave first and reads the partials afterwards instead of letting one
+            // error absorb the other.
+            //
+            // When detection finds nothing - an unpitched or near-silent render -
+            // `metrics.pitch` is `null`, the harmonic blocks are absent, `centsError`
+            // is `null` and the text payload reads `PITCH n/a (no fundamental
+            // measured on your sound)`. That is the honest answer; falling back to
+            // the reference's f0 would reinstate the confidence-1 lie under a
+            // different name.
             await runPerformance(signal, operationSignal => renderSequence(
               sequence.notes, duration, undefined, operationSignal, 'AI comparison render',
-              // The reference's own fundamental, so both sides' partials are
-              // measured against the same f0 rather than each against its own.
-              referencePitch ? { f0Hz: referencePitch.f0Hz } : analysisOptionsFor(sequence.notes)
+              candidateAnalysisOptions(reference)
             ))
           } catch (error) {
             if ((error as Error | undefined)?.name === 'AbortError') throw error

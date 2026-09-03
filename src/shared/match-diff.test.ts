@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { AudioMetrics, AudioMetricsComparison } from './audio-analysis'
+import type { AudioMetrics, AudioMetricsComparison, SpectralWindow } from './audio-analysis'
 import { diffAudioMetrics } from './match-diff'
 
 /**
@@ -40,6 +40,24 @@ function makeMetrics(overrides: Partial<AudioMetrics> = {}): AudioMetrics {
     ...overrides
   }
 }
+
+/**
+ * `windows` equal, consecutive slices of one buffer, the way the analyzer emits them: the
+ * count varies (`analyze_reference_audio` takes 4…32) and `totalMs` varies independently,
+ * because the reference is a file and the candidate is a render.
+ */
+const spectralWindows = (centroidsHz: readonly number[], totalMs = 660): SpectralWindow[] =>
+  centroidsHz.map((spectralCentroidHz, index) => ({
+    startMs: (index * totalMs) / centroidsHz.length,
+    endMs: ((index + 1) * totalMs) / centroidsHz.length,
+    spectralCentroidHz,
+    spectralRolloffHz: spectralCentroidHz * 3,
+    levelDb: 0
+  }))
+
+/** The octave delta the diff should report for one pair of centroids, floor included. */
+const expectedDelta = (referenceHz: number, candidateHz: number): number =>
+  Math.log2((candidateHz + 20) / (referenceHz + 20))
 
 const comparison = (similarity = 0.612): AudioMetricsComparison =>
   ({ similarity, details: {} } as unknown as AudioMetricsComparison)
@@ -149,6 +167,138 @@ describe('diffAudioMetrics', () => {
     expect(diff.brightness[3].octaveDelta).toBeLessThan(0)
     expect(diff.brightness[0].startMs).toBe(0)
     expect(diff.brightness[0].endMs).toBe(165)
+  })
+
+  it('resamples mismatched window counts by position instead of pairing by index', () => {
+    // One sound, analysed twice. It holds 4 kHz for its first half and drops to 500 Hz for
+    // its second; the candidate is that same trajectory a little brighter throughout, and
+    // 2.5x longer, as a render of a shorter reference file would be.
+    const reference = makeMetrics({
+      spectralWindows: spectralWindows([4000, 4000, 4000, 4000, 500, 500, 500, 500], 660)
+    })
+    const candidate = makeMetrics({
+      spectralWindows: spectralWindows([5000, 5000, 700, 700], 1650)
+    })
+
+    const diff = diffAudioMetrics(reference, candidate, comparison())
+
+    // Resampled onto the coarser (4-window) grid: reference windows 0, 2, 5 and 7 sit at the
+    // same fractions of their buffer as candidate windows 0…3, so every row compares a
+    // brighter candidate slice against its own reference slice - positive throughout.
+    expect(diff.brightness.map((window) => window.octaveDelta)).toEqual([
+      expectedDelta(4000, 5000),
+      expectedDelta(4000, 5000),
+      expectedDelta(500, 700),
+      expectedDelta(500, 700)
+    ])
+    for (const window of diff.brightness) expect(window.octaveDelta).toBeGreaterThan(0)
+
+    // What pairing by index reported instead: rows 2 and 3 read the reference's *first half*
+    // against the candidate's second, so a uniformly brighter candidate came back 2.48
+    // octaves DARK with the sign inverted, and the first-to-last trend fell 2.8 octaves -
+    // `filter-envelope-depth` would rank "darkens too fast, lengthen env2.decay" at the top
+    // of a sound that never darkened at all.
+    const pairedByIndex = [0, 1, 2, 3].map((index) =>
+      expectedDelta(
+        reference.spectralWindows[index].spectralCentroidHz,
+        candidate.spectralWindows[index].spectralCentroidHz
+      )
+    )
+    expect(pairedByIndex[2]).toBeLessThan(-2)
+    expect(Math.sign(pairedByIndex[2])).toBe(-Math.sign(diff.brightness[2].octaveDelta))
+    const trend = (windows: readonly { octaveDelta: number }[]) =>
+      windows[windows.length - 1].octaveDelta - windows[0].octaveDelta
+    expect(pairedByIndex[3] - pairedByIndex[0]).toBeLessThan(-2.5)
+    expect(trend(diff.brightness)).toBeGreaterThan(0)
+  })
+
+  it('resamples the candidate when it is the finer side, mirroring the same positions', () => {
+    const reference = makeMetrics({ spectralWindows: spectralWindows([4000, 4000, 500, 500], 660) })
+    const candidate = makeMetrics({
+      spectralWindows: spectralWindows([5000, 5000, 5000, 5000, 700, 700, 700, 700], 400)
+    })
+
+    const diff = diffAudioMetrics(reference, candidate, comparison())
+
+    expect(diff.brightness.map((window) => window.octaveDelta)).toEqual([
+      expectedDelta(4000, 5000),
+      expectedDelta(4000, 5000),
+      // Candidate windows 0, 2, 5 and 7 - the same fractions of a buffer 260 ms shorter.
+      expectedDelta(500, 700),
+      expectedDelta(500, 700)
+    ])
+  })
+
+  it('leaves the equal-count path exactly as it was', () => {
+    // The common case: both sides analysed at the default 4 windows. Hardcoded rather than
+    // recomputed, so a change to the resampling that perturbs this path fails here.
+    const candidate = makeMetrics({ spectralWindows: spectralWindows([1000, 800, 600, 450]) })
+    const diff = diffAudioMetrics(makeMetrics(), candidate, comparison())
+
+    expect(diff.brightness).toHaveLength(4)
+    const deltas = diff.brightness.map((window) => window.octaveDelta)
+    expect(deltas[0]).toBeCloseTo(-0.985786, 6)
+    expect(deltas[1]).toBeCloseTo(-0.982298, 6)
+    expect(deltas[2]).toBeCloseTo(-0.976541, 6)
+    expect(deltas[3]).toBeCloseTo(-0.968973, 6)
+    // Row labels are still the reference's own windows, verbatim.
+    expect(diff.brightness.map((window) => [window.startMs, window.endMs])).toEqual(
+      makeMetrics().spectralWindows.map((window) => [window.startMs, window.endMs])
+    )
+  })
+
+  it('labels each row with the reference slice it sampled, never the candidate timeline', () => {
+    // Reference finer than the candidate, and on a different timeline: rows 0…3 sample
+    // reference windows 0, 2, 5 and 7, so those are the bounds that must be reported. Neither
+    // reference[0…3] nor any candidate bound would be true of the numbers being differenced.
+    const reference = makeMetrics({ spectralWindows: spectralWindows(Array(8).fill(1000), 660) })
+    const candidate = makeMetrics({ spectralWindows: spectralWindows(Array(4).fill(1000), 1650) })
+
+    const diff = diffAudioMetrics(reference, candidate, comparison())
+
+    expect(diff.brightness.map((window) => [window.startMs, window.endMs])).toEqual(
+      [0, 2, 5, 7].map((index) => [
+        reference.spectralWindows[index].startMs,
+        reference.spectralWindows[index].endMs
+      ])
+    )
+    const candidateBounds = candidate.spectralWindows.map((window) => window.endMs)
+    for (const window of diff.brightness) expect(candidateBounds).not.toContain(window.endMs)
+  })
+
+  it('handles both extremes of the 4…32 window range without throwing', () => {
+    const fine = makeMetrics({
+      spectralWindows: spectralWindows(Array.from({ length: 32 }, (_, index) => 4000 - index * 100))
+    })
+    const coarse = makeMetrics({ spectralWindows: spectralWindows([3800, 2600, 1400, 400], 900) })
+
+    for (const [reference, candidate] of [[fine, coarse], [coarse, fine]] as const) {
+      const diff = diffAudioMetrics(reference, candidate, comparison())
+      expect(diff.brightness).toHaveLength(4)
+      for (const window of diff.brightness) {
+        expect(Number.isFinite(window.octaveDelta)).toBe(true)
+        expect(Number.isFinite(window.startMs)).toBe(true)
+        expect(Number.isFinite(window.endMs)).toBe(true)
+      }
+    }
+  })
+
+  it('survives the degenerate one-window and zero-window grids', () => {
+    // Below the analyzer's 4-window floor, so unreachable through `analyzeAudio`; the diff is
+    // a pure function over its argument and must not divide by zero windows either way.
+    const single = makeMetrics({ spectralWindows: spectralWindows([1500]) })
+    const none = makeMetrics({ spectralWindows: [] })
+    const many = makeMetrics({ spectralWindows: spectralWindows([2000, 1600, 1200, 900]) })
+
+    for (const [reference, candidate] of [
+      [single, many], [many, single], [single, single], [none, many], [many, none], [none, none]
+    ] as const) {
+      const diff = diffAudioMetrics(reference, candidate, comparison())
+      expect(diff.brightness).toHaveLength(Math.min(reference.spectralWindows.length, candidate.spectralWindows.length))
+      everyNumber(diff.brightness, (found, path) => {
+        expect(Number.isFinite(found), `${path} is ${found}`).toBe(true)
+      })
+    }
   })
 
   it('leaks no NaN or Infinity from any division', () => {

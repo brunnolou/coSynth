@@ -10,6 +10,13 @@
  *
  * Refusing beats fabricating here, exactly as `decayT60Ms` already does.
  *
+ * Neither detector is stereo-aware, so both read a single signal. That signal is normally the
+ * mono sum, but the sum is the one mix that can destroy the thing being measured: coSynth
+ * produces anti-phase material on purpose - `osc1.spread`, unison detune, the chorus, all of
+ * which `stereoWidth` scores toward 1 - and summing opposite channels cancels a clear tone to
+ * nothing. So the sum's level is checked against the channels' first, and a cancelled sum is
+ * abandoned in favour of the channels themselves. See `COLLAPSE_RATIO`.
+ *
  * Safe in a Web Worker and under jsdom: no `window`, `document` or `AudioContext`, at import
  * or at call time.
  */
@@ -45,8 +52,23 @@ const AGREEMENT_CENTS = 50
  * frames instead, which keeps the whole detection under ~0.5 s and still spans the buffer.
  */
 const MAX_VETOED_FRAMES = 32
+/**
+ * How far the mono sum may fall below its loudest channel before we stop believing it. Two
+ * equal-amplitude channels `phi` apart sum to `cos(phi / 2)` of one channel's level, so this
+ * 0.25 (-12 dB) is only reached past ~151 degrees of phase difference. Every ordinary stereo
+ * shape sits well above it: 1.0 for identical channels, ~0.71 for uncorrelated ones, 0.5 with
+ * one channel silent. It fires on cancellation and on nothing else.
+ */
+const COLLAPSE_RATIO = 0.25
+/**
+ * ...and this is what keeps that ratio from firing on silence, where it is 0/0 or one noise
+ * floor over another. It is pitchy's own `minVolumeDecibels = -60` expressed as an amplitude
+ * (10 ** (-60 / 20)): below this the channels hold no frame the fallback could rescue, so a
+ * quiet sum means an empty recording rather than a cancelled one, and the answer stays `null`.
+ */
+const SILENT_RMS = 1e-3
 
-/** Mean of the channels. A mono mix is what both detectors want; neither is stereo-aware. */
+/** Mean of the channels. Still the right signal for everything that is not near anti-phase. */
 function toMono(channels: readonly Float32Array[], length: number): Float32Array {
   if (channels.length === 1) return channels[0]
   const mono = new Float32Array(length)
@@ -56,6 +78,14 @@ function toMono(channels: readonly Float32Array[], length: number): Float32Array
   }
   for (let i = 0; i < length; i++) mono[i] /= channels.length
   return mono
+}
+
+function rms(samples: Float32Array, length: number): number {
+  const n = Math.min(length, samples.length)
+  if (n <= 0) return 0
+  let sum = 0
+  for (let i = 0; i < n; i++) sum += samples[i] * samples[i]
+  return Math.sqrt(sum / n)
 }
 
 function centsBetween(a: number, b: number): number {
@@ -70,25 +100,21 @@ function windowFor(length: number): number {
   return size
 }
 
+interface Guards {
+  minHz: number
+  maxHz: number
+  minConfidence: number
+}
+
 /**
- * Estimate the fundamental of a decoded buffer, or return `null` when nothing periodic
- * survives the guards. Refusing beats fabricating here, exactly as `decayT60Ms` already does.
+ * The detector proper, on one already-chosen signal: two passes, one veto, a median frame.
  */
-export function detectPitch(
-  channels: readonly Float32Array[],
+function detectOn(
+  signal: Float32Array,
+  length: number,
   sampleRate: number,
-  options: DetectPitchOptions = {}
+  { minHz, maxHz, minConfidence }: Guards
 ): PitchEstimate | null {
-  const minHz = options.minHz ?? 16.35
-  const maxHz = options.maxHz ?? 5000
-  const minConfidence = options.minConfidence ?? 0.85
-
-  if (!channels.length || !Number.isFinite(sampleRate) || sampleRate <= 0) return null
-
-  const length = Math.min(...channels.map((c) => c.length))
-  if (length < MIN_WINDOW) return null
-
-  const mono = toMono(channels, length)
   const size = windowFor(length)
   const hop = size >> 1
 
@@ -98,7 +124,7 @@ export function detectPitch(
   // Pass 1: pitchy on every frame, cheap. Keep the frame indices that clear both guards.
   const passed: { start: number; hz: number; clarity: number }[] = []
   for (let start = 0; start + size <= length; start += hop) {
-    const frame = mono.subarray(start, start + size)
+    const frame = signal.subarray(start, start + size)
     const [hz, clarity] = detector.findPitch(frame, sampleRate)
     // Range guard first: pitchy has none of its own, and its subharmonic answers are the
     // confident ones, so clarity cannot be trusted to filter them.
@@ -113,7 +139,7 @@ export function detectPitch(
   const survivors: { hz: number; confidence: number }[] = []
   for (let i = 0; i < passed.length; i += step) {
     const { start, hz, clarity } = passed[i]
-    const frame = mono.subarray(start, start + size)
+    const frame = signal.subarray(start, start + size)
     const check = yin(frame, { fs: sampleRate, minFreq: minHz, maxFreq: maxHz })
     if (!check || !Number.isFinite(check.freq) || check.freq <= 0) continue
     if (centsBetween(hz, check.freq) > AGREEMENT_CENTS) continue
@@ -138,4 +164,51 @@ export function detectPitch(
     centsOffset: cents,
     source: 'detected'
   }
+}
+
+/**
+ * Estimate the fundamental of a decoded buffer, or return `null` when nothing periodic
+ * survives the guards. Refusing beats fabricating here, exactly as `decayT60Ms` already does.
+ */
+export function detectPitch(
+  channels: readonly Float32Array[],
+  sampleRate: number,
+  options: DetectPitchOptions = {}
+): PitchEstimate | null {
+  const guards: Guards = {
+    minHz: options.minHz ?? 16.35,
+    maxHz: options.maxHz ?? 5000,
+    minConfidence: options.minConfidence ?? 0.85
+  }
+
+  if (!channels.length || !Number.isFinite(sampleRate) || sampleRate <= 0) return null
+
+  const length = Math.min(...channels.map((c) => c.length))
+  if (length < MIN_WINDOW) return null
+
+  if (channels.length === 1) return detectOn(channels[0], length, sampleRate, guards)
+
+  // Two O(n) passes of arithmetic decide which signal to spend the detectors on. That is
+  // nothing beside pitchy's ~0.5 ms per frame, and it buys the whole anti-phase case.
+  const levels = channels.map((channel) => rms(channel, length))
+  const loudest = Math.max(...levels)
+  const mono = toMono(channels, length)
+
+  // A sum far below its own channels has cancelled; a sum far below nothing has not. The
+  // absolute floor is what separates those two, and it has to come first - without it, digital
+  // silence reads as a total collapse and sends us hunting for a pitch that was never there.
+  const cancelled = loudest >= SILENT_RMS && rms(mono, length) < COLLAPSE_RATIO * loudest
+  if (!cancelled) return detectOn(mono, length, sampleRate, guards)
+
+  // The channels survive what their sum did not, and near anti-phase they are near mirrors of
+  // each other, so the loudest one alone normally answers - one pass, the same cost as the sum
+  // it replaced. The rest are tried only if it refuses.
+  const byLevel = levels
+    .map((level, index) => ({ level, index }))
+    .sort((a, b) => b.level - a.level)
+  for (const { index } of byLevel) {
+    const got = detectOn(channels[index].subarray(0, length), length, sampleRate, guards)
+    if (got) return got
+  }
+  return null
 }

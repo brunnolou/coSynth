@@ -86,20 +86,59 @@ function diffHarmonics(reference: AudioMetrics, candidate: AudioMetrics): MatchD
   }
 }
 
+/**
+ * Nearest source window for output row `index` of a `points`-long grid, by *position*.
+ *
+ * Deliberately the same arithmetic as `brightnessDetail` in `audio-analysis.ts`: that
+ * function scores the very trajectories this one reports, and two resampling conventions
+ * for one quantity would let the table and the score disagree about which slices were
+ * compared. Endpoints anchor - row 0 is the first slice of each side and the last row the
+ * last - so the map is over fraction-of-sound rather than over milliseconds.
+ *
+ * `points <= 1` has no fraction to interpolate (0/0); the single row reads the first
+ * window, which keeps the degenerate case finite instead of indexing past the array.
+ */
+const resampledIndex = (length: number, index: number, points: number): number =>
+  points > 1
+    ? Math.min(length - 1, Math.max(0, Math.round(index * (length - 1) / (points - 1))))
+    : 0
+
+/**
+ * Per-window signed brightness error, resampled by position onto the coarser of the two
+ * grids.
+ *
+ * `analyze_reference_audio` takes `windows: 4…32`, so the two sides can carry different
+ * counts. Each window is an equal, consecutive slice of *its own* buffer, so window i of a
+ * 4-window run and window i of an 8-window run describe different spans of sound: pairing
+ * by index compared the reference's first half against the whole candidate and handed
+ * `filter-cutoff-static` / `filter-envelope-depth` a trajectory whose trend, and often
+ * whose sign, belonged to no pair of slices that exist. Index position is fraction of
+ * sound here, so aligning on it also survives the two sounds having different durations -
+ * a reference file and a rendered candidate rarely share one.
+ *
+ * The output grid is the COARSER side. Resampling up would invent resolution neither
+ * measurement has, repeat nearest-neighbour values into plateaus that read as real
+ * brightness holds, and lengthen a table a human and a model read row by row.
+ *
+ * `startMs`/`endMs` are the bounds of the REFERENCE slice this row sampled - the provenance
+ * of the row's reference centroid, never a span shared with the candidate, whose matching
+ * slice sits at the same fraction of a possibly different duration. When the reference is
+ * the coarser side (equal counts included) every row samples reference[i], so the labels
+ * are its windows verbatim and the common path is unchanged.
+ */
 function diffBrightness(
   reference: readonly SpectralWindow[],
   candidate: readonly SpectralWindow[]
 ): MatchDiff['brightness'] {
-  // Windows pair by index; the analyzer emits a fixed count, and a short array only ever
-  // means one side was analysed by an older build. Extra windows on either side are dropped
-  // rather than compared against nothing.
-  const count = Math.min(reference.length, candidate.length)
+  const points = Math.min(reference.length, candidate.length)
   const windows: MatchDiff['brightness'] = []
-  for (let index = 0; index < count; index++) {
+  for (let index = 0; index < points; index++) {
+    const referenceWindow = reference[resampledIndex(reference.length, index, points)]
+    const candidateWindow = candidate[resampledIndex(candidate.length, index, points)]
     windows.push({
-      startMs: reference[index].startMs,
-      endMs: reference[index].endMs,
-      octaveDelta: octaveDelta(reference[index].spectralCentroidHz, candidate[index].spectralCentroidHz)
+      startMs: referenceWindow.startMs,
+      endMs: referenceWindow.endMs,
+      octaveDelta: octaveDelta(referenceWindow.spectralCentroidHz, candidateWindow.spectralCentroidHz)
     })
   }
   return windows

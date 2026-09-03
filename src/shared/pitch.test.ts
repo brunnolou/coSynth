@@ -97,6 +97,31 @@ const vibrato = (hz: number, seconds = 1.5, sampleRate = SR) => {
   })
 }
 
+/** The same wave, shifted by `degrees`. `invert` flips it as well, for true anti-phase. */
+const shifted = (hz: number, degrees: number, seconds = 1, sampleRate = SR, amp = 0.8) =>
+  render(seconds, sampleRate, (t) => amp * Math.sin(2 * Math.PI * hz * t + (degrees * Math.PI) / 180))
+
+/** Scaled deterministic noise. The seed is a parameter so two channels can dither apart. */
+const quietNoise = (amp: number, seconds = 1, sampleRate = SR, startSeed = 4242) => {
+  let seed = startSeed
+  return render(seconds, sampleRate, () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+    return (seed / 0x3fffffff - 1) * amp
+  })
+}
+
+const inverted = (samples: Float32Array) => {
+  const out = new Float32Array(samples.length)
+  for (let i = 0; i < samples.length; i++) out[i] = -samples[i]
+  return out
+}
+
+const mixed = (a: Float32Array, b: Float32Array) => {
+  const out = new Float32Array(Math.min(a.length, b.length))
+  for (let i = 0; i < out.length; i++) out[i] = a[i] + b[i]
+  return out
+}
+
 const centsOff = (hz: number, target: number) => Math.abs(1200 * Math.log2(hz / target))
 
 describe('detectPitch', () => {
@@ -192,5 +217,94 @@ describe('detectPitch', () => {
 
   it('refuses no channels at all', () => {
     expect(detectPitch([], SR)).toBeNull()
+  })
+})
+
+/**
+ * `stereoWidth` is documented as "0 is identical L/R, 1 is fully anti-phase", so anti-phase
+ * material is something this synth produces on purpose - `osc1.spread`, unison detune, the
+ * chorus. A mono sum cancels it, and the cancellation is silent and total: no pitch, no
+ * harmonics, no auto-render. These are the cases where the sum must not be the only evidence.
+ */
+describe('detectPitch on out-of-phase stereo', () => {
+  it('detects a fully anti-phase 220 Hz tone that a mono sum cancels to nothing', () => {
+    const left = sine(220)
+    const got = detectPitch([left, inverted(left)], SR)
+    expect(got).not.toBeNull()
+    expect(got!.midi).toBe(57)
+    expect(centsOff(got!.f0Hz, 220)).toBeLessThan(1)
+  })
+
+  // The realistic version: each channel has its own dither, so the sum is not silence but the
+  // dither alone - the tone is gone and only noise is left to measure.
+  it('detects an anti-phase tone whose sum residual is buried in per-channel noise', () => {
+    const tone = sine(220)
+    const left = mixed(tone, quietNoise(0.05, 1, SR, 8081))
+    const right = mixed(inverted(tone), quietNoise(0.05, 1, SR, 31337))
+    const got = detectPitch([left, right], SR)
+    expect(got).not.toBeNull()
+    expect(centsOff(got!.f0Hz, 220)).toBeLessThan(2)
+  })
+
+  it('detects a near-anti-phase pair 170 degrees apart', () => {
+    const got = detectPitch([sine(220), shifted(220, 170)], SR)
+    expect(got).not.toBeNull()
+    expect(centsOff(got!.f0Hz, 220)).toBeLessThan(1)
+  })
+
+  it('detects an inverted channel delayed by a few samples', () => {
+    const left = sine(220, 1.05)
+    const right = inverted(left).subarray(5)
+    const got = detectPitch([left.subarray(0, right.length), right], SR)
+    expect(got).not.toBeNull()
+    expect(centsOff(got!.f0Hz, 220)).toBeLessThan(1)
+  })
+
+  // The guard against the fix over-reaching: a cancelled sum and an empty one look alike by
+  // ratio alone, and only one of them has a pitch hiding in the channels.
+  it('still refuses when both channels are silent', () => {
+    expect(detectPitch([new Float32Array(SR), new Float32Array(SR)], SR)).toBeNull()
+  })
+
+  it('still refuses anti-phase noise far below the volume floor', () => {
+    const left = quietNoise(1e-5)
+    expect(detectPitch([left, inverted(left)], SR)).toBeNull()
+  })
+
+  // ...and loud enough to trip the collapse test, which is the harder half: the fallback runs,
+  // reaches the channels, and must still find nothing worth naming in white noise.
+  it('still refuses anti-phase noise loud enough to trip the collapse test', () => {
+    const left = quietNoise(0.7)
+    expect(detectPitch([left, inverted(left)], SR)).toBeNull()
+  })
+
+  it('still refuses an anti-phase kick drum', () => {
+    const left = kick()
+    expect(detectPitch([left, inverted(left)], SR)).toBeNull()
+  })
+
+  it('detects when one channel is silent and the other carries the tone', () => {
+    const got = detectPitch([sine(440), new Float32Array(SR)], SR)
+    expect(got).not.toBeNull()
+    expect(centsOff(got!.f0Hz, 440)).toBeLessThan(1)
+  })
+
+  // The common path has to be provably untouched, so this asserts the identical f0 - not a
+  // close one - that the same tone gets as a single channel.
+  it('leaves ordinary in-phase stereo on exactly the mono answer', () => {
+    const mono = detectPitch([sine(440)], SR)
+    const stereo = detectPitch([sine(440), sine(440)], SR)
+    expect(mono).not.toBeNull()
+    expect(stereo).not.toBeNull()
+    expect(stereo!.f0Hz).toBe(mono!.f0Hz)
+    expect(stereo!.confidence).toBe(mono!.confidence)
+  })
+
+  it('does not throw on channels of differing lengths', () => {
+    const left = sine(330, 1)
+    expect(() => detectPitch([left, sine(330, 0.5)], SR)).not.toThrow()
+    expect(() => detectPitch([left, inverted(sine(330, 0.5))], SR)).not.toThrow()
+    expect(() => detectPitch([sine(330, 0.5), left], SR)).not.toThrow()
+    expect(() => detectPitch([left, new Float32Array(0)], SR)).not.toThrow()
   })
 })

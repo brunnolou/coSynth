@@ -116,7 +116,9 @@ describe('adviseFromDiff', () => {
   })
 
   it('emits only known params and legal suggestions across a spread of diffs', () => {
-    const magnitudes = [-3000, -1200, -120, -12, -1.2, 1.2, 12, 120, 1200, 3000]
+    // The negative half-semitone cases (+-1150, +-50) ride through here too, so
+    // the general min/max/step assertion covers them.
+    const magnitudes = [-3000, -1200, -1150, -120, -50, -12, -1.2, 1.2, 12, 50, 120, 1150, 1200, 3000]
     const patches = [
       defaultPatch(),
       {},
@@ -184,6 +186,25 @@ describe('adviseFromDiff', () => {
 })
 
 describe('pitch', () => {
+  /**
+   * The semitone count the finding TELLS a model to apply. Read back out of the
+   * prose rather than recomputed, so these tests prove that the sentence and the
+   * machine-applied value agree instead of restating the formula twice.
+   */
+  function semitonesFromFinding(finding: string): number {
+    const m = /transpose by ([+-]?\d+(?:\.\d+)?) semitones?/i.exec(finding)
+    expect(m, `no semitone move in finding: ${finding}`).not.toBeNull()
+    return Number(m![1])
+  }
+
+  function pitchAction(cents: number, patch: PatchValues = defaultPatch()) {
+    const diff = zeroDiff()
+    diff.pitch.centsError = cents
+    const [action] = adviseFromDiff(diff, patch)
+    expect(action, `no action for cents=${cents}`).toBeDefined()
+    return action
+  }
+
   it('names an octave error explicitly rather than quoting 1200 cents', () => {
     for (const cents of [1200, -1200, 2400, -2400, 1180]) {
       const diff = zeroDiff()
@@ -217,6 +238,108 @@ describe('pitch', () => {
     const diff = zeroDiff()
     diff.pitch.centsError = 4
     expect(adviseFromDiff(diff, defaultPatch())).toEqual([])
+  })
+
+  it('suggests exactly the semitone count its finding states', () => {
+    const sweep = [
+      50, -50, 99, -99, 101, -101,
+      // The octave band and both of its edges, inside and one cent outside.
+      1140, -1140, 1139, -1139, 1150, -1150, 1200, -1200, 1250, -1250, 1260, -1260, 1261, -1261,
+      2340, -2340, 2350, -2350, 2400, -2400, 2460, -2460, 2461, -2461
+    ]
+    for (const cents of sweep) {
+      const action = pitchAction(cents)
+      const s = action.suggested
+      expect(s?.id, `cents=${cents}`).toBe('osc1.transpose')
+      expect(s!.to - s!.from, `cents=${cents}`).toBe(semitonesFromFinding(action.finding))
+      expectLegalSuggestion(action)
+    }
+  })
+
+  it('rounds a negative half-semitone away from zero, not toward +Infinity', () => {
+    // Math.round(-1150 / 100) is Math.round(-11.5) === -11, a semitone short of
+    // the octave the same finding names. -12 is the only defensible answer.
+    const action = pitchAction(-1150)
+    expect(action.suggested).toEqual({ id: 'osc1.transpose', from: 0, to: 12, unit: 'st' })
+    expect(semitonesFromFinding(action.finding)).toBe(12)
+    expect(action.finding.toLowerCase()).toContain('octave')
+    expect(action.direction).toBe('increase')
+  })
+
+  it('corrects +X and -X by equal and opposite amounts', () => {
+    for (const cents of [50, 99, 101, 175, 1139, 1140, 1150, 1200, 1250, 1260, 1261, 2350, 2400, 3000]) {
+      const up = pitchAction(cents)
+      const down = pitchAction(-cents)
+      expect(up.suggested!.to, `cents=${cents}`).toBe(-down.suggested!.to)
+      expect(semitonesFromFinding(up.finding), `cents=${cents}`).toBe(-semitonesFromFinding(down.finding))
+      expect(up.confidence).toBe(down.confidence)
+    }
+  })
+
+  it('agrees on the octave word and the semitone count at every band edge', () => {
+    // Inside the 60-cent band the octave decides the count; outside it the
+    // nearest semitone does. No input gets one answer from each.
+    const cases = [
+      [1140, -12, true], [1139, -11, false], [1260, -12, true], [1261, -13, false],
+      [-1140, 12, true], [-1139, 11, false], [-1260, 12, true], [-1261, 13, false],
+      [2340, -24, true], [2339, -23, false], [2460, -24, true], [2461, -25, false],
+      [-2340, 24, true], [-2339, 23, false], [-2460, 24, true], [-2461, 25, false]
+    ] as const
+    for (const [cents, semitones, isOctave] of cases) {
+      const action = pitchAction(cents)
+      expect(action.finding.toLowerCase().includes('octave'), `cents=${cents}`).toBe(isOctave)
+      expect(semitonesFromFinding(action.finding), `cents=${cents}`).toBe(semitones)
+      expect(action.suggested!.to - action.suggested!.from, `cents=${cents}`).toBe(semitones)
+    }
+  })
+
+  it('names the leftover cents so the two moves add up to the whole error', () => {
+    for (const cents of [1141, -1141, 1150, -1150, 1260, -1260, 175, -175]) {
+      const action = pitchAction(cents)
+      const m = /([+-]\d+(?:\.\d+)?) cents? on osc1\.fine/.exec(action.finding)
+      expect(m, `no residual in: ${action.finding}`).not.toBeNull()
+      expect(semitonesFromFinding(action.finding) * 100 + Number(m![1])).toBeCloseTo(-cents, 6)
+    }
+  })
+
+  it('routes a sub-semitone error to osc1.fine and never to osc1.transpose', () => {
+    for (const cents of [-49, -20, 20, 49]) {
+      const action = pitchAction(cents)
+      expect(action.suggested!.id, `cents=${cents}`).toBe('osc1.fine')
+      expect(action.suggested!.to, `cents=${cents}`).toBe(-cents)
+      expect(action.finding, `cents=${cents}`).not.toMatch(/transpose by/i)
+      expect(action.confidence).toBe('medium')
+      expect(action.paramIds).not.toContain('osc1.transpose')
+    }
+  })
+
+  it('treats the 50-cent transpose boundary symmetrically', () => {
+    // Math.round(-0.5) is -0, so -50 cents used to fall through to osc1.fine
+    // while +50 went to osc1.transpose.
+    expect(pitchAction(50).suggested).toEqual({ id: 'osc1.transpose', from: 0, to: -1, unit: 'st' })
+    expect(pitchAction(-50).suggested).toEqual({ id: 'osc1.transpose', from: 0, to: 1, unit: 'st' })
+  })
+
+  it('quantizes a fractional transpose away from zero in both directions', () => {
+    // legalValue's step rounding sees negative halves too: 0.5 - 12 is -11.5.
+    expect(pitchAction(1200, defaultPatch({ 'osc1.transpose': 0.5 })).suggested!.to).toBe(-12)
+    expect(pitchAction(-1200, defaultPatch({ 'osc1.transpose': -0.5 })).suggested!.to).toBe(12)
+  })
+
+  it('keeps every pitch suggestion inside its range and on its step', () => {
+    const patches: PatchValues[] = [
+      defaultPatch(),
+      defaultPatch({ 'osc1.transpose': 44, 'osc1.fine': 90 }),
+      defaultPatch({ 'osc1.transpose': -44, 'osc1.fine': -90 }),
+      {}
+    ]
+    for (const patch of patches) {
+      for (let cents = -3000; cents <= 3000; cents += 25) {
+        const diff = zeroDiff()
+        diff.pitch.centsError = cents
+        for (const action of adviseFromDiff(diff, patch)) expectLegalSuggestion(action)
+      }
+    }
   })
 })
 

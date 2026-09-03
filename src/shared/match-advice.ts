@@ -110,9 +110,26 @@ export interface AdviceRule {
 
 const PARAM_BY_ID: ReadonlyMap<string, ParamDef> = new Map(PARAMS.map(d => [d.id, d]))
 
+/**
+ * Round half AWAY FROM ZERO.
+ *
+ * `Math.round` breaks ties toward +Infinity, so `Math.round(11.5)` is 12 while
+ * `Math.round(-11.5)` is -11. Every quantity in this module is a SIGNED error,
+ * and half of them are negative by construction, so that asymmetry means an
+ * error and its mirror image get corrected by different amounts: a flat octave
+ * lands a semitone short of the sharp one of the same size. `|f(-x)| === |f(x)|`
+ * is the property this file needs, and this is the cheapest form of it.
+ *
+ * `Math.sign(-0.2) * Math.round(0.2)` is `-0`; the `+ 0` normalizes it so a
+ * suggested value never serializes as `-0`.
+ */
+function roundTiesAwayFromZero(v: number): number {
+  return Math.sign(v) * Math.round(Math.abs(v)) + 0
+}
+
 function round(v: number, places = 6): number {
   const f = 10 ** places
-  return Math.round(v * f) / f
+  return roundTiesAwayFromZero(v * f) / f
 }
 
 const n1 = (v: number) => (Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1))
@@ -141,7 +158,10 @@ export function legalValue(def: ParamDef, v: number): number {
     return Math.min(def.choices.length - 1, Math.max(0, Number.isFinite(i) ? i : 0))
   }
   let x = Math.min(def.max, Math.max(def.min, v))
-  if (def.step) x = Math.min(def.max, Math.max(def.min, Math.round(x / def.step) * def.step))
+  // Half away from zero, not `Math.round`: `osc1.transpose` (-48..48, step 1)
+  // and `sub.octave` (-3..0, step 1) both span negative values, and rounding
+  // -11.5 to -11 while rounding 11.5 to 12 would bias every downward move.
+  if (def.step) x = Math.min(def.max, Math.max(def.min, roundTiesAwayFromZero(x / def.step) * def.step))
   x = round(x)
   // Rounding for display can push a value a hair past an endpoint; re-clamp.
   return Math.min(def.max, Math.max(def.min, x))
@@ -200,7 +220,71 @@ function bandMean(bands: MatchDiff['bands'], minHz: number): number | null {
   return vals.length === 0 ? null : mean(vals)
 }
 
+const SEMITONE_CENTS = 100
+const OCTAVE_SEMITONES = 12
+const OCTAVE_CENTS = OCTAVE_SEMITONES * SEMITONE_CENTS
+
+/**
+ * How far off a whole octave a pitch error may sit and still be CALLED an
+ * octave error. Detectors miss by an exact octave, so anything inside this band
+ * is one, and whatever is left over (up to 60 cents) is an ordinary detune
+ * riding on top of it — reported separately rather than folded into the octave.
+ */
 const OCTAVE_TOLERANCE_CENTS = 60
+
+/** The pitch move, as ONE value. Prose and `suggested` are both read off this. */
+interface PitchCorrection {
+  /** Semitones to ADD to `osc1.transpose`. 0 when the whole error fits in `osc1.fine`. */
+  semitones: number
+  /** Cents to ADD to `osc1.fine` after `semitones` is applied. */
+  residualCents: number
+  /** Signed octave count when this is an octave error, 0 otherwise. `semitones` is 12x it. */
+  octaves: number
+}
+
+/**
+ * Turn a signed cents error into the correction that removes it.
+ *
+ * This is the single source of truth for the `pitch-error` rule: the finding
+ * text is PHRASED from the numbers it returns rather than recomputed alongside
+ * them, so the sentence an agent reads and the value an agent applies cannot
+ * disagree. They used to. The rule classified an octave error from
+ * `Math.round(cents / 1200)` and then derived the transpose independently from
+ * `Math.round(cents / 100)`, which parts company anywhere in the 50..60 cent
+ * shell of the tolerance band (-1141 cents read "1 octave below, +12 semitones"
+ * and suggested +11), and `Math.round`'s tie-break toward +Infinity widened that
+ * to the exact half-octave case: `Math.round(-11.5)` is -11, so -1150 cents said
+ * "+12 semitones" and suggested +11 while +1150 cents said and suggested -12.
+ *
+ * Two rules settle every case:
+ *
+ * - Inside the octave band the OCTAVE wins the semitone count. The band is wider
+ *   (60 cents) than the semitone grid's own rounding (50 cents), so the count
+ *   has to come from the same classification that produces the word "octave".
+ * - Outside it, the nearest semitone, rounded half away from zero so +X and -X
+ *   are corrected by equal and opposite amounts.
+ *
+ * `residualCents` is always what is left over, so `semitones * 100 +
+ * residualCents === -cents` exactly, for every input.
+ */
+function pitchCorrection(cents: number): PitchCorrection {
+  const nearestOctave = roundTiesAwayFromZero(cents / OCTAVE_CENTS)
+  const isOctave = nearestOctave !== 0 && Math.abs(cents - nearestOctave * OCTAVE_CENTS) <= OCTAVE_TOLERANCE_CENTS
+  const octaves = isOctave ? -nearestOctave : 0
+  const semitones = isOctave ? octaves * OCTAVE_SEMITONES : -roundTiesAwayFromZero(cents / SEMITONE_CENTS)
+  return { semitones, residualCents: round(-cents - semitones * SEMITONE_CENTS), octaves }
+}
+
+/** `+12`, `-3`, `+49.7` — a signed number for prose an agent has to parse back. */
+function signedNumber(v: number): string {
+  return `${v > 0 ? '+' : ''}${round(v, 1)}`
+}
+
+/** `-12 semitones`, `+1 cent`. Signed, and singular only at exactly one unit. */
+function signedUnits(v: number, unit: string): string {
+  const rounded = round(v, 1)
+  return `${signedNumber(rounded)} ${unit}${Math.abs(rounded) === 1 ? '' : 's'}`
+}
 
 // ------------------------------------------------------------------ rules
 
@@ -219,27 +303,39 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
     evaluate({ diff, patch }) {
       const cents = diff.pitch.centsError
       if (cents === null || !Number.isFinite(cents)) return null
-      const octaves = cents / 1200
-      const nearestOctave = Math.round(octaves)
-      const isOctave = nearestOctave !== 0 && Math.abs(cents - nearestOctave * 1200) <= OCTAVE_TOLERANCE_CENTS
+      // ONE computation. Everything below is phrased from it, never recomputed.
+      const { semitones, residualCents, octaves } = pitchCorrection(cents)
+      // `semitones !== 0` is exactly `|cents| >= 50` under half-away-from-zero
+      // rounding, so the old `Math.abs(cents) >= 50 && semitones !== 0` guard
+      // collapses to this — and stops treating -50 and +50 differently.
+      const onTranspose = semitones !== 0
       const sharp = cents > 0
-      const direction: MatchAction['direction'] = sharp ? 'decrease' : 'increase'
-      const finding = isOctave
-        ? `Octave error: the candidate is ${Math.abs(nearestOctave)} octave${Math.abs(nearestOctave) === 1 ? '' : 's'} ${sharp ? 'above' : 'below'} the reference (${n1(cents)} cents). Transpose by ${sharp ? '-' : '+'}${Math.abs(nearestOctave) * 12} semitones, do not chase this with fine tuning.`
-        : `Candidate is ${n1(Math.abs(cents))} cents ${sharp ? 'sharp' : 'flat'}${diff.pitch.referenceHz !== null && diff.pitch.candidateHz !== null ? ` (${n1(diff.pitch.candidateHz)} Hz against ${n1(diff.pitch.referenceHz)} Hz)` : ''}.`
-      const semitones = Math.round(cents / 100)
-      const suggested = Math.abs(cents) >= 50 && semitones !== 0
-        ? suggest(patch, 'osc1.transpose', from => from - semitones)
-        : suggest(patch, 'osc1.fine', from => from - cents)
+      // The whole error rarely lands on a semitone. Naming the leftover lets an
+      // agent finish the move in one round trip instead of two.
+      const fineNote = Math.abs(residualCents) >= 0.5
+        ? `, then ${signedUnits(residualCents, 'cent')} on osc1.fine`
+        : ''
+      const hzNote = diff.pitch.referenceHz !== null && diff.pitch.candidateHz !== null
+        ? ` (${n1(diff.pitch.candidateHz)} Hz against ${n1(diff.pitch.referenceHz)} Hz)`
+        : ''
+      const finding = octaves !== 0
+        // "Octave" is deliberate: a model acts on it far more reliably than on
+        // "1200 cents sharp", which reads like any other detune.
+        ? `Octave error: the candidate is ${Math.abs(octaves)} octave${Math.abs(octaves) === 1 ? '' : 's'} ${octaves < 0 ? 'above' : 'below'} the reference (${n1(cents)} cents). Transpose by ${signedUnits(semitones, 'semitone')}${fineNote}; do not chase the octave itself with fine tuning.`
+        : onTranspose
+          ? `Candidate is ${n1(Math.abs(cents))} cents ${sharp ? 'sharp' : 'flat'}${hzNote}. Transpose by ${signedUnits(semitones, 'semitone')}${fineNote}.`
+          : `Candidate is ${n1(Math.abs(cents))} cents ${sharp ? 'sharp' : 'flat'}${hzNote}. Under a semitone, so this is osc1.fine (${signedUnits(residualCents, 'cent')}), not osc1.transpose.`
       return {
         error: cents,
         finding,
-        direction,
+        direction: (onTranspose ? semitones : residualCents) < 0 ? 'decrease' : 'increase',
         // Pitch to transpose is one-to-one and exact. Sub-semitone errors can
         // also come out of unison detune, so those stay medium.
-        confidence: Math.abs(cents) >= 50 ? 'high' : 'medium',
-        suggested,
-        paramIds: Math.abs(cents) >= 50 ? ['osc1.transpose', 'osc1.fine'] : ['osc1.fine', 'osc1.detune']
+        confidence: onTranspose ? 'high' : 'medium',
+        suggested: onTranspose
+          ? suggest(patch, 'osc1.transpose', from => from + semitones)
+          : suggest(patch, 'osc1.fine', from => from + residualCents),
+        paramIds: onTranspose ? ['osc1.transpose', 'osc1.fine'] : ['osc1.fine', 'osc1.detune']
       }
     }
   },
@@ -608,7 +704,10 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
       const quiet = d < 0
       const from = patchRaw(patch, 'master.volume')
       const def = PARAM_BY_ID.get('master.volume')
-      const wanted = from === undefined ? undefined : from * 10 ** (-d / 20)
+      // One gain, used by both the clip note and the suggestion. Spelling the
+      // formula out twice is how the finding and the value drift apart.
+      const gain = 10 ** (-d / 20)
+      const wanted = from === undefined ? undefined : from * gain
       const clipNote = wanted !== undefined && def !== undefined && (wanted > def.max || wanted < def.min)
         ? ` master.volume cannot travel that far (range ${def.min}..${def.max}); take the rest from oscillator levels or comp.makeup.`
         : ''
@@ -619,7 +718,7 @@ export const ADVICE_RULES: readonly AdviceRule[] = [
         // A gain change moves gated loudness by exactly that gain (R128's
         // relative gate), so this one really is one-to-one.
         confidence: 'high',
-        suggested: suggest(patch, 'master.volume', v => v * 10 ** (-d / 20))
+        suggested: suggest(patch, 'master.volume', v => v * gain)
       }
     }
   }

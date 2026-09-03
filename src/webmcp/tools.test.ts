@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { PARAMS, defaultValues, paramIndex } from '../shared/params'
+import { PARAMS, defaultValues, normToValue, paramDef, paramIndex } from '../shared/params'
 import { DEFAULT_FX_ORDER, FX_IDS, MAX_MOD_SLOTS, MOD_SOURCES, defaultLfoShape, modSourceIndex, type ModSlotState } from '../shared/messages'
 import type { PresetData, RecordedAudio, SynthEngine } from '../audio/engine'
 import { createWebMcpTools, type WebMcpToolDependencies } from './tools'
@@ -115,14 +115,16 @@ describe('WebMCP tool metadata', () => {
       expect(tool.execute).toBeTypeOf('function')
     }
     expect(tools.filter(tool => tool.annotations?.readOnlyHint).map(tool => tool.name)).toEqual([
-      'get_synth_state', 'get_parameter_schema', 'analyze_audio',
-      'suggest_patch', 'list_presets'
+      'get_synth_state', 'get_parameter_schema', 'suggest_patch', 'list_presets'
     ])
     // `compare_audio` renders by default now, so it is no longer read-only:
     // it replaces `last-render`, and on the realtime fallback it makes sound.
+    // `analyze_audio` left the read-only list for the same kind of reason:
+    // `source: "reference"` with a corrected `f0Hz` or a raised `windows`
+    // replaces the active reference and resets the best-so-far with it.
     expect(tools.filter(tool => tool.annotations?.readOnlyHint === false).map(tool => tool.name)).toEqual([
       'update_parameters', 'set_modulation', 'play_notes', 'render_audio',
-      'analyze_reference_audio', 'compare_audio', 'save_preset', 'load_preset'
+      'analyze_audio', 'analyze_reference_audio', 'compare_audio', 'save_preset', 'load_preset'
     ])
     expect(tools.find(tool => tool.name === 'analyze_reference_audio')?.annotations?.untrustedContentHint).toBe(true)
     expect(tools[7].inputSchema).toMatchObject({
@@ -1551,29 +1553,55 @@ describe('matching a reference: harmonics on both sides, a gradient, and advice'
     }
   }
 
-  /** A synth-side renderer that actually tracks the requested MIDI note. */
+  const wav = (channelData: Float32Array[], duration: number): RecordedAudio => ({
+    blob: new Blob([encodeWav(channelData, RATE)], { type: 'audio/wav' }),
+    mimeType: 'audio/wav', duration, sampleRate: RATE, channelData
+  })
+
+  /**
+   * A synth-side renderer that tracks the requested MIDI note AND the patch's
+   * `osc1.transpose`, exactly as the real one does. The transpose is what makes the
+   * candidate's pitch a thing to be measured rather than assumed: the note asked for
+   * and the frequency produced are two different numbers the moment it is non-zero.
+   */
   function renderer() {
-    return vi.fn(async (_engine: unknown, notes: readonly { midi: number }[], duration: number): Promise<RecordedAudio> => {
+    return vi.fn(async (engine: unknown, notes: readonly { midi: number }[], duration: number): Promise<RecordedAudio> => {
       const length = Math.max(64, Math.round(duration * RATE))
-      const f0 = 440 * Math.pow(2, ((notes[0]?.midi ?? 69) - 69) / 12)
+      // `engine.values` holds NORMALIZED values, as `update_parameters` writes them.
+      const transpose = normToValue(paramDef('osc1.transpose'), (engine as FakeEngine).values[paramIndex('osc1.transpose')])
+      const f0 = 440 * Math.pow(2, ((notes[0]?.midi ?? 69) + transpose - 69) / 12)
       const channel = Float32Array.from({ length }, (_, index) => {
         const t = index / RATE
         // Two partials only: darker than the reference's six, so the diff has a
         // real gradient for the advice to rank.
         return 0.3 * Math.exp(-4 * t) * (Math.sin(2 * Math.PI * f0 * t) + 0.2 * Math.sin(4 * Math.PI * f0 * t))
       })
-      const channelData = [channel, channel.slice()]
-      return {
-        blob: new Blob([encodeWav(channelData, RATE)], { type: 'audio/wav' }),
-        mimeType: 'audio/wav', duration, sampleRate: RATE, channelData
-      }
+      return wav([channel, channel.slice()], duration)
     })
   }
 
-  function matchSetup(decoded: () => DecodedBase64Audio = pitchedReference) {
+  /**
+   * A renderer with no fundamental to find: deterministic white noise, which both
+   * detectors disagree about and the YIN veto therefore rejects outright.
+   */
+  function noiseRenderer() {
+    return vi.fn(async (_engine: unknown, _notes: readonly { midi: number }[], duration: number): Promise<RecordedAudio> => {
+      const length = Math.max(64, Math.round(duration * RATE))
+      let seed = 12345
+      const channel = Float32Array.from({ length }, () => {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        return 0.3 * (seed / 1073741824 - 1)
+      })
+      return wav([channel, channel.slice()], duration)
+    })
+  }
+
+  function matchSetup(
+    decoded: () => DecodedBase64Audio = pitchedReference,
+    renderOffline: ReturnType<typeof renderer> = renderer()
+  ) {
     const engine = new FakeEngine()
     engine.running = false
-    const renderOffline = renderer()
     const decodeAudio = vi.fn(async () => decoded())
     const tools = createWebMcpTools(engine as unknown as SynthEngine, undefined, { renderOffline, decodeAudio })
     const byName = new Map(tools.map(tool => [tool.name, tool]))
@@ -1634,9 +1662,10 @@ describe('matching a reference: harmonics on both sides, a gradient, and advice'
     expect(duration).toBeCloseTo(0.5, 2)
     expect(result.candidate.source).toBe('last-render')
     expect(result.diff.similarity).toBe(result.comparison.similarity)
-    // Both sides measured against the same fundamental, so the partial errors
-    // are comparable rather than each read against its own f0.
-    expect(result.candidate.metrics.pitch).toMatchObject({ source: 'given' })
+    // MEASURED, not asserted: the reference's f0 is not handed to the candidate's
+    // analysis, so `centsError` reports what the patch actually produced. It lands
+    // on the reference's pitch here because nothing detunes this render.
+    expect(result.candidate.metrics.pitch).toMatchObject({ source: 'detected' })
     expect(result.candidate.metrics.pitch.f0Hz).toBeCloseTo(REFERENCE_HZ, -1)
 
     // Opting out compares whatever was rendered last, without rendering again.
@@ -1702,6 +1731,121 @@ describe('matching a reference: harmonics on both sides, a gradient, and advice'
     const focused = await execute('suggest_patch', { focus: 'envelope', maxActions: 20 })
     expect(focused.actions.length).toBeLessThanOrEqual(again.actions.length + 20)
     await expect(execute('suggest_patch', { focus: 'nope' })).rejects.toThrow(/focus/i)
+  })
+
+  it('measures the candidate\'s own pitch, so a transposed patch reports a real cents error', async () => {
+    const { execute } = matchSetup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    // Nothing detunes this patch yet, so the measured pitch lands on the target's.
+    const inTune = await execute('compare_audio', { format: 'json' })
+    expect(Math.abs(inTune.diff.pitch.centsError)).toBeLessThan(5)
+
+    // The regression: the candidate used to be analyzed at the REFERENCE's f0, which
+    // `resolvePitch` accepts as `source: "given"`, `confidence: 1` without reading a
+    // sample. `centsError` was therefore 0 no matter how far the render was from the
+    // target, and `pitch-error` — the rule that names an octave error — was dead code
+    // on the default path. An octave of transpose has to show up as ~1200 cents.
+    await execute('update_parameters', { updates: [{ id: 'osc1.transpose', value: 12 }] })
+    const octaveUp = await execute('compare_audio', { format: 'json' })
+    expect(octaveUp.diff.pitch.centsError).toBeGreaterThan(1150)
+    expect(octaveUp.diff.pitch.centsError).toBeLessThan(1250)
+    expect(octaveUp.diff.pitch.referenceHz).toBeCloseTo(REFERENCE_HZ, -1)
+    expect(octaveUp.diff.pitch.candidateHz).toBeCloseTo(REFERENCE_HZ * 2, -1)
+    expect(octaveUp.candidate.metrics.pitch).toMatchObject({ source: 'detected' })
+
+    // And the advice that reads it now fires, naming the transpose rather than fine tuning.
+    const pitchAction = octaveUp.diff.actions.find((action: any) => action.paramIds.includes('osc1.transpose'))
+    expect(pitchAction.finding).toMatch(/octave error/i)
+    expect(pitchAction.finding).toMatch(/-12 semitones/)
+    expect(pitchAction.direction).toBe('decrease')
+
+    // A sub-semitone detune is measured too, where a stated f0 would have hidden it.
+    await execute('update_parameters', { updates: [{ id: 'osc1.transpose', value: 0 }, { id: 'osc1.fine', value: 0 }] })
+    const inTuneAgain = await execute('compare_audio', { format: 'json' })
+    expect(Math.abs(inTuneAgain.diff.pitch.centsError)).toBeLessThan(5)
+  })
+
+  it('reports n/a rather than a borrowed fundamental when the candidate has no detectable pitch', async () => {
+    const { execute } = matchSetup(pitchedReference, noiseRenderer())
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', name: 'target.wav' })
+    // Noise has no fundamental. Falling back to the reference's f0 here would put
+    // `confidence: 1` on a number nothing measured, so the answer is "not measurable".
+    const result = await execute('compare_audio')
+    expect(result.candidate.metrics.pitch).toBeNull()
+    expect(result.candidate.metrics).not.toHaveProperty('harmonics')
+    expect(result.candidate.metrics).not.toHaveProperty('harmonicShape')
+    expect(result.text).toContain('PITCH   n/a (no fundamental measured on your sound)')
+    expect(result.text).toContain('PARTIALS  n/a (one side has no fundamental')
+    expect(result.diff.similarity).toBe(result.comparison.similarity)
+
+    const json = await execute('compare_audio', { format: 'json' })
+    expect(json.diff.pitch.referenceHz).toBeCloseTo(REFERENCE_HZ, -1)
+    expect(json.diff.pitch.candidateHz).toBeNull()
+    expect(json.diff.pitch.centsError).toBeNull()
+    expect(json.diff.harmonics).toBeNull()
+  })
+
+  it('analyzes the candidate with the same window count as the reference', async () => {
+    const { execute } = matchSetup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==', windows: 8 })
+    const result = await execute('compare_audio', { format: 'json' })
+    // A 4-window candidate against an 8-window reference compares slices that cover
+    // different fractions of each sound, and throws away half the resolution the
+    // caller paid for on the reference.
+    expect(result.reference.metrics.spectralWindows).toHaveLength(8)
+    expect(result.candidate.metrics.spectralWindows).toHaveLength(8)
+    expect(result.diff.brightness).toHaveLength(8)
+  })
+
+  it('makes a corrected reference re-analysis the one compare_audio scores against', async () => {
+    const { execute, renderOffline } = matchSetup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    const before = await execute('compare_audio', { format: 'json' })
+    expect(before.reference.metrics.pitch).toMatchObject({ source: 'detected', midi: REFERENCE_MIDI })
+    expect(before.reference.metrics.spectralWindows).toHaveLength(4)
+
+    const corrected = await execute('analyze_audio', { source: 'reference', f0Hz: REFERENCE_HZ / 2, windows: 8 })
+    expect(corrected.activeReference).toBe('replaced')
+
+    // The correction used to be returned and then dropped: every later compare_audio
+    // went on scoring against the metrics the caller had just replaced.
+    const after = await execute('compare_audio', { format: 'json' })
+    expect(after.reference.metrics.pitch).toMatchObject({ f0Hz: REFERENCE_HZ / 2, source: 'given' })
+    expect(after.reference.metrics.spectralWindows).toHaveLength(8)
+    expect(after.diff.pitch.referenceHz).toBeCloseTo(REFERENCE_HZ / 2, 3)
+    // The candidate follows the corrected target, on both counts: an octave lower,
+    // and cut into the reference's eight windows.
+    expect(renderOffline.mock.calls[1][1]).toEqual([
+      { midi: REFERENCE_MIDI - 12, velocity: 1, start: 0, duration: expect.any(Number) }
+    ])
+    expect(after.candidate.metrics.spectralWindows).toHaveLength(8)
+  })
+
+  it('resets the best-so-far when a re-analysis moves the reference, and says so', async () => {
+    const { execute } = matchSetup()
+    await execute('analyze_reference_audio', { audioBase64: 'UklGRg==' })
+    await execute('compare_audio')
+    expect((await execute('compare_audio')).progress.comparisonNumber).toBe(2)
+
+    // A plain look changes nothing — same fundamental, same window count — so the
+    // running best is not thrown away for a call that only read.
+    const plain = await execute('analyze_audio', { source: 'reference' })
+    expect(plain.activeReference).toBe('unchanged')
+    expect(plain.matchProgressReset).toBe(false)
+    expect(plain.note).toMatch(/untouched/i)
+    expect((await execute('compare_audio')).progress.comparisonNumber).toBe(3)
+
+    // A correction does move the target, and a similarity scored against the old
+    // metrics is not comparable to one scored against the new ones.
+    const corrected = await execute('analyze_audio', { source: 'reference', f0Hz: REFERENCE_HZ / 2 })
+    expect(corrected.matchProgressReset).toBe(true)
+    expect(corrected.note).toMatch(/best-so-far was reset/i)
+    expect(corrected.note).toMatch(/restarts at 1/i)
+    // The stale advice goes with it, rather than being re-read against a moved target.
+    await expect(execute('suggest_patch')).rejects.toThrow(/No comparison to advise from yet/i)
+
+    const fresh = await execute('compare_audio')
+    expect(fresh.progress).toMatchObject({ comparisonNumber: 1, isBest: true, comparisonsSinceBest: 0 })
   })
 
   it('says out loud that the live scope is 1024 samples, so its envelope metrics mean nothing', async () => {
