@@ -2,7 +2,7 @@
 // export/import.
 
 import { paramDef, valueToNorm } from '../shared/params'
-import { listPresets, savePreset, validatePresetData } from '../shared/preset-store'
+import { listPresets, onPresetStoreChange, savePreset, validatePresetData } from '../shared/preset-store'
 import type { SynthEngine, PresetData } from '../audio/engine'
 import { el } from './common'
 import { guideTarget } from './guide-target'
@@ -569,6 +569,7 @@ export async function importPresetFile(engine: SynthEngine, file: File, storage?
 export class PresetBrowser {
   readonly root: HTMLElement
   private readonly select: HTMLSelectElement
+  private readonly unsubscribe: () => void
 
   constructor(private readonly engine: SynthEngine) {
     this.root = el('div', 'presets')
@@ -738,6 +739,13 @@ export class PresetBrowser {
     actions.append(trigger, menu)
     this.root.append(previous, this.select, next, actions, file, saveDialog.root)
     this.refresh('factory:Init')
+    // Presets also change from outside this component: an agent's save_preset or
+    // load_preset tool call writes and reads the same store with no UI event.
+    this.unsubscribe = onPresetStoreChange(change => this.refresh(`user:${change.name}`))
+  }
+
+  dispose(): void {
+    this.unsubscribe()
   }
 
   private step(direction: -1 | 1): void {
@@ -748,6 +756,7 @@ export class PresetBrowser {
   }
 
   private refresh(selected: string): void {
+    const previous = this.select.value
     this.select.textContent = ''
     const fGroup = el('optgroup') as HTMLOptGroupElement
     fGroup.label = 'Factory'
@@ -768,7 +777,10 @@ export class PresetBrowser {
       }
       this.select.appendChild(uGroup)
     }
+    // A name from another storage (or one just deleted) must not blank the field.
     this.select.value = selected
+    if (!this.select.value) this.select.value = previous
+    if (!this.select.value) this.select.selectedIndex = 0
   }
 
   private load(key: string): void {

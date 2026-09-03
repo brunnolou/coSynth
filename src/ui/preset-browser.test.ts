@@ -5,6 +5,7 @@ import { savePreset, loadPreset, listPresets, PRESET_STORAGE_KEY } from '../shar
 import { defaultLfoShape, FX_IDS } from '../shared/messages'
 import { normToValue, paramDef, paramIndex, SYNC_DIVISIONS } from '../shared/params'
 import { PresetBrowser } from './presets'
+import { createWebMcpTools } from '../webmcp/tools'
 
 describe('compact preset browser', () => {
   let engine: SynthEngine
@@ -233,6 +234,39 @@ describe('compact preset browser', () => {
     select().dispatchEvent(new Event('change'))
     expect(divisionOf('lfo1.division')).toBe('1/4')
     expect(divisionOf('delay.division')).toBe('1/8')
+  })
+
+  // An agent writes and reads the preset store directly, so nothing in the UI
+  // fires. Without a store subscription the dropdown never showed the save.
+  const callTool = (name: string, input: Record<string, unknown>) =>
+    createWebMcpTools(engine).find(tool => tool.name === name)!
+      .execute(input, { signal: new AbortController().signal })
+
+  it('lists and selects a preset the agent saved through save_preset', () => {
+    engine.setParamById('osc1.morph', 0.42, 'ai')
+    callTool('save_preset', { name: 'Agent patch' })
+    expect([...select().querySelectorAll('optgroup')].map(group => group.label)).toEqual(['Factory', 'User'])
+    expect([...select().options].map(option => option.value)).toContain('user:Agent patch')
+    expect(select().value).toBe('user:Agent patch')
+  })
+
+  it('follows the agent selecting a stored preset through load_preset', () => {
+    savePreset(engine.toPreset('Agent patch'))
+    select().value = 'factory:Reese Bass'
+    select().dispatchEvent(new Event('change'))
+    callTool('load_preset', { name: 'Agent patch' })
+    expect(select().value).toBe('user:Agent patch')
+  })
+
+  it('keeps the current selection when a save lands in another storage', () => {
+    const elsewhere = new Map<string, string>()
+    const other = {
+      getItem: (key: string) => elsewhere.get(key) ?? null,
+      setItem: (key: string, value: string) => { elsewhere.set(key, value) }
+    } as unknown as Storage
+    select().value = 'factory:Reese Bass'
+    savePreset(engine.toPreset('Elsewhere'), other)
+    expect(select().value).toBe('factory:Reese Bass')
   })
 
   it('exports the current patch through the existing JSON download', () => {

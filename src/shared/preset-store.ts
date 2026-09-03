@@ -133,6 +133,28 @@ export function validatePresetData(value: unknown): PresetData {
   return { name, version: PRESET_VERSION, params, mods, lfoShapes, fxOrder }
 }
 
+/**
+ * A preset was written, or read back to be made current. `savePreset` and
+ * `loadPreset` are the only ways in, so every caller - the preset browser, a
+ * file import, and the WebMCP `save_preset` / `load_preset` tools - announces
+ * itself here without knowing that a UI exists.
+ */
+export interface PresetStoreChange {
+  kind: 'saved' | 'loaded'
+  name: string
+}
+
+const presetStoreListeners = new Set<(change: PresetStoreChange) => void>()
+
+export function onPresetStoreChange(listener: (change: PresetStoreChange) => void): () => void {
+  presetStoreListeners.add(listener)
+  return () => { presetStoreListeners.delete(listener) }
+}
+
+function notifyPresetStore(change: PresetStoreChange): void {
+  for (const listener of [...presetStoreListeners]) listener(change)
+}
+
 function browserStorage(): Storage {
   try {
     if (typeof localStorage === 'undefined') throw new Error('localStorage is unavailable')
@@ -191,6 +213,7 @@ export function savePreset(preset: PresetData, storage?: Storage): PresetData {
   } catch (error) {
     throw new Error(`Could not save preset to browser storage: ${error instanceof Error ? error.message : String(error)}`)
   }
+  notifyPresetStore({ kind: 'saved', name: saved.name })
   return validatePresetData(saved)
 }
 
@@ -200,5 +223,7 @@ export function loadPreset(name: unknown, storage?: Storage): PresetData | null 
   let list: PresetData[]
   try { list = readPresets(target) } catch (error) { throw storageReadError(error) }
   const found = list.find(item => item.name === canonical)
-  return found ? validatePresetData(found) : null
+  if (!found) return null
+  notifyPresetStore({ kind: 'loaded', name: canonical })
+  return validatePresetData(found)
 }
